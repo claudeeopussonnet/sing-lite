@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.0.1 [服务端]
+#  sing-lite v1.0.2 [服务端]
 #  官方 sing-box 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 sing。
 #  适配: Alpine/Debian/Ubuntu/CentOS
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.0.1"
+readonly VERSION="1.0.2"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/sing-lite"
 readonly SCRIPT_REPO="mikuuu3981/sing-lite"
@@ -5714,291 +5714,205 @@ _singbox_ruleset_source_path() {
     echo "$CFG/ruleset-src/${tag}.json"
 }
 
-# 在子 shell 内清理临时文件和处理中断，不改写交互菜单的 trap。
-_build_singbox_geo_ruleset() (
-    local tag="$1" source_path output_path tmp_source tmp_output status
-    [[ "$tag" =~ ^(geoip|geosite)-[a-zA-Z0-9][a-zA-Z0-9@!._-]*$ ]] || return 1
-    source_path=$(_singbox_ruleset_source_path "$tag")
-    output_path=$(_singbox_ruleset_path "$tag")
-    mkdir -p "$CFG/ruleset" "$CFG/ruleset-src" || return 1
-    tmp_source=$(mktemp "$CFG/ruleset-src/.${tag}.XXXXXX") || return 1
-    tmp_output=""
-    trap 'rm -f "$tmp_source" "$tmp_output"' EXIT
-    trap '_warn "已取消 Sing-box 规则集生成: $tag" >&2; exit 130' INT
-    trap 'exit 143' TERM
-    tmp_output=$(mktemp "$CFG/ruleset/.${tag}.XXXXXX") || return 1
-
-    # curl 限制整次传输；Python 同时限制所有 include 下载的总耗时。
-    # 先完成下载及源数据校验，再编译，任何一步失败都保留原有缓存。
-    python3 - "$tmp_source" "$tag" <<'PY'
-import ipaddress
-import json
-import re
-import subprocess
-import sys
-import time
-from pathlib import Path
-
-out_path = Path(sys.argv[1])
-tag = sys.argv[2]
-deadline = time.monotonic() + 120
-
-
-def fetch(url, name):
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise RuntimeError('规则源下载总耗时超过 120 秒')
-    print(f'  ▸ 下载规则源: {name}（单次最多 30 秒，总计最多 120 秒）', file=sys.stderr, flush=True)
-    try:
-        result = subprocess.run(
-            ['curl', '-fsSL', '--connect-timeout', '10', '--max-time', '30', url],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=min(30, remaining), check=False,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f'下载规则源超时: {name}') from None
-    if result.returncode:
-        detail = result.stderr.decode('utf-8', 'replace').strip()
-        raise RuntimeError(f'下载规则源失败: {name} (curl {result.returncode}) {detail}')
-    return result.stdout.decode('utf-8', 'strict')
-
-
-def build_geoip(name):
-    text = fetch(f'https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/{name}.txt', name)
-    ips = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith('#'):
-            continue
-        ipaddress.ip_network(line, strict=False)
-        ips.append(line)
-    if not ips:
-        raise ValueError(f'GeoIP 规则源为空: {name}')
-    return {'ip_cidr': ips}
-
-
-def build_geosite(name):
-    roots = ['category-public-tracker', 'category-pt'] if name == 'tracker' else [name]
-    seen = set()
-    full, suffix, keyword, regex = set(), set(), set(), set()
-
-    def norm_token(token):
-        token = token.strip()
-        if '@' in token:
-            token = token.split('@', 1)[0].strip()
-        if ' ' in token:
-            token = token.split()[0].strip()
-        return token.strip()
-
-    def load(name):
-        if not name or name in seen:
-            return
-        # include 只能引用上游 data 下的文件，不接受路径或 URL。
-        if not re.fullmatch(r'[a-zA-Z0-9!._-]+', name):
-            raise ValueError(f'无效的 GeoSite 引用: {name}')
-        seen.add(name)
-        text = fetch(f'https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/{name}', name)
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line or line.startswith('#'):
-                continue
-            if '# ' in line:
-                line = line.split('#', 1)[0].strip()
-            line = norm_token(line)
-            if not line:
-                continue
-            if line.startswith('include:'):
-                load(norm_token(line.split(':', 1)[1]))
-            elif line.startswith('full:'):
-                value = norm_token(line.split(':', 1)[1])
-                if value:
-                    full.add(value)
-            elif line.startswith('regexp:'):
-                value = line.split(':', 1)[1].strip()
-                if value:
-                    regex.add(value)
-            elif line.startswith('keyword:'):
-                value = norm_token(line.split(':', 1)[1])
-                if value:
-                    keyword.add(value)
-            elif line.startswith('exclude:'):
-                continue
-            else:
-                value = norm_token((line.split(':', 1)[1] if line.startswith('domain:') else line)).lstrip('.')
-                if value:
-                    suffix.add(value)
-
-    for root in roots:
-        load(root)
-    rule = {}
-    for key, values in [('domain', full), ('domain_suffix', suffix),
-                        ('domain_keyword', keyword), ('domain_regex', regex)]:
-        if values:
-            rule[key] = sorted(values)
-    if not rule:
-        raise ValueError(f'GeoSite 规则源为空: {name}')
-    return rule
-
-
-try:
-    kind, name = tag.split('-', 1)
-    rule = build_geoip(name) if kind == 'geoip' else build_geosite(name)
-    out_path.write_text(json.dumps({'version': 3, 'rules': [rule]}, ensure_ascii=False, indent=2))
-except KeyboardInterrupt:
-    sys.exit(130)
-except (OSError, ValueError, RuntimeError) as exc:
-    print(f'  ✗ {exc}', file=sys.stderr)
-    sys.exit(1)
-PY
-    status=$?
-    if [[ "$status" -ne 0 ]]; then
-        [[ "$status" -ne 130 ]] || _warn "已取消 Sing-box 规则集生成: $tag" >&2
-        return "$status"
-    fi
-    _info "编译规则集: $tag" >&2
-    if ! "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set compile "$tmp_source" -o "$tmp_output" >/dev/null 2>&1 ||
-       [[ ! -s "$tmp_output" ]]; then
-        _err "编译 Sing-box 规则集失败: $tag" >&2
-        return 1
-    fi
-    chmod 600 "$tmp_source" "$tmp_output" || return 1
-    mv -f "$tmp_source" "$source_path" && mv -f "$tmp_output" "$output_path"
-)
-
-_build_singbox_geosite_ruleset() {
-    [[ "$1" == geosite-* ]] || return 1
-    _build_singbox_geo_ruleset "$1"
+# Public Sukka catalog: only published phases are eligible for downloading.
+_singbox_sukka_catalog() {
+    cat <<'CATALOG'
+domainset apple_cdn cdn download game-download icloud_private_relay reject reject_extra reject_phishing speedtest
+non-ip ai apple_cdn apple_cn apple_intelligence apple_services cdn cloudmounter direct domestic domestic_cdn download gitlab global lan microsoft microsoft_cdn my_direct my_git my_plus my_proxy my_reject my_tw my_us neteasemusic reject-drop reject-no-drop reject-url-regex reject sogouinput stream stream_biliintl stream_eu stream_hk stream_jp stream_kr stream_tw stream_us telegram
+ip ai apple_services cdn china_ip china_ip_ipv6 domestic download lan neteasemusic reject stream stream_biliintl stream_eu stream_hk stream_jp stream_kr stream_tw stream_us telegram telegram_asn teleproto
+CATALOG
 }
 
-_build_singbox_geoip_ruleset() {
-    [[ "$1" == geoip-* ]] || return 1
-    _build_singbox_geo_ruleset "$1"
+# Exact repository, branch and path allowlist; Yuu files contain domains only.
+_singbox_ruleset_source_url() {
+    case "$1" in
+        yuu-non-ip-youtube) echo https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_site/youtube.json ;;
+        yuu-non-ip-google) echo https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_site/google.json ;;
+        *) local source
+           source=$(_singbox_sukka_tag_source "$1") || return 1
+           printf 'https://ruleset.skk.moe/sing-box/%s.json\n' "$source" ;;
+    esac
+}
+
+_singbox_sukka_normalize_tag() {
+    case "$1" in
+        skk-ai-non-ip) echo skk-non-ip-ai ;;
+        skk-ai-ip) echo skk-ip-ai ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+_singbox_sukka_tag_source() {
+    local tag phase name line
+    tag=$(_singbox_sukka_normalize_tag "$1")
+    case "$tag" in
+        *)
+            while read -r phase line; do
+                [[ "$tag" == "skk-$phase-"* ]] || continue
+                name="${tag#skk-$phase-}"
+                case " $line " in *" $name "*) printf '%s/%s\n' "${phase//-/_}" "$name"; return 0 ;; esac
+            done < <(_singbox_sukka_catalog)
+            _err "不支持的 Sukka 规则集: $tag" >&2; return 1 ;;
+    esac
+}
+
+_singbox_sukka_tags_for_token() {
+    local token="$1" name phase names tag
+    case "$token" in
+        rule-set:*|ruleset:*)
+            tag=$(_singbox_sukka_normalize_tag "${token#*:}")
+            _singbox_ruleset_source_url "$tag" >/dev/null || return 1
+            echo "$tag"; return ;;
+        skk-*|yuu-*) _singbox_sukka_tags_for_token "rule-set:$token"; return ;;
+        geosite:*)
+            name="${token#*:}"
+            case "$name" in
+                cn) name=domestic ;;
+                tracker|public-tracker|private-tracker|category-public-tracker|category-pt) _err "Sukka 没有等价的独立 BT/PT 规则: $token" >&2; return 1 ;;
+                category-ads-all|ads) name=reject ;;
+                youtube|google) echo "yuu-non-ip-$name"; return ;;
+                telegram|ai) ;;
+                *) _err "无 Sukka 映射的旧规则: $token" >&2; return 1 ;;
+            esac
+            while read -r phase names; do
+                [[ "$phase" != ip ]] || continue
+                case " $names " in *" $name "*) echo "skk-$phase-$name" ;; esac
+            done < <(_singbox_sukka_catalog) ;;
+        geoip:*)
+            case "${token#*:}" in
+                cn) printf '%s\n' skk-ip-china_ip skk-ip-china_ip_ipv6 ;;
+                telegram|ai) echo "skk-ip-${token#*:}" ;;
+                *) _err "无 Sukka 映射的旧规则: $token" >&2; return 1 ;;
+            esac ;;
+        *) _err "不支持的规则标记: $token" >&2; return 1 ;;
+    esac
+}
+
+_singbox_sukka_preset_tokens() {
+    local name="$1"
+    case "$name" in
+        singbox-ai) echo 'rule-set:skk-non-ip-ai,rule-set:skk-ip-ai' ;;
+        stream) echo 'rule-set:skk-non-ip-stream,rule-set:skk-ip-stream' ;;
+        stream-jp) echo 'rule-set:skk-non-ip-stream_jp,rule-set:skk-ip-stream_jp' ;;
+        youtube|google) echo "rule-set:yuu-non-ip-$name" ;;
+        *) [[ -n "${ROUTING_PRESETS[$name]:-}" ]] || return 1
+           printf '%s\n' "${ROUTING_PRESETS[$name]}" ;;
+    esac
 }
 
 _singbox_sukka_ai_cache_valid() {
-    local path=$(_singbox_ruleset_path "$1")
+    local path
+    path=$(_singbox_ruleset_path "$1")
     [[ -s "$path" ]] && "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set decompile "$path" -o /dev/null >/dev/null 2>&1
 }
 
-_build_singbox_sukka_ai_ruleset() {
-    local tag="$1" url source_path output_path tmp_source tmp_output
-    case "$tag" in
-        skk-ai-non-ip) url="https://ruleset.skk.moe/sing-box/non_ip/ai.json" ;;
-        skk-ai-ip) url="https://ruleset.skk.moe/sing-box/ip/ai.json" ;;
-        *) return 1 ;;
-    esac
+# Atomic downloads from the exact Sukka/Yuu allowlists; retain valid caches.
+_build_singbox_sukka_ruleset() (
+    local tag="$1" sources source_path output_path tmp_source tmp_output status
+    sources=$(_singbox_ruleset_source_url "$tag") || return 1
     source_path=$(_singbox_ruleset_source_path "$tag")
     output_path=$(_singbox_ruleset_path "$tag")
     mkdir -p "$CFG/ruleset" "$CFG/ruleset-src" || return 1
     tmp_source=$(mktemp "$CFG/ruleset-src/.${tag}.XXXXXX") || return 1
-    tmp_output=$(mktemp "$CFG/ruleset/.${tag}.XXXXXX") || { rm -f "$tmp_source"; return 1; }
-
-    # 保留上游完整 JSON；两份规则集独立编译，禁止扁平化或合并匹配条件。
-    if curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp_source" "$url" &&
-        jq -e 'type == "object" and (.version | type == "number") and
-            (.rules | type == "array" and length > 0)' "$tmp_source" >/dev/null 2>&1 &&
-        "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set compile "$tmp_source" -o "$tmp_output" >/dev/null 2>&1 &&
-        [[ -s "$tmp_output" ]]; then
-        chmod 600 "$tmp_source" "$tmp_output"
-        if mv -f "$tmp_source" "$source_path" && mv -f "$tmp_output" "$output_path"; then
-            return 0
-        fi
+    tmp_output=''
+    trap 'rm -f "$tmp_source" "$tmp_output"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    tmp_output=$(mktemp "$CFG/ruleset/.${tag}.XXXXXX") || return 1
+    python3 - "$tmp_source" "$(_singbox_sukka_normalize_tag "$tag")" "$sources" <<'PY'
+import json, subprocess, sys
+from pathlib import Path
+try:
+    url = sys.argv[3]
+    print('  ▸ 下载规则源: ' + url, file=sys.stderr)
+    result = subprocess.run(['curl', '-fsSL', '--connect-timeout', '10', '--max-time', '45', url], capture_output=True, timeout=50, check=True)
+    doc = json.loads(result.stdout)
+    if not isinstance(doc, dict) or not isinstance(doc.get('version'), int) or not isinstance(doc.get('rules'), list) or not doc['rules']:
+        raise ValueError('无效或空的规则集')
+    # Fail explicitly if the selected native Yuu files change matching phase.
+    if sys.argv[2].startswith('yuu-'):
+        expected = {'domain', 'domain_suffix', 'domain_keyword', 'domain_regex'}
+        if any(not isinstance(r, dict) or not r or set(r) - expected for r in doc['rules']):
+            raise ValueError('Yuu 规则的匹配阶段发生变化')
+    Path(sys.argv[1]).write_text(json.dumps(doc, ensure_ascii=False))
+except (ValueError, OSError, subprocess.SubprocessError) as exc:
+    print('  ✗ 规则生成失败: ' + str(exc), file=sys.stderr)
+    sys.exit(1)
+PY
+    status=$?
+    if [[ "$status" == 0 ]] &&
+        "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set compile "$tmp_source" -o "$tmp_output" >/dev/null 2>&1 && [[ -s "$tmp_output" ]]; then
+        chmod 600 "$tmp_source" "$tmp_output" || return 1
+        mv -f "$tmp_source" "$source_path" && mv -f "$tmp_output" "$output_path"
+        return $?
     fi
-    rm -f "$tmp_source" "$tmp_output"
-    if _singbox_sukka_ai_cache_valid "$tag"; then
-        _warn "更新 Sukka AI 规则集失败，继续使用有效缓存: $tag" >&2
+    if _singbox_sukka_ai_cache_valid "$tag" && [[ -s "$source_path" ]]; then
+        _warn "更新规则集失败，继续使用有效缓存: $tag" >&2
         return 0
     fi
     return 1
-}
+)
 
-_build_singbox_ruleset() {
-    local tag="$1"
-    case "$tag" in
-        skk-ai-non-ip|skk-ai-ip) _build_singbox_sukka_ai_ruleset "$tag" ;;
-        geosite-*) _build_singbox_geosite_ruleset "$tag" ;;
-        geoip-*) _build_singbox_geoip_ruleset "$tag" ;;
+_build_singbox_sukka_ai_ruleset() { _build_singbox_sukka_ruleset "$1"; }
+_build_singbox_geo_ruleset() {
+    local token tags tag
+    case "$1" in
+        geosite-*) token="geosite:${1#geosite-}" ;;
+        geoip-*) token="geoip:${1#geoip-}" ;;
         *) return 1 ;;
+    esac
+    tags=$(_singbox_sukka_tags_for_token "$token") || return 1
+    while IFS= read -r tag; do
+        _build_singbox_sukka_ruleset "$tag" || return 1
+    done <<<"$tags"
+}
+_build_singbox_geosite_ruleset() { _build_singbox_geo_ruleset "$1"; }
+_build_singbox_geoip_ruleset() { _build_singbox_geo_ruleset "$1"; }
+_build_singbox_ruleset() {
+    case "$1" in
+        geosite-*|geoip-*) _build_singbox_geo_ruleset "$1" ;;
+        *) _build_singbox_sukka_ruleset "$1" ;;
     esac
 }
 
 _list_missing_singbox_rulesets_from_routing_rules() {
-    local routing_rules="$1"
-    [[ -z "$routing_rules" || "$routing_rules" == "[]" ]] && return 0
-
-    local tags
-    tags=$(echo "$routing_rules" | jq -r '.[]? | .rule_set[]?' 2>/dev/null | sort -u)
-    [[ -z "$tags" ]] && return 0
-
     local tag
-    for tag in $tags; do
-        local path=$(_singbox_ruleset_path "$tag")
-        [[ -s "$path" ]] || echo "$tag"
-    done
+    while IFS= read -r tag; do
+        [[ -n "$tag" ]] || continue
+        _singbox_ruleset_source_url "$tag" >/dev/null || return 1
+        [[ -s "$(_singbox_ruleset_path "$tag")" ]] || echo "$tag"
+    done < <(jq -r '.. | objects | .rule_set? // empty | .[]' <<<"${1:-[]}" | sort -u)
 }
 
 _ensure_singbox_rulesets_from_routing_rules() {
-    local routing_rules="$1"
-    [[ -z "$routing_rules" || "$routing_rules" == "[]" ]] && return 0
-
-    local tags
-    tags=$(echo "$routing_rules" | jq -r '.[]? | .rule_set[]?' 2>/dev/null | sort -u)
-    [[ -z "$tags" ]] && return 0
-
-    local missing_tags
-    missing_tags=$(_list_missing_singbox_rulesets_from_routing_rules "$routing_rules")
-    if [[ -n "$missing_tags" ]]; then
-        local missing_count
-        missing_count=$(printf '%s\n' "$missing_tags" | sed '/^$/d' | wc -l | tr -d ' ')
-        _info "正在准备 Sing-box 规则集缓存 (${missing_count} 项)..."
-        _warn "首次启用或缓存缺失时需要下载并编译；GeoSite/GeoIP 每项下载总计最多 120 秒，可按 Ctrl+C 取消"
-    fi
-
-    local tag
-    for tag in $tags; do
-        local path=$(_singbox_ruleset_path "$tag")
-        if [[ "$tag" == skk-ai-non-ip || "$tag" == skk-ai-ip ]]; then
-            # 仅在配置重建的准备阶段刷新，不注册后台任务。
-            local source_path=$(_singbox_ruleset_source_path "$tag")
-            if ! _singbox_sukka_ai_cache_valid "$tag" || ! python3 - "$source_path" "$path" <<'PY'
+    local tag source_path path
+    while IFS= read -r tag; do
+        [[ -n "$tag" ]] || continue
+        _singbox_ruleset_source_url "$tag" >/dev/null || return 1
+        path=$(_singbox_ruleset_path "$tag")
+        source_path=$(_singbox_ruleset_source_path "$tag")
+        if ! _singbox_sukka_ai_cache_valid "$tag" || ! python3 - "$source_path" "$path" <<'PY'
 import os, sys, time
 try:
-    fresh = all(time.time() - os.path.getmtime(path) < 86400 for path in sys.argv[1:])
+    fresh = all(time.time() - os.path.getmtime(p) < 86400 for p in sys.argv[1:])
 except OSError:
     fresh = False
 sys.exit(0 if fresh else 1)
 PY
-            then
-                _build_singbox_ruleset "$tag" || {
-                    _err "生成 Sing-box 规则集失败: $tag"
-                    return 1
-                }
-            fi
-            continue
+        then
+            _build_singbox_ruleset "$tag" || { _err "生成规则集失败: $tag"; return 1; }
         fi
-        if [[ ! -s "$path" ]]; then
-            _info "生成规则集: $tag"
-            _build_singbox_ruleset "$tag" || {
-                _err "生成 Sing-box 规则集失败: $tag"
-                return 1
-            }
-        fi
-    done
+    done < <(jq -r '.. | objects | .rule_set? // empty | .[]' <<<"${1:-[]}" | sort -u)
 }
 
 _build_singbox_ruleset_defs() {
-    local routing_rules="$1"
-    [[ -z "$routing_rules" || "$routing_rules" == "[]" ]] && { echo "[]"; return 0; }
-
-    local defs="[]"
-    local tags=$(echo "$routing_rules" | jq -r '.[]? | .rule_set[]?' 2>/dev/null | sort -u)
-    [[ -z "$tags" ]] && { echo "[]"; return 0; }
-
-    local tag
-    for tag in $tags; do
-        local path=$(_singbox_ruleset_path "$tag")
-        defs=$(echo "$defs" | jq --arg tag "$tag" --arg path "$path" '. + [{type: "local", tag: $tag, format: "binary", path: $path}]')
-    done
+    local tag path defs='[]'
+    while IFS= read -r tag; do
+        [[ -n "$tag" ]] || continue
+        _singbox_ruleset_source_url "$tag" >/dev/null || return 1
+        path=$(_singbox_ruleset_path "$tag")
+        defs=$(jq --arg tag "$tag" --arg path "$path" '. + [{type:"local",tag:$tag,format:"binary",path:$path}]' <<<"$defs") || return 1
+    done < <(jq -r '.. | objects | .rule_set? // empty | .[]' <<<"${1:-[]}" | sort -u)
     echo "$defs"
 }
 
@@ -9494,43 +9408,25 @@ uninstall_warp() {
 # 多出口分流规则系统
 #═══════════════════════════════════════════════════════════════════════════════
 
-# 预设规则类型定义 (使用 geosite 规则库，更全面且自动更新)
+# 预设仅引用发布方现成规则，不从聚合规则中提取网站域名。
 declare -A ROUTING_PRESETS=(
-    [singbox-ai]="rule-set:skk-ai-non-ip,rule-set:skk-ai-ip"
-    [openai]="geosite:openai"
-    [netflix]="geosite:netflix"
-    [disney]="geosite:disney"
-    [mytvsuper]="geosite:mytvsuper"
-    [youtube]="geosite:youtube"
-    [spotify]="geosite:spotify"
-    [tiktok]="geosite:tiktok"
-    [telegram]="geosite:telegram"
-    [google]="geosite:google"
-    [ads]="geosite:category-ads-all"
-    [singbox-instagram]="rule-set:yuu-instagram"
-)
-
-# 需要同时匹配 IP 的预设规则 (这些服务客户端会直连 IP)
-declare -A ROUTING_PRESETS_IP=(
-    [telegram]="geoip:telegram"
-    [netflix]="geoip:netflix"
-    [google]="geoip:google"
+    [singbox-ai]="rule-set:skk-non-ip-ai,rule-set:skk-ip-ai"
+    [stream]="rule-set:skk-non-ip-stream,rule-set:skk-ip-stream"
+    [stream-jp]="rule-set:skk-non-ip-stream_jp,rule-set:skk-ip-stream_jp"
+    [youtube]="rule-set:yuu-non-ip-youtube"
+    [google]="rule-set:yuu-non-ip-google"
+    [ads]="rule-set:skk-domainset-reject,rule-set:skk-non-ip-reject,rule-set:skk-ip-reject"
 )
 
 # 预设规则显示名称
 declare -A ROUTING_PRESET_NAMES=(
-    [singbox-ai]="Sukka-AI-Sing-Box专属"
-    [openai]="OpenAI/ChatGPT"
-    [netflix]="Netflix"
-    [disney]="Disney+"
-    [mytvsuper]="MyTVSuper"
+    [singbox-ai]="AI (Sukka)"
+    [stream]="Stream (Sukka)"
+    [stream-jp]="Stream JP (Sukka)"
     [youtube]="YouTube"
-    [spotify]="Spotify"
-    [tiktok]="TikTok"
-    [telegram]="Telegram"
     [google]="Google"
-    [ads]="广告屏蔽"
-    [singbox-instagram]="Instagram/INS (Snell v5)"
+    [ads]="广告屏蔽 (Sukka)"
+    [all]="所有流量"
 )
 
 # 数据库：添加分流规则
@@ -9541,6 +9437,11 @@ db_add_routing_rule() {
     local rule_type="$1"    # openai, netflix, custom, all
     local outbound="$2"     # 出口标识: direct, warp, chain:节点名
     local domains="$3"      # 自定义域名 (仅 custom 类型)
+
+    if [[ "$rule_type" != custom && "$rule_type" != all && -z "${ROUTING_PRESETS[$rule_type]:-}" ]]; then
+        _err "未提供该分类的现成规则: $rule_type"
+        return 1
+    fi
 
     [[ ! -f "$DB_FILE" ]] && init_db
 
@@ -9629,17 +9530,18 @@ db_del_routing_rule() {
 _db_routing_rule_entries() {
     local core="${1:-all}" db_file="${2:-$DB_FILE}"
     [[ "$db_file" != /dev/stdin && ! -f "$db_file" ]] && printf '%s\n' '[]' && return
-    jq --arg core "$core" '. as $db | [(.routing_rules // [] | to_entries[]) |
-        select(.value.type != "ai-intl" and .value.type != "mihomo-ai") |
-        select(.value.type != "singbox-ai" or $core == "all" or $core == "singbox") |
-        select(.value.type != "singbox-instagram" or $core == "all" or
-            ($core == "singbox" and
-             ([$db.singbox | . // {} | to_entries[] |
-                select(.key == "snell-v5") |
-                .value | if type == "array" then .[] else . end] | length > 0)))
-    ] | if $core == "singbox" then
+    jq --arg core "$core" '[((.routing_rules // []) | to_entries[])] |
+        if $core == "singbox" then
         sort_by(
+            (if .value.type == "all" then 1 else 0 end),
             (.value.routing_priority[$core] // 2147483647),
+            (if .value.type == "custom" then 0
+             elif .value.type == "ads" then 1
+             elif .value.type == "singbox-ai" then 2
+             elif .value.type == "youtube" then 3
+             elif .value.type == "stream-jp" then 4
+             elif .value.type == "stream" then 5
+             elif .value.type == "google" then 6 else 7 end),
             (if .value.type != "all" then 0
              elif .value.ip_version == "ipv6_only" then 1
              elif .value.ip_version == "ipv4_only" then 2 else 3 end),
@@ -10073,75 +9975,31 @@ _get_outbound_display_name() {
 
 
 # 生成 Sing-box 分流路由配置 (支持多出口)
+# Removed preset retained as an explicit error for older callers.
 _load_yuu_instagram_domains() {
-    local cache="$CFG/yuu-instagram-domains.json" tmp source
-    if [[ -s "$cache" ]] && [[ "$(find "$cache" -mmin -1440 -print 2>/dev/null)" ]]; then
-        jq -er 'join(",")' "$cache"
-        return
-    fi
-    tmp=$(mktemp "$CFG/.yuu-instagram.XXXXXX") || return 1
-    source="https://raw.githubusercontent.com/Yuu518/Yuu-rules/rule-set/mihomo/geosite/instagram.list"
-    if ! curl -fsSL --connect-timeout 10 --max-time 30 "$source" -o "$tmp" ||
-       ! jq -Rse 'split("\n") | map(gsub("\\r$"; "") | select(length > 0 and (startswith("#") | not))) |
-           if length > 0 and all(.[]; test("^\\+\\.[A-Za-z0-9.-]+$")) then map(ltrimstr("+.")) | unique
-           else error("unsupported Yuu Instagram domain syntax") end' "$tmp" >"${tmp}.json"; then
-        rm -f "$tmp" "${tmp}.json"
-        [[ -s "$cache" ]] && { jq -er 'join(",")' "$cache"; return; }
-        _err "Yuu Instagram 域名规则下载或解析失败"
-        return 1
-    fi
-    chmod 600 "${tmp}.json" && mv "${tmp}.json" "$cache" || { rm -f "$tmp" "${tmp}.json"; return 1; }
-    rm -f "$tmp"
-    jq -er 'join(",")' "$cache"
+    _err "Instagram 独立规则已移除；请使用受支持的分流预设" >&2
+    return 1
 }
 
 gen_singbox_routing_rules() {
-    local db_file="${1:-$DB_FILE}" rules instagram_domains='' instagram_inbounds='[]'
+    local db_file="${1:-$DB_FILE}" rules result='[]' rule rule_type outbound domains ip_version
+    local preset token tags rs phase version tag item
     rules=$(db_get_routing_rules singbox "$db_file") || return 1
-    [[ -z "$rules" || "$rules" == "[]" ]] && return
-    if jq -e 'any(.[]; .type == "singbox-instagram")' <<<"$rules" >/dev/null; then
-        instagram_domains=$(_load_yuu_instagram_domains) || return 1
-        instagram_inbounds=$(jq '[.singbox | to_entries[] |
-            select(.key == "snell-v5") |
-            .key as $p | .value | (if type == "array" then .[] else . end) |
-            "snell-" + $p + "-" + (.port | tostring)]' "$db_file") || return 1
-        rules=$(jq --arg domains "$instagram_domains" --argjson inbounds "$instagram_inbounds" '
-            map(if .type == "singbox-instagram" then
-                if $inbounds | length > 0 then .domains=$domains else empty end
-                else . end)' <<<"$rules") || return 1
-    fi
-
-    # 预设的域名和 IP 库为 OR 关系；混用 GeoSite/GeoIP/普通域名时分开生成，
-    # 不能把 "geosite:cn,geoip:cn" 当成一个规则集名称。
-    local preset_ips preset
-    preset_ips=$(for preset in "${!ROUTING_PRESETS_IP[@]}"; do
-        jq -nc --arg key "$preset" --arg value "${ROUTING_PRESETS_IP[$preset]}" '{key:$key,value:$value}'
-    done | jq -s 'from_entries') || return 1
-    rules=$(jq --argjson ips "$preset_ips" '[.[] | . as $rule |
-        if .type == "all" or .type == "singbox-ai" then . else
-            (((.domains // "") + "," + ($ips[.type] // "")) | split(",") | map(select(length > 0))) as $tokens |
-            ($tokens | map(select(startswith("geosite:") or startswith("geoip:")))) as $geo |
-            ($tokens | map(select((startswith("geosite:") or startswith("geoip:")) | not)) | join(",")) as $plain |
-            ($geo + (if $plain == "" then [] else [$plain] end))[] |
-            . as $domains | $rule + {domains:$domains}
-        end
-    ]' <<<"$rules") || return 1
-
-    local result="[]"
+    [[ -n "$rules" && "$rules" != '[]' ]] || return 0
     while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        local previous_count
-        previous_count=$(jq 'length' <<<"$result") || return 1
-        local rule_type=$(echo "$rule" | jq -r '.type')
-        local outbound=$(echo "$rule" | jq -r '.outbound')
-        local domains=$(echo "$rule" | jq -r '.domains // ""')
-        local ip_version=$(echo "$rule" | jq -r '.ip_version // "prefer_ipv4"')
-        local ip_family_cidr=""
-        case "$ip_version" in
-            ipv4_only) ip_family_cidr="0.0.0.0/0" ;;
-            ipv6_only) ip_family_cidr="::/0" ;;
-        esac
-
+        rule_type=$(jq -r '.type' <<<"$rule")
+        outbound=$(jq -r '.outbound' <<<"$rule")
+        domains=$(jq -r '.domains // ""' <<<"$rule")
+        ip_version=$(jq -r '.ip_version // "prefer_ipv4"' <<<"$rule")
+        # Resolve presets anew: old DB snapshots must never retain old sources.
+        if [[ "$rule_type" != custom && "$rule_type" != all ]]; then
+            preset=$(_singbox_sukka_preset_tokens "$rule_type") || {
+                _err "未定义 Sukka 预设: $rule_type" >&2; return 1;
+            }
+            domains="$preset"
+        fi
+        version=0
+        case "$ip_version" in ipv4_only) version=4 ;; ipv6_only) version=6 ;; esac
         # 转换出口标识为 tag
         local tag="$outbound"
         if [[ "$outbound" == "direct" ]]; then
@@ -10173,107 +10031,49 @@ gen_singbox_routing_rules() {
             tag="balancer-${outbound#balancer:}"
         fi
 
-        if [[ "$rule_type" == "all" ]]; then
-            local rule_json=""
-            if [[ -n "$ip_family_cidr" ]]; then
-                rule_json=$(jq -n --arg tag "$tag" --arg ip "$ip_family_cidr" \
-                    '{"ip_cidr":[$ip],"outbound":$tag}')
-            else
-                rule_json=$(jq -n --arg tag "$tag" \
-                    '{"outbound":$tag}')
-            fi
-            result=$(jq --argjson rule "$rule_json" '. + [$rule]' <<<"$result") || return 1
-        elif [[ "$rule_type" == "singbox-ai" ]]; then
-            # 相邻路由表达 OR；ip_version 与规则集相交，不能用全网 ip_cidr 扩张匹配。
-            local ai_ip_version=0
-            case "$ip_version" in
-                ipv4_only) ai_ip_version=4 ;;
-                ipv6_only) ai_ip_version=6 ;;
+        local base
+        base=$(jq -nc --arg tag "$tag" --argjson version "$version" \
+            '{outbound:$tag} + (if $version == 0 then {} else {ip_version:$version} end)') || return 1
+        # Preserve explicit inbound scope.
+        if jq -e 'has("inbound")' <<<"$rule" >/dev/null; then
+            base=$(jq --argjson inbound "$(jq '.inbound' <<<"$rule")" '. + {inbound:$inbound}' <<<"$base") || return 1
+        fi
+        if [[ "$rule_type" == all ]]; then
+            result=$(jq --argjson base "$base" '. + [$base + {_phase:3}]' <<<"$result") || return 1
+            continue
+        fi
+        local -a tokens=()
+        IFS=',' read -r -a tokens <<<"$domains"
+        for token in "${tokens[@]}"; do
+            token="${token#"${token%%[![:space:]]*}"}"
+            token="${token%"${token##*[![:space:]]}"}"
+            [[ -n "$token" ]] || continue
+            case "$token" in
+                rule-set:*|ruleset:*|skk-*|yuu-*|geosite:*|geoip:*)
+                    tags=$(_singbox_sukka_tags_for_token "$token") || return 1
+                    while IFS= read -r rs; do
+                        [[ -n "$rs" ]] || continue
+                        case "$rs" in skk-domainset-*) phase=0 ;; skk-non-ip-*|yuu-non-ip-*) phase=1 ;; skk-ip-*) phase=2 ;; *) return 1 ;; esac
+                        result=$(jq --argjson base "$base" --arg rs "$rs" --argjson phase "$phase" \
+                            '. + [$base + {rule_set:[$rs],_phase:$phase}]' <<<"$result") || return 1
+                    done <<<"$tags" ;;
+                *)
+                    # User domain rules precede non-IP rules; literal IPs follow them.
+                    local field=domain_suffix
+                    phase=0
+                    if [[ "$token" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ || "$token" == *:* ]]; then
+                        field=ip_cidr; phase=2
+                        [[ "$version" != 4 || "$token" != *:* ]] || continue
+                        [[ "$version" != 6 || "$token" != *.* ]] || continue
+                    fi
+                    result=$(jq --argjson base "$base" --arg field "$field" --arg value "$token" --argjson phase "$phase" \
+                        '. + [$base + {($field):[$value],_phase:$phase}]' <<<"$result") || return 1 ;;
             esac
-            result=$(jq --arg tag "$tag" --argjson version "$ai_ip_version" '
-                . + (["skk-ai-non-ip", "skk-ai-ip"] | map(
-                    {rule_set:[.], outbound:$tag} +
-                    (if $version == 0 then {} else {ip_version:$version} end)))' <<<"$result") || return 1
-        elif [[ -n "$domains" ]]; then
-            # 检测是否是 geosite 规则
-            if [[ "$domains" == geosite:* ]]; then
-                # Sing-box 使用 rule_set 格式，需要引用 geosite 规则集
-                local geosite_name="${domains#geosite:}"
-                if [[ -n "$ip_family_cidr" ]]; then
-                    result=$(echo "$result" | jq --arg geosite "$geosite_name" --arg tag "$tag" --arg ip "$ip_family_cidr" \
-                        '. + [{"rule_set": ["geosite-\($geosite)"], "ip_cidr": [$ip], "outbound": $tag}]')
-                else
-                    result=$(echo "$result" | jq --arg geosite "$geosite_name" --arg tag "$tag" \
-                        '. + [{"rule_set": ["geosite-\($geosite)"], "outbound": $tag}]')
-                fi
-            elif [[ "$domains" =~ ^geoip:[^,]+(,geoip:[^,]+)*$ ]]; then
-                # geoip 规则转换为对应 rule_set
-                local geoip_rule_set
-                geoip_rule_set=$(echo "$domains" | tr ',' '\n' | grep -v '^$' | sed 's/^geoip:/geoip-/' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
-                if [[ -n "$geoip_rule_set" && "$geoip_rule_set" != "[]" && "$geoip_rule_set" != "null" ]] && echo "$geoip_rule_set" | jq empty 2>/dev/null; then
-                    if [[ -n "$ip_family_cidr" ]]; then
-                        result=$(echo "$result" | jq --argjson sets "$geoip_rule_set" --arg tag "$tag" --arg ip "$ip_family_cidr" \
-                            '. + [{"rule_set": $sets, "ip_cidr": [$ip], "outbound": $tag}]')
-                    else
-                        result=$(echo "$result" | jq --argjson sets "$geoip_rule_set" --arg tag "$tag" \
-                            '. + [{"rule_set": $sets, "outbound": $tag}]')
-                    fi
-                fi
-            else
-                # 分离域名和 IP 地址
-                local domain_list="" ip_list=""
-                local item
-                for item in $(echo "$domains" | tr ',' ' '); do
-                    [[ -z "$item" ]] && continue
-                    # 判断是否是 IP 地址 (IPv4/IPv6/CIDR)
-                    if [[ "$item" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] || [[ "$item" =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]]; then
-                        if [[ "$ip_version" == "ipv4_only" && "$item" =~ : ]]; then
-                            continue
-                        fi
-                        if [[ "$ip_version" == "ipv6_only" && "$item" =~ \. ]]; then
-                            continue
-                        fi
-                        [[ -n "$ip_list" ]] && ip_list+=","
-                        ip_list+="$item"
-                    else
-                        [[ -n "$domain_list" ]] && domain_list+=","
-                        domain_list+="$item"
-                    fi
-                done
-
-                # 生成域名规则
-                if [[ -n "$domain_list" ]]; then
-                    local domain_array
-                    domain_array=$(echo "$domain_list" | tr ',' '\n' | grep -v '^$' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
-                    if [[ -n "$domain_array" && "$domain_array" != "[]" && "$domain_array" != "null" ]] && echo "$domain_array" | jq empty 2>/dev/null; then
-                        if [[ -n "$ip_family_cidr" ]]; then
-                            result=$(echo "$result" | jq --argjson domains "$domain_array" --arg tag "$tag" --arg ip "$ip_family_cidr" \
-                                '. + [{"domain_suffix": $domains, "ip_cidr": [$ip], "outbound": $tag}]')
-                        else
-                            result=$(echo "$result" | jq --argjson domains "$domain_array" --arg tag "$tag" \
-                                '. + [{"domain_suffix": $domains, "outbound": $tag}]')
-                        fi
-                    fi
-                fi
-
-                # 生成 IP 规则
-                if [[ -n "$ip_list" ]]; then
-                    local ip_array
-                    ip_array=$(echo "$ip_list" | tr ',' '\n' | grep -v '^$' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
-                    if [[ -n "$ip_array" && "$ip_array" != "[]" && "$ip_array" != "null" ]] && echo "$ip_array" | jq empty 2>/dev/null; then
-                        result=$(echo "$result" | jq --argjson ips "$ip_array" --arg tag "$tag" '. + [{"ip_cidr": $ips, "outbound": $tag}]')
-                    fi
-                fi
-            fi
-        fi
-        if [[ "$rule_type" == singbox-instagram ]]; then
-            result=$(jq --argjson start "$previous_count" --argjson inbounds "$instagram_inbounds" '
-                to_entries | map(if .key >= $start then .value + {inbound:$inbounds} else .value end)' <<<"$result") || return 1
-        fi
-    done < <(echo "$rules" | jq -c '.[]')
-
-    [[ "$result" != "[]" ]] && echo "$result"
-    return 0
+        done
+    done < <(jq -c '.[]' <<<"$rules")
+    # Explicit original index makes ordering stable within each global phase.
+    jq 'to_entries | sort_by([.value._phase,.key]) | map(.value | del(._phase)) |
+        reduce .[] as $rule ([]; if index($rule) == null then . + [$rule] else . end)' <<<"$result"
 }
 
 # 生成 Sing-box WARP outbound 配置 (支持 WireGuard 和 SOCKS5 双模式)
@@ -10554,9 +10354,8 @@ test_routing() {
     return 0
 }
 
-# 访问限制预设（最小可用集）
-ACCESS_RESTRICT_CN_DOMAINS="geosite:cn,geoip:cn"
-ACCESS_RESTRICT_BTPT_DOMAINS="geosite:tracker"
+# 访问限制预设（Sukka 规则集；保留旧规则标识用于识别和清理）
+ACCESS_RESTRICT_CN_DOMAINS="rule-set:skk-non-ip-domestic,rule-set:skk-ip-domestic,rule-set:skk-ip-china_ip,rule-set:skk-ip-china_ip_ipv6"
 
 access_restriction_enabled() {
     [[ ! -f "$DB_FILE" ]] && return 1
@@ -10567,8 +10366,8 @@ access_restriction_enabled() {
         .id == "restrict-btpt-tracker" or
         .id == "restrict-btpt-trackers" or
         .id == "restrict-btpt-pt" or
-        .type == "restrict-cn" or
-        .type == "restrict-btpt" or
+        .id == "restrict-cn" or .type == "restrict-cn" or
+        .id == "restrict-btpt" or .type == "restrict-btpt" or
         ((.outbound // "") == "block" and (
             (.domains // "") == "geosite:tracker,geosite:public-tracker,geosite:private-tracker" or
             (.domains // "") == "geosite:category-pt" or
@@ -10584,8 +10383,9 @@ access_restriction_enabled() {
 
 _enable_access_rule() {
     local type="$1" domains="$2"
-    db_del_routing_rule "$type" "by_type"
-    db_add_routing_rule "$type" "block" "$domains" "as_is"
+    _db_apply --arg type "$type" --arg domains "$domains" '
+        .routing_rules = ([.routing_rules[]? | select(.type != $type and .id != $type)] +
+            [{id: $type, type: "custom", outbound: "block", domains: $domains, ip_version: "as_is"}])'
 }
 
 cleanup_legacy_access_restriction_rules() {
@@ -10596,8 +10396,8 @@ cleanup_legacy_access_restriction_rules() {
         .id == "restrict-btpt-tracker" or
         .id == "restrict-btpt-trackers" or
         .id == "restrict-btpt-pt" or
-        .type == "restrict-cn" or
-        .type == "restrict-btpt" or
+        .id == "restrict-cn" or .type == "restrict-cn" or
+        .id == "restrict-btpt" or .type == "restrict-btpt" or
         ((.outbound // "") == "block" and (
             (.domains // "") == "geosite:tracker,geosite:public-tracker,geosite:private-tracker" or
             (.domains // "") == "geosite:category-pt" or
@@ -10611,10 +10411,14 @@ cleanup_legacy_access_restriction_rules() {
 }
 
 disable_access_restriction() {
-    db_del_routing_rule "restrict-cn" "by_type"
-    db_del_routing_rule "restrict-btpt" "by_type"
-    cleanup_legacy_access_restriction_rules
-    _regenerate_proxy_configs
+    local previous_rules
+    previous_rules=$(db_get_routing_rules) || return 1
+    if ! cleanup_legacy_access_restriction_rules || ! _regenerate_proxy_configs; then
+        _db_apply --argjson rules "$previous_rules" '.routing_rules = $rules' || { _err "访问限制关闭失败，数据库恢复失败"; return 1; }
+        _err "访问限制关闭失败，已恢复原规则"
+        _pause
+        return 1
+    fi
     _ok "访问限制已关闭"
     _pause
 }
@@ -10628,14 +10432,14 @@ show_access_restriction_status() {
     echo "$rules" | jq -e '.[] | select(
         .id == "restrict-cn-geosite" or
         .id == "restrict-cn-geoip" or
-        .type == "restrict-cn" or
+        .id == "restrict-cn" or .type == "restrict-cn" or
         ((.outbound // "") == "block" and ((.domains // "") == "geosite:cn" or (.domains // "") == "geoip:cn"))
     )' >/dev/null 2>&1 && cn_enabled="是"
     echo "$rules" | jq -e '.[] | select(
         .id == "restrict-btpt-tracker" or
         .id == "restrict-btpt-trackers" or
         .id == "restrict-btpt-pt" or
-        .type == "restrict-btpt" or
+        .id == "restrict-btpt" or .type == "restrict-btpt" or
         ((.outbound // "") == "block" and (
             (.domains // "") == "geosite:tracker" or
             (.domains // "") == "geosite:public-tracker" or
@@ -10645,7 +10449,8 @@ show_access_restriction_status() {
         ))
     )' >/dev/null 2>&1 && bt_enabled="是"
     echo -e "  禁止回国: ${G}${cn_enabled}${NC}"
-    echo -e "  禁止 BT/PT: ${G}${bt_enabled}${NC}"
+    echo -e "  旧版 BT/PT 限制: ${G}${bt_enabled}${NC}"
+    echo -e "  ${D}BT/PT 暂无专用规则源，不支持新增启用；旧规则可通过关闭访问限制移除${NC}"
     echo ""
     echo -e "  ${D}当前预设规则:${NC}"
     echo "$rules" | jq -r '.[] | select(
@@ -10654,8 +10459,8 @@ show_access_restriction_status() {
         .id == "restrict-btpt-tracker" or
         .id == "restrict-btpt-trackers" or
         .id == "restrict-btpt-pt" or
-        .type == "restrict-cn" or
-        .type == "restrict-btpt" or
+        .id == "restrict-cn" or .type == "restrict-cn" or
+        .id == "restrict-btpt" or .type == "restrict-btpt" or
         ((.outbound // "") == "block" and (
             (.domains // "") == "geosite:cn" or
             (.domains // "") == "geoip:cn" or
@@ -10672,51 +10477,23 @@ show_access_restriction_status() {
 
 enable_access_restriction() {
     _header
-    echo -e "  ${W}启用回国 / BT/PT 限制${NC}"
+    echo -e "  ${W}启用回国限制${NC}"
     _line
     echo -e "  ${D}将写入以下预设拦截规则:${NC}"
-    echo -e "  • geosite:cn / geoip:cn -> block"
-    echo -e "  • geosite:tracker -> block"
+    echo -e "  • ${ACCESS_RESTRICT_CN_DOMAINS} -> block"
+    echo -e "  ${D}BT/PT 暂无专用规则源，不支持新增启用${NC}"
+    echo -e "  ${D}全局按 domainset → non_ip → ip 匹配，所有流量始终最后；手动优先级仅作用于阶段内部${NC}"
     echo ""
     read -rp "  确认启用? [Y/n]: " confirm
     [[ "$confirm" =~ ^[nN]$ ]] && return 0
-    cleanup_legacy_access_restriction_rules
-    db_add_routing_rule "custom" "block" "geosite:cn" "as_is"
-    python3 - "$DB_FILE" <<'PY2'
-import json,sys
-from pathlib import Path
-p=Path(sys.argv[1])
-d=json.loads(p.read_text())
-for r in d.get('routing_rules',[]):
-    if r.get('domains')=='geosite:cn' and r.get('outbound')=='block':
-        r['id']='restrict-cn-geosite'
-        break
-p.write_text(json.dumps(d,ensure_ascii=False,indent=2))
-PY2
-    db_add_routing_rule "custom" "block" "geoip:cn" "as_is"
-    python3 - "$DB_FILE" <<'PY2'
-import json,sys
-from pathlib import Path
-p=Path(sys.argv[1])
-d=json.loads(p.read_text())
-for r in d.get('routing_rules',[]):
-    if r.get('domains')=='geoip:cn' and r.get('outbound')=='block':
-        r['id']='restrict-cn-geoip'
-        break
-p.write_text(json.dumps(d,ensure_ascii=False,indent=2))
-PY2
-    db_add_routing_rule "custom" "block" "geosite:tracker" "as_is"
-    python3 - "$DB_FILE" <<'PY2'
-import json,sys
-from pathlib import Path
-p=Path(sys.argv[1])
-d=json.loads(p.read_text())
-for r in d.get('routing_rules',[]):
-    if r.get('domains')=='geosite:tracker' and r.get('outbound')=='block':
-        r['id']='restrict-btpt-tracker'
-        break
-p.write_text(json.dumps(d,ensure_ascii=False,indent=2))
-PY2
+    local previous_rules
+    previous_rules=$(db_get_routing_rules) || return 1
+    if ! cleanup_legacy_access_restriction_rules ||
+       ! _enable_access_rule "restrict-cn" "$ACCESS_RESTRICT_CN_DOMAINS"; then
+        _db_apply --argjson rules "$previous_rules" '.routing_rules = $rules' || { _err "访问限制写入失败，数据库恢复失败"; return 1; }
+        _err "访问限制写入失败，已恢复原规则"
+        return 1
+    fi
 
     if [[ -n "$(get_singbox_protocols 2>/dev/null)" ]]; then
         echo ""
@@ -10724,8 +10501,13 @@ PY2
         _info "若本机首次为 Sing-box 启用访问限制，可能会额外下载并编译规则集"
     fi
 
-    _regenerate_proxy_configs
-    _ok "访问限制已启用"
+    if ! _regenerate_proxy_configs; then
+        _db_apply --argjson rules "$previous_rules" '.routing_rules = $rules' || { _err "配置更新失败，数据库恢复失败"; return 1; }
+        _err "访问限制启用失败，已恢复原规则"
+        _pause
+        return 1
+    fi
+    _ok "回国限制已启用"
     sleep 1
     return 0
 }
@@ -10735,8 +10517,9 @@ manage_access_restrictions() {
         _header
         echo -e "  ${W}访问限制${NC}"
         _line
-        local access_action="启用回国 / BT/PT 限制"
-        access_restriction_enabled && access_action="关闭回国 / BT/PT 限制"
+        local access_action="启用回国限制"
+        access_restriction_enabled && access_action="关闭访问限制（含旧版 BT/PT）"
+        echo -e "  ${D}BT/PT 暂无专用规则源，不支持新增启用${NC}"
         _item "1" "$access_action"
         _item "2" "查看当前限制状态"
         _item "0" "返回"
@@ -10785,29 +10568,19 @@ _add_routing_rule() {
     _header
     echo -e "  ${W}添加分流规则${NC}"
     _line
-    echo -e "  ${D}默认顺序: 直连规则 > 自定义规则 > 预设规则 > 全局规则${NC}"
-    echo -e "  ${D}可按内核调整顺序；手动排序后，新建或覆盖的规则排在已排序规则之后${NC}"
+    echo -e "  ${D}全局匹配顺序: domainset → non_ip → ip → 所有流量${NC}"
+    echo -e "  ${D}手动优先级仅作用于各阶段内部；所有流量始终最后${NC}"
     _line
 
     echo -e "  ${Y}选择规则类型:${NC}"
     echo ""
-    _item "1" "OpenAI/ChatGPT"
-    _item "2" "Netflix"
-    _item "3" "Disney+"
-    _item "4" "YouTube"
-    _item "5" "Spotify"
-    _item "6" "TikTok"
-    _item "7" "Telegram"
-    _item "8" "Google"
-    local singbox_protocols
-    singbox_protocols=$(get_singbox_protocols) || :
-    [[ -z "$singbox_protocols" ]] || _item "s" "Sukka-AI-Sing-Box专属"
-    _item "d" "MyTVSuper"
-    local snell_protocols
-    snell_protocols=$(get_singbox_snell_protocols) || :
-    [[ -z "$snell_protocols" ]] || _item "i" "Instagram/INS (Snell v5)"
+    _item "1" "AI (Sukka)"
+    _item "2" "Stream (Sukka)"
+    _item "3" "Stream JP (Sukka)"
+    _item "4" "YouTube (Yuu)"
+    _item "5" "Google (Yuu)"
     _item "c" "自定义域名"
-    _item "b" "广告屏蔽 (geosite)"
+    _item "b" "广告屏蔽 (Sukka)"
     _item "a" "所有流量"
     _item "0" "返回"
     _line
@@ -10816,37 +10589,20 @@ _add_routing_rule() {
 
     local rule_type="" custom_domains=""
     case "$rule_choice" in
-        1) rule_type="openai" ;;
-        2) rule_type="netflix" ;;
-        3) rule_type="disney" ;;
+        1) rule_type="singbox-ai" ;;
+        2) rule_type="stream" ;;
+        3) rule_type="stream-jp" ;;
         4) rule_type="youtube" ;;
-        5) rule_type="spotify" ;;
-        6) rule_type="tiktok" ;;
-        7) rule_type="telegram" ;;
-        8) rule_type="google" ;;
-        s|S)
-            [[ -n "$singbox_protocols" ]] || { _warn "请先安装 Sing-box 协议"; _pause; return 1; }
-            rule_type="singbox-ai"
-            _info "分别使用 Sukka AI non_ip 与 ip 规则集，统一选择出口"
-            ;;
-        d|D) rule_type="mytvsuper" ;;
-        i|I)
-            if [[ -z "$snell_protocols" ]]; then
-                _warn "Instagram/INS 分流需要先安装 Sing-box Snell v5"
-                _pause
-                return
-            fi
-            rule_type="singbox-instagram"
-            _info "使用 Yuu-rules Instagram 域名规则集，每 24 小时更新，仅对 Snell v5 生效"
-            ;;
+        5) rule_type="google" ;;
         c|C)
             rule_type="custom"
             echo ""
             echo -e "  ${Y}输入要分流的匹配规则 (逗号分隔):${NC}"
-            echo -e "  ${D}支持三种格式:${NC}"
+            echo -e "  ${D}支持普通域名/IP 与 Sukka 规则集，可混合输入:${NC}"
             echo -e "  ${D}  1) 普通域名/IP: google.com,youtube.com 或 1.2.3.4,192.168.0.0/16${NC}"
-            echo -e "  ${D}  2) geosite 规则: geosite:category-ads-all${NC}"
-            echo -e "  ${D}  3) geoip 规则: geoip:cn,geoip:telegram${NC}"
+            echo -e "  ${D}  2) domainset: rule-set:skk-domainset-cdn${NC}"
+            echo -e "  ${D}  3) non_ip: rule-set:skk-non-ip-ai${NC}"
+            echo -e "  ${D}  4) ip: rule-set:skk-ip-telegram${NC}"
             read -rp "  匹配规则: " custom_domains
             custom_domains=$(echo "$custom_domains" | tr -d ' \t')
             if [[ -z "$custom_domains" ]]; then
@@ -10869,10 +10625,16 @@ _add_routing_rule() {
 
     # 广告屏蔽规则直接使用 block 出口，不需要选择
     if [[ "$rule_type" == "ads" ]]; then
-        db_add_routing_rule "$rule_type" "block"
-        _ok "已添加规则: 广告屏蔽 → 拦截"
+        local ads_previous_rules
+        ads_previous_rules=$(db_get_routing_rules) || return 1
         _info "更新代理配置..."
-        _regenerate_proxy_configs || { _pause; return 1; }
+        if ! db_add_routing_rule "$rule_type" "block" || ! _regenerate_proxy_configs; then
+            _db_apply --argjson rules "$ads_previous_rules" '.routing_rules = $rules' || { _err "数据库恢复失败"; return 1; }
+            _err "添加失败，已恢复原规则"
+            _pause
+            return 1
+        fi
+        _ok "已添加规则: 广告屏蔽 → 拦截"
         _ok "配置已更新"
         _pause
         return
@@ -10924,18 +10686,21 @@ _add_routing_rule() {
         fi
     fi
 
-    # AI 专属规则修改失败时恢复原数据库，与配置回滚保持一致。
-    local ai_snapshot=""
-    if [[ "$rule_type" == singbox-ai ]]; then
-        ai_snapshot=$(mktemp "$CFG/.ai-routing.XXXXXX") || return 1
-        cp -p "$DB_FILE" "$ai_snapshot" || { rm -f "$ai_snapshot"; return 1; }
-    fi
+    # 所有新增/覆盖操作在配置应用失败时通过数据库锁恢复原规则。
+    local previous_rules saved=false applied=false
+    previous_rules=$(db_get_routing_rules) || return 1
 
     # 保存规则
     if [[ "$rule_type" == "custom" ]]; then
-        db_add_routing_rule "$rule_type" "$outbound" "$custom_domains" "$ip_version"
+        db_add_routing_rule "$rule_type" "$outbound" "$custom_domains" "$ip_version" && saved=true
     else
-        db_add_routing_rule "$rule_type" "$outbound" "" "$ip_version"
+        db_add_routing_rule "$rule_type" "$outbound" "" "$ip_version" && saved=true
+    fi
+    if [[ "$saved" != true ]]; then
+        _db_apply --argjson rules "$previous_rules" '.routing_rules = $rules' || { _err "数据库恢复失败"; return 1; }
+        _err "规则保存失败，已恢复原规则"
+        _pause
+        return 1
     fi
 
     local rule_name="${ROUTING_PRESET_NAMES[$rule_type]:-$rule_type}"
@@ -10953,23 +10718,20 @@ _add_routing_rule() {
         as_is|asis) ip_version_mark=" ${C}[ALL]${NC}" ;;
     esac
 
-    _ok "已添加规则: ${rule_name} → ${outbound_name}${ip_version_mark}"
-
-    # Mihomo 专属规则只应用到 Mihomo，不重启其他内核。
+    # 专属规则只应用到对应内核。
     _info "更新代理配置..."
     if [[ "$rule_type" == singbox-ai ]]; then
-        if ! _reload_ai_routing_core "$rule_type"; then
-            cp -p "$ai_snapshot" "$DB_FILE" || { _err "数据库恢复失败，备份保留: $ai_snapshot"; return 1; }
-            rm -f "$ai_snapshot"
-            _pause
-            return 1
-        fi
-        rm -f "$ai_snapshot"
-    elif [[ "$rule_type" == singbox-instagram ]]; then
-        _regenerate_singbox_routing_config || { _pause; return 1; }
+        _reload_ai_routing_core "$rule_type" && applied=true
     else
-        _regenerate_proxy_configs || { _pause; return 1; }
+        _regenerate_proxy_configs && applied=true
     fi
+    if [[ "$applied" != true ]]; then
+        _db_apply --argjson rules "$previous_rules" '.routing_rules = $rules' || { _err "数据库恢复失败"; return 1; }
+        _err "配置更新失败，已恢复原规则"
+        _pause
+        return 1
+    fi
+    _ok "已添加规则: ${rule_name} → ${outbound_name}${ip_version_mark}"
     _ok "配置已更新"
     _pause
 }
@@ -11127,8 +10889,8 @@ _reorder_routing_rules() {
         _header
         echo -e "  ${W}${core_name} 分流规则顺序${NC}"
         _line
-        _info "从上到下匹配，首条命中生效；系统保护和用户专属路由保持原有优先级"
-        _warn "将“所有流量”前移会覆盖其后符合相同 IP 版本的分流规则"
+        _info "全局按 domainset → non_ip → ip 匹配，所有流量始终最后"
+        _info "手动顺序仅调整各阶段内部的优先级，阶段内首条命中生效"
         idx=1
         while IFS= read -r rule; do
             rule_type=$(jq -r '.type' <<<"$rule")

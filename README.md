@@ -24,6 +24,21 @@ Snell v5/v6 安装时均可选择 sing-box 或 Surge 原厂，默认 sing-box。
 
 分流支持 sing-box 规则集、普通 WARP 出口和链式节点。最低延迟选择使用 URLTest；Selector 固定选择首节点。多 IP 入站与出口映射、WARP IPv6 专用双层链式向导暂不可用，相关入口会明确提示。原 Xray 路径回落共用端口功能已移除，VLESS TLS/WS 使用独立端口。
 
+分流分类使用发布方现成规则，不从聚合规则中提取网站域名：
+
+| 标签 | 来源 |
+| --- | --- |
+| AI | Sukka `non_ip/ai`、`ip/ai` |
+| Stream | Sukka `non_ip/stream`、`ip/stream` |
+| Stream JP | Sukka `non_ip/stream_jp`、`ip/stream_jp` |
+| YouTube、Google | [Yuu518/sing-box-rules](https://github.com/Yuu518/sing-box-rules) 的 `rule_set_site/youtube.json`、`google.json` |
+| 广告屏蔽 | Sukka `domainset/reject`、`non_ip/reject`、`ip/reject` |
+| 所有流量 | 保留的兜底标签，匹配其余流量 |
+
+Sukka 规则统一从 [ruleset.skk.moe](https://ruleset.skk.moe/) 获取，按 [Sukka 的配置说明](https://blog.skk.moe/post/i-have-my-unique-surge-setup/) 将规则全局排为 **domainset → non_ip → ip → 所有流量**；缺少某一类文件时直接跳过。YouTube 和 Google 的原生文件只有域名规则，排在 non_ip 阶段。自定义域名在域名阶段、自定义 IP 在 IP 阶段匹配；手动调整优先级只影响同一阶段。“所有流量”始终在最后，出口标签、IPv4/IPv6 条件继续保留。默认先匹配 Stream JP 再匹配 Stream，先匹配 YouTube 再匹配 Google；WARP 必要的防回环保护仍优先执行。
+
+规则在配置重建时检查并按 24 小时周期刷新，下载或编译失败不会替换原规则缓存和运行配置。旧 AI、YouTube、Google 预设及支持的旧 GeoSite/GeoIP 引用会在生成时转换至新源；没有对应现成规则的旧分类会明确报错并保留运行配置，请在菜单中删除后选择新的分类。回国限制改用 Sukka 国内域名及 IP 规则；新启用时不再添加 BT/PT 限制，旧 BT/PT 限制仍可关闭。
+
 版本检查实时查询 GitHub，不读取本地版本缓存，也不在查询失败后回退旧缓存。脚本以所选分支（默认 `main`）的当前提交为准，上传代码并提高脚本版本号即可在下一次启动或手动检查时发现，无需先发布 Release。内核更新使用发布方 Release。网络失败或 API 限流会提示重试。
 
 证书、订阅、Nginx、Cloudflare Tunnel、WARP 和端口转发按需安装。`nft.sh` 使用 `/etc/sing-lite/nftables/`、独立的 `sing_port_forward` 表及 `sing-nftm` 命令；系统 nftables 服务仍为共用服务。
