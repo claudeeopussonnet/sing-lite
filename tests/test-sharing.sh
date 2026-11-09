@@ -7,7 +7,8 @@ first = dict(port=44001, uuid='00000000-0000-4000-8000-000000000001',
              sni='first.example', security_mode='reality')
 second = dict(first, port=44002, uuid='00000000-0000-4000-8000-000000000002', sni='second.example')
 json.dump(dict(singbox={'vless-singbox':[first, second],
-                       'snell-v5':dict(port=44005, psk='testSharedV5Key', version=5)},
+                       'snell-v5':dict(port=44005, psk='testSharedV5Key', version=5),
+                       'snell-v6-singbox':dict(port=44006, psk='testSharedV6Key', version=6, mode='unsafe-raw')},
                snell={'snell-v5-official':dict(port=44015, psk='testOfficialV5Key', version=5),
                       'snell-v6':dict(port=44016, psk='testOfficialV6Key', version=6, mode='unshaped')}),
           open(sys.argv[1], 'w'))
@@ -33,11 +34,19 @@ for port, last, domain in [(44001,'1','first.example'), (44002,'2','second.examp
     assert str(port) in (root/'clash').read_text()
     assert str(port) in (root/'share').read_text()
 surge = (root/'surge').read_text()
-for port, psk, version in [(44005,'testSharedV5Key',5), (44015,'testOfficialV5Key',5), (44016,'testOfficialV6Key',6)]:
+for port, psk, version in [(44005,'testSharedV5Key',5), (44006,'testSharedV6Key',6), (44015,'testOfficialV5Key',5), (44016,'testOfficialV6Key',6)]:
     rows = [line for line in surge.splitlines() if f', {port},' in line]
     assert len(rows) == 1, (port, rows)
     assert f'psk={psk}' in rows[0] and f'version={version}' in rows[0], rows[0]
 assert 'mode=unshaped' in surge
+assert 'mode=unsafe-raw' in surge
+for port, mode, impl in [(44006,'unsafe-raw','singbox'),(44016,'unshaped','official')]:
+    link, = [urlsplit(line) for line in (root/'generic').read_text().splitlines()
+             if line.startswith('snell://') and urlsplit(line).port == port]
+    query = parse_qs(link.query)
+    assert query['version'] == ['6'] and query['mode'] == [mode], link
+    assert impl in link.fragment, link
+    assert str(port) in (root/'share').read_text()
 PY
 printf 'ok - multiport REALITY shares and official/shared Snell subscription namespaces\n'
 

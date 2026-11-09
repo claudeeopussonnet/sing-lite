@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.0.0 [服务端]
+#  sing-lite v1.0.1 [服务端]
 #  官方 sing-box 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 sing。
 #  适配: Alpine/Debian/Ubuntu/CentOS
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.0.1"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/sing-lite"
 readonly SCRIPT_REPO="mikuuu3981/sing-lite"
@@ -605,6 +605,7 @@ get_protocol_name() {
         snell-v5) echo 'Snell v5 (sing-box)' ;;
         snell-v5-official) echo 'Snell v5 (Surge 原厂)' ;;
         snell-v6) echo 'Snell v6 (Surge 原厂)' ;;
+        snell-v6-singbox) echo 'Snell v6 (sing-box)' ;;
         ss2022-shadowtls) echo 'SS2022 + ShadowTLS v3' ;;
         ss2022) echo SS2022 ;;
         ss-legacy) echo Shadowsocks ;;
@@ -1417,7 +1418,7 @@ db_migrate_to_multiuser() {
             if has("users") or ((.uuid // .password // .username // "") == "") then .
             else .users=[{name:"default",uuid:(.uuid // .password // .username),enabled:true}] end;
         .singbox |= with_entries(
-            if .key == "snell-v5" or .key == "ss2022-shadowtls" then . else
+            if .key == "snell-v5" or .key == "snell-v6-singbox" or .key == "ss2022-shadowtls" then . else
                 .value |= (if type == "array" then map(migrate) else migrate end)
             end)
     '
@@ -2293,7 +2294,7 @@ fi
 
 # 协议分类定义 (重构: Sing-box 接管独立协议)
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
-SINGBOX_PROTOCOLS="vless-singbox vless-vision vless-ws vless-ws-notls ss2022 ss-legacy socks hy2 tuic anytls naive ss2022-shadowtls snell-v5"
+SINGBOX_PROTOCOLS="vless-singbox vless-vision vless-ws vless-ws-notls ss2022 ss-legacy socks hy2 tuic anytls naive ss2022-shadowtls snell-v5 snell-v6-singbox"
 readonly SINGBOX_SNELL_MIN_VERSION="1.14.0"
 # Sing-box Snell v4/v5 协议键保持稳定，供管理和客户端订阅识别。
 SINGBOX_SNELL_V45_PROTOCOLS="snell-v5"
@@ -5374,7 +5375,7 @@ _install_binary() {
     [[ -n "$version" ]] || version=$(_get_singbox_target_version "$channel") || return 1
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ ]] || return 1
     if [[ -n "$(get_singbox_snell_protocols)" ]] && ! _singbox_supports_snell_version "$version"; then
-        _err "Snell v5 需要 Sing-box ${SINGBOX_SNELL_MIN_VERSION}+"
+        _err "Snell v5/v6 需要 Sing-box ${SINGBOX_SNELL_MIN_VERSION}+"
         return 1
     fi
     tmp=$(mktemp -d) || return 1
@@ -5458,7 +5459,7 @@ ensure_singbox_snell_support() {
     version=$(_get_core_version sing-box)
     _singbox_supports_snell_version "$version" && return 0
     version=$(_get_singbox_target_version stable) || return 1
-    _singbox_supports_snell_version "$version" || { _err "稳定版暂不支持 Snell v5"; return 1; }
+    _singbox_supports_snell_version "$version" || { _err "稳定版暂不支持 Snell v5/v6"; return 1; }
     _update_singbox_core_to_version stable "$version"
 }
 
@@ -5574,7 +5575,7 @@ _update_singbox_core_to_version() {
     local channel="$1" version="$2" install_func="${3:-install_singbox}"
     local snapshot binary had_binary=false was_running=false success=false installed=false
     if [[ -n "$(get_singbox_snell_protocols)" ]] && ! _singbox_supports_snell_version "$version"; then
-        _err "Snell v5 需要 Sing-box ${SINGBOX_SNELL_MIN_VERSION}+"; return 1
+        _err "Snell v5/v6 需要 Sing-box ${SINGBOX_SNELL_MIN_VERSION}+"; return 1
     fi
     mkdir -p "$CFG" || return 1
     binary=$(_core_binary_path sing-box) || return 1
@@ -6001,9 +6002,19 @@ _build_singbox_ruleset_defs() {
     echo "$defs"
 }
 
-# Mieru 由 Mihomo 提供；JSON 是合法 YAML，使用 jq 避免凭据插值和 YAML 类型歧义。
+# 校验共享 Snell 入站的版本、凭据与模式。
 _validate_singbox_snell_record() {
-    [[ "${2:-snell-v5}" == snell-v5 ]] || return 1
+    local protocol="${2:-snell-v5}"
+    if [[ "$protocol" == snell-v6-singbox ]]; then
+        jq -e 'type == "object" and .version == 6 and
+            (.port | type == "number" and . == floor and . >= 1 and . <= 65535) and
+            (.psk | type == "string" and length >= 12 and length <= 255 and
+                (explode | all(.[]; . != 0 and . != 10 and . != 13))) and
+            ((.mode // "default") | . == "default" or . == "unshaped" or . == "unsafe-raw")
+        ' <<<"$1" >/dev/null
+        return $?
+    fi
+    [[ "$protocol" == snell-v5 ]] || return 1
     jq -e 'type == "object" and .version == 5 and
         (.port | type == "number" and . == floor and . >= 1 and . <= 65535) and
         (.psk | type == "string" and length > 0 and (explode | all(.[]; . != 0 and . != 10 and . != 13)))
@@ -6012,12 +6023,15 @@ _validate_singbox_snell_record() {
 
 
 get_singbox_snell_protocols() {
-    db_exists singbox snell-v5 && printf "%s\n" snell-v5
+    local protocol
+    for protocol in snell-v5 snell-v6-singbox; do
+        db_exists singbox "$protocol" && printf '%s\n' "$protocol"
+    done
     return 0
 }
 
 is_singbox_snell_protocol() {
-    [[ "$1" == snell-v5 ]]
+    [[ "$1" == snell-v5 || "$1" == snell-v6-singbox ]]
 }
 
 # 生成 Sing-box 统一配置；可写入候选文件，校验成功前不覆盖运行配置。
@@ -6028,12 +6042,12 @@ _lite_singbox_inbounds() {
             if [[ -f "$CFG/certs/$proto/server.crt" ]]; then
                 cert="$CFG/certs/$proto/server.crt"; key="$CFG/certs/$proto/server.key"
             fi ;;
-        vless-singbox|vless-vision|vless-ws|vless-ws-notls|ss2022|ss-legacy|ss2022-shadowtls|socks|anytls|naive|snell-v5) ;;
+        vless-singbox|vless-vision|vless-ws|vless-ws-notls|ss2022|ss-legacy|ss2022-shadowtls|socks|anytls|naive|snell-v5|snell-v6-singbox) ;;
         *) _err "不支持的 Sing-box 服务端协议: $proto"; return 1 ;;
     esac
     jq -e 'type == "object" and (.port | type == "number" and . == floor and . >= 1 and . <= 65535)' <<<"$cfg" >/dev/null || return 1
-    if [[ "$proto" == snell-v5 ]]; then
-        _validate_singbox_snell_record "$cfg" snell-v5 || return 1
+    if is_singbox_snell_protocol "$proto"; then
+        _validate_singbox_snell_record "$cfg" "$proto" || return 1
     elif [[ "$proto" == socks ]]; then
         jq -e '.tls != true and .tls != "true"' <<<"$cfg" >/dev/null || {
             _err "SOCKS5 仅支持明文"; return 1;
@@ -6070,6 +6084,8 @@ _lite_singbox_inbounds() {
         elif $p == "naive" then
             $base + {type:"naive",tls:$tls,users:[$users[] | {username:(.username // .name),password:(.password // .uuid)}]}
         elif $p == "snell-v5" then $base + {type:"snell",tag:("snell-snell-v5-"+($c.port|tostring)),version:5,psk:$c.psk}
+        elif $p == "snell-v6-singbox" then
+            $base + {type:"snell",tag:("snell-snell-v6-singbox-"+($c.port|tostring)),version:6,psk:$c.psk,mode:($c.mode // "default")}
         elif $p == "ss2022" or $p == "ss-legacy" or $p == "ss2022-shadowtls" then
             (if $c | has("users") then
                 if ($users | length) == 0 then error("no enabled Shadowsocks users")
@@ -6486,7 +6502,7 @@ generate_singbox_config() {
     local chain_outbounds_added=""  # 跟踪已添加的链式代理 outbound
 
     for proto in $singbox_protocols; do
-        [[ "$proto" != snell-v5 ]] || continue
+        is_singbox_snell_protocol "$proto" && continue
         local db_users=$(jq -r --arg p "$proto" '
             .singbox[$p] as $cfg |
             if $cfg == null then empty
@@ -7292,12 +7308,12 @@ _lite_build_config() {
 # Rebuild every enabled account and every port into a candidate JOIN file.
 regenerate_singbox_protocol_join_info() {
     local protocol="$1" records record output tmp aggregate join ipv4 ipv6 ip host label
-    local port uuid password username sni path method psk public sid data link prefix
+    local port uuid password username sni path method psk public sid data link prefix mode country
     output="$CFG/$protocol.join"
     tmp=$(mktemp "$CFG/.protocol-join.XXXXXX") || return 1
     records=$(jq -c --arg p "$protocol" '
         .singbox[$p] | (if type == "array" then .[] elif type == "object" then . else empty end) |
-        . as $c | if has("users") and ($p != "snell-v5") then
+        . as $c | if has("users") and ($p != "snell-v5" and $p != "snell-v6-singbox") then
             .users[] | select(.enabled != false) | $c + {uuid:.uuid,name:.name,
                 username:(.username // .name),password:(if $p == "tuic" then (.password // $c.password)
                 elif ($p == "ss2022" or $p == "ss2022-shadowtls") and
@@ -7330,6 +7346,11 @@ regenerate_singbox_protocol_join_info() {
                 ss2022|ss2022-shadowtls) data="SS2022|$host|$port|$method|$password"; link=$(gen_ss2022_link "$host" "$port" "$method" "$password") ;;
                 ss-legacy) data="SS|$host|$port|$method|$password"; link=$(gen_ss_legacy_link "$host" "$port" "$method" "$password") ;;
                 snell-v5) data="SNELL-V5|$host|$port|$psk|5"; link=$(gen_snell_link "$host" "$port" "$psk" 5) ;;
+                snell-v6-singbox)
+                    mode=$(jq -r '.mode // "default"' <<<"$record")
+                    country=$(get_ip_country "$ip")
+                    data="SNELL-V6|$host|$port|$psk|6|$mode"
+                    link=$(gen_snell_link "$host" "$port" "$psk" 6 "$country" "$mode" singbox) ;;
                 *) rm -f "$tmp"; return 1 ;;
             esac || { rm -f "$tmp"; return 1; }
             if [[ "$protocol" == ss2022-shadowtls ]]; then
@@ -7557,6 +7578,23 @@ gen_snell_v5_server_config() {
     unset INSTALL_MODE REPLACE_PORT
 
     echo "server" > "$CFG/role"
+}
+
+# Snell v6 服务端配置（由 Sing-box 共享服务承载）
+gen_singbox_snell_v6_server_config() {
+    local psk="$1" port="$2" version="${3:-6}" mode="${4:-default}" record
+    _is_valid_port "$port" || return 1
+    _is_safe_credential "$psk" && [[ "$version" == 6 && ${#psk} -ge 12 && ${#psk} -le 255 ]] || {
+        _err "无效的 Snell v6 版本或 PSK（长度应为 12–255）"; return 1;
+    }
+    case "$mode" in
+        default|unshaped|unsafe-raw) ;;
+        *) _err "无效的 Snell v6 混淆模式: $mode"; return 1 ;;
+    esac
+    mkdir -p "$CFG" || return 1
+    record=$(_lite_build_config psk "$psk" port "$port" version "$version" mode "$mode") || return 1
+    _validate_singbox_snell_record "$record" snell-v6-singbox || return 1
+    _lite_apply_protocol snell-v6-singbox "$record"
 }
 
 # Snell v6 服务端配置
@@ -13577,7 +13615,7 @@ show_single_protocol_info() {
         [[ -z "$selected_port" || "$selected_port" == "$port" ]] || continue
         printf '  端口: %s\n' "$port"
         case "$protocol" in
-            snell-v5|snell-v5-official|snell-v6)
+            snell-v5|snell-v5-official|snell-v6|snell-v6-singbox)
                 gen_snell_surge_line "$(get_protocol_name "$protocol")-$port" "$address" "$port" \
                     "$(jq -r .psk <<< "$cfg")" "$(jq -r '.version // 5' <<< "$cfg")" \
                     "$(jq -r '.mode // "default"' <<< "$cfg")" "$(jq -r '.tfo // true' <<< "$cfg")"
@@ -13752,7 +13790,7 @@ uninstall_specific_protocol() {
     fi
     read -rp '  确认卸载? [y/N]: ' choice || return
     [[ "$choice" =~ ^[yY]$ ]] || return
-    if [[ "$selected" == snell-v5 ]]; then
+    if is_singbox_snell_protocol "$selected"; then
         _apply_singbox_snell_change remove "$SELECTED_PORT" '{}' "$selected" || return 1
     elif [[ "$kind" == singbox ]]; then
         _apply_singbox_vless_config '{}' remove "$SELECTED_PORT" "$selected" || return 1
@@ -13851,7 +13889,7 @@ select_protocol() {
     _item 10 "Naive (Sing-box)"
     _item 11 "SS2022 + ShadowTLS v3"
     _item 12 "Snell v5"
-    _item 13 "Snell v6 (Surge 官方)"
+    _item 13 "Snell v6"
     _item 0 "返回"
     while true; do
         read -rp "  选择协议 [0-13]: " choice || return 1
@@ -13869,7 +13907,7 @@ select_protocol() {
             10) SELECTED_PROTOCOL=naive ;;
             11) SELECTED_PROTOCOL=ss2022-shadowtls ;;
             12) select_snell_v5_implementation; return $? ;;
-            13) SELECTED_PROTOCOL=snell-v6 ;;
+            13) select_snell_v6_implementation; return $? ;;
             *) _err "无效选择"; continue ;;
         esac
         return 0
@@ -13878,7 +13916,19 @@ select_protocol() {
 
 # Snell v6 的实现选择先于已有实例检查，两种实现使用不同协议键。
 select_snell_v6_implementation() {
-    SELECTED_PROTOCOL=snell-v6
+    local choice
+    _item 1 "Sing-box Snell v6 (统一分流)"
+    _item 2 "Surge 官方 Snell v6 (独立服务)"
+    _item 0 "返回"
+    while true; do
+        read -rp "  请选择 [1]: " choice || return 1
+        case "${choice:-1}" in
+            1) SELECTED_PROTOCOL=snell-v6-singbox; return 0 ;;
+            2) SELECTED_PROTOCOL=snell-v6; return 0 ;;
+            0) SELECTED_PROTOCOL=""; return 1 ;;
+            *) _err "无效选择" ;;
+        esac
+    done
 }
 
 select_snell_v5_implementation() {
@@ -13930,6 +13980,7 @@ do_install_server() {
     mkdir -p "$CFG" || return 1
     if [[ "$core" == singbox ]]; then
         install_singbox || return 1
+        [[ "$protocol" != snell-v6-singbox ]] || ensure_singbox_snell_support || return 1
         handle_existing_protocol "$protocol" singbox || return 1
     else
         case "$protocol" in
@@ -14020,11 +14071,29 @@ do_install_server() {
                 gen_naive_server_config "$username" "$password" "$port" "$sni" || return 1
             fi
             ;;
-        snell-v5|snell-v5-official|snell-v6)
+        snell-v5|snell-v5-official|snell-v6|snell-v6-singbox)
             psk=$(ask_password 24 "Snell PSK") || return 1
+            if [[ "$protocol" == snell-v6-singbox ]]; then
+                while [[ ${#psk} -lt 12 || ${#psk} -gt 255 ]]; do
+                    _err "Snell v6 PSK 长度应为 12–255"
+                    psk=$(ask_password 24 "Snell PSK") || return 1
+                done
+            fi
             case "$protocol" in
                 snell-v5) gen_snell_v5_server_config "$psk" "$port" || return 1 ;;
                 snell-v5-official) gen_snell_v5_official_server_config "$psk" "$port" || return 1 ;;
+                snell-v6-singbox)
+                    local singbox_mode
+                    while true; do
+                        read -rp "  混淆模式 [default/unshaped/unsafe-raw，默认 default]: " singbox_mode || return 1
+                        singbox_mode="${singbox_mode:-default}"
+                        case "$singbox_mode" in
+                            default|unshaped|unsafe-raw) break ;;
+                            *) _err "无效的 Snell v6 混淆模式: $singbox_mode" ;;
+                        esac
+                    done
+                    gen_singbox_snell_v6_server_config "$psk" "$port" 6 "$singbox_mode" || return 1
+                    ;;
                 snell-v6)
                     local mode dns_pref dns_servers
                     read -rp "  混淆模式 [default/unshaped/unsafe-raw，默认 default]: " mode || return 1
@@ -15394,6 +15463,9 @@ gen_v2ray_sub() {
                 snell-v6)
                     link=$(gen_snell_link "$server_ip" "$actual_port" "$psk" 6 "$country_code" "$(jq -r '.mode // "default"' <<< "$cfg")" official)
                     ;;
+                snell-v6-singbox)
+                    link=$(gen_snell_link "$server_ip" "$actual_port" "$psk" 6 "$country_code" "$(jq -r '.mode // "default"' <<< "$cfg")" singbox)
+                    ;;
                 vless-ws)
                     [[ -n "$server_ip" ]] && link=$(gen_vless_ws_link "$server_ip" "$actual_port" "$uuid" "$sni" "$path" "$country_code")
                     ;;
@@ -15683,6 +15755,7 @@ gen_surge_sub() {
             case "$protocol" in
                 snell-v5|snell-v5-official) name="${country_code}-Snell-v5-${port}" ;;
                 snell-v6) name="${country_code}-Snell-v6-official-${port}" ;;
+                snell-v6-singbox) name="${country_code}-Snell-v6-singbox-${port}" ;;
             esac
             local user_name=$(jq -r '.user_name // ""' <<< "$cfg")
             [[ -z "$user_name" ]] || name="${name}-${port}-${user_name}"
@@ -15713,7 +15786,7 @@ gen_surge_sub() {
                 snell-v5|snell-v5-official)
                     [[ -n "$server_ip" ]] && proxy=$(gen_snell_surge_line "$name" "$server_ip" "$port" "$psk" "${version:-5}" "${snell_mode:-default}" "${snell_tfo:-true}" "$stls_password" "$sni")
                     ;;
-                snell-v6)
+                snell-v6|snell-v6-singbox)
                     # Snell v6 服务端与 Surge 客户端的 mode 必须完全一致。
                     [[ -n "$server_ip" ]] && proxy=$(gen_snell_surge_line "$name" "$server_ip" "$port" "$psk" "${version:-6}" "${snell_mode:-default}" "${snell_tfo:-true}")
                     ;;

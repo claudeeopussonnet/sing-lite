@@ -13,10 +13,10 @@ bash sing-lite.sh
 
 | 内核 | 服务端协议 |
 | --- | --- |
-| sing-box | VLESS REALITY、VLESS Vision/TLS、VLESS WS、SS2022、传统 Shadowsocks、SOCKS5、Hysteria2、TUIC、AnyTLS、Naive、SS2022+ShadowTLS、Snell v5 |
+| sing-box | VLESS REALITY、VLESS Vision/TLS、VLESS WS、SS2022、传统 Shadowsocks、SOCKS5、Hysteria2、TUIC、AnyTLS、Naive、SS2022+ShadowTLS、Snell v5、Snell v6 |
 | Surge 原厂 | Snell v5、Snell v6 |
 
-Snell v5 安装时选择 sing-box 或 Surge 原厂；Snell v6 使用原厂独立服务。原厂 Snell 不接入 sing-box 的共享分流。Naive 和 ShadowTLS 组合由 sing-box 内置实现承载。
+Snell v5/v6 安装时均可选择 sing-box 或 Surge 原厂，默认 sing-box。sing-box 版本使用共享服务与分流，原厂版本使用独立服务。两种实现可通过不同端口共存，v6 的客户端 mode 必须与服务端一致。Naive 和 ShadowTLS 组合由 sing-box 内置实现承载。
 
 不包含 Xray、Mihomo、Trojan/VMess 服务端、XHTTP、VLESS Encryption、Snell v4。保留外部 Trojan/VMess 节点的订阅及链式代理兼容。SOCKS5 不提供 TLS 选项。
 
