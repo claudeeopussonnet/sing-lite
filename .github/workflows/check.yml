@@ -1,0 +1,30 @@
+name: Check scripts
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax and help
+        run: |
+          bash -n vless-server.sh
+          bash -n nft.sh
+          bash vless-server.sh --help
+      - name: Download verified official sing-box
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/SagerNet/sing-box/releases/tags/v1.14.4 > "$RUNNER_TEMP/release.json"
+          asset=sing-box-1.14.4-linux-amd64.tar.gz
+          url=$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .browser_download_url' "$RUNNER_TEMP/release.json")
+          digest=$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .digest | select(startswith("sha256:")) | ltrimstr("sha256:")' "$RUNNER_TEMP/release.json")
+          curl -fsSL "$url" -o "$RUNNER_TEMP/sing-box.tar.gz"
+          printf '%s  %s\n' "$digest" "$RUNNER_TEMP/sing-box.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/sing-box.tar.gz" -C "$RUNNER_TEMP"
+          echo "SING_TEST_SINGBOX_BIN=$RUNNER_TEMP/sing-box-1.14.4-linux-amd64/sing-box" >> "$GITHUB_ENV"
+      - name: Regression tests with official core
+        run: bash tests/run.sh
