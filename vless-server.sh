@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.0.4 [服务端]
+#  sing-lite v1.0.5 [服务端]
 #  官方 sing-box 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 sing。
 #  适配: Alpine/Debian/Ubuntu/CentOS
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.0.4"
+readonly VERSION="1.0.5"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/claudeeopussonnet/sing-lite"
 readonly SCRIPT_REPO="claudeeopussonnet/sing-lite"
@@ -13040,11 +13040,16 @@ manage_protocol_services() {
 
 # 简洁的协议概览（用于服务管理页面）
 show_protocols_overview() {
-    local protocol core ports
+    local protocol core ports index=0 accent
     for protocol in $(get_installed_protocols); do
         core=$(protocol_db_core "$protocol") || continue
         ports=$(db_protocol_configs "$core" "$protocol" | jq -r '.port // empty' | paste -sd ',' -)
-        printf '  • %s - 端口: %s\n' "$(get_protocol_name "$protocol")" "$ports"
+        index=$((index+1))
+        accent='\e[1;96m'
+        ((index % 2 != 0)) || accent='\e[1;95m'
+        printf '  %b[%02d]%b  %b%s%b  %b│ 端口%b %b%s%b\n' \
+            "$accent" "$index" "$NC" '\e[1;97m' "$(get_protocol_name "$protocol")" "$NC" \
+            "$D" "$NC" '\e[1;93m' "${ports:-—}" "$NC"
     done
 }
 
@@ -13445,24 +13450,24 @@ do_install_server() {
 
 
 show_status() {
-    local installed protocol service ports running=0 total=0 status core
+    local installed protocol service running=0 total=0 status status_color
     _INSTALLED_CACHE=''
-    [[ -f "$DB_FILE" ]] || { printf '  状态: 未安装\n'; return; }
+    [[ -f "$DB_FILE" ]] || { printf '  %b状态%b  %b○ 未安装%b\n' "$D" "$NC" "$D" "$NC"; return; }
     installed=$(get_installed_protocols)
-    [[ -n "$installed" ]] || { printf '  状态: 未安装\n'; return; }
+    [[ -n "$installed" ]] || { printf '  %b状态%b  %b○ 未安装%b\n' "$D" "$NC" "$D" "$NC"; return; }
     _INSTALLED_CACHE="$installed"
     for protocol in $installed; do
         total=$((total+1))
         service="${PROTO_SVC[$protocol]}"
         svc status "$service" >/dev/null 2>&1 && running=$((running+1))
     done
-    if is_paused; then status=已暂停
-    elif ((running == total)); then status=运行中
-    elif ((running > 0)); then status="部分运行 ($running/$total)"
-    else status=已停止; fi
-    printf '  状态: %s\n' "$status"
+    if is_paused; then status='○ 已暂停'; status_color='\e[1;93m'
+    elif ((running == total)); then status='● 运行中'; status_color='\e[1;92m'
+    elif ((running > 0)); then status="◐ 部分运行 ($running/$total)"; status_color='\e[1;93m'
+    else status='○ 已停止'; status_color='\e[1;91m'; fi
+    printf '  %b状态%b  %b%s%b\n\n' "$D" "$NC" "$status_color" "$status" "$NC"
     show_protocols_overview
-    if access_restriction_enabled; then printf '  访问限制: 已启用\n'; fi
+    if access_restriction_enabled; then printf '  %b访问限制%b  %b已启用%b\n' "$D" "$NC" "$C" "$NC"; fi
 }
 install_nginx() {
     if check_cmd nginx; then
@@ -17468,8 +17473,7 @@ _update_script_from_channel() {
     fi
 
     if [[ "$channel" == stable ]]; then
-        _init_version_cache
-        remote_ver=$(_get_latest_script_version "true" "false" "$ref")
+        remote_ver=$(_get_latest_script_version_from_raw "$ref")
         if [[ -z "$remote_ver" ]]; then
             _err "无法获取远程版本信息"
             return 1

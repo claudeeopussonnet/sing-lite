@@ -7,7 +7,7 @@ curl -fL https://raw.githubusercontent.com/claudeeopussonnet/sing-lite/main/vles
 bash sing-lite.sh
 ```
 
-安装后运行 `sing` 打开管理菜单。
+安装后运行 `sing` 打开管理菜单，查看运行状态、彩色编号节点和端口。
 
 ## 支持协议
 

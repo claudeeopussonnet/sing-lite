@@ -72,3 +72,31 @@ mock_blob=cccccccccccccccccccccccccccccccccccccccc
 if _fetch_script_tmp 5 10 dev >"$TEST_TMP/rejected" 2>&1; then fail 'mismatched GitHub blob accepted'; fi
 [[ ! -e "$(cat "$TEST_TMP/download-path")" ]] || fail 'rejected script download was not removed'
 printf 'ok - commit-pinned script downloads require a matching GitHub blob digest\n'
+
+# Exercise the menu's actual update path, including staging, backup and system sync.
+# Version-query helpers alone cannot catch obsolete calls in the interactive flow.
+unset mock_blob
+_current_script_path() { printf '%s\n' "$TEST_TMP/current.sh"; }
+_system_script_path() { printf '%s\n' "$TEST_TMP/system.sh"; }
+printf '#!/bin/bash\nreadonly VERSION="0.0.1"\n' >"$TEST_TMP/original.sh"
+for channel in stable dev; do
+    cp "$TEST_TMP/original.sh" "$TEST_TMP/current.sh"
+    cp "$TEST_TMP/original.sh" "$TEST_TMP/system.sh"
+    chmod 755 "$TEST_TMP/current.sh" "$TEST_TMP/system.sh"
+    rc=0
+    LC_ALL=C _update_script_from_channel "$channel" <<<'n' >"$TEST_TMP/menu.log" 2>"$TEST_TMP/menu.err" || rc=$?
+    [[ "$rc" == 2 ]] || fail "$channel cancellation status"
+    cmp "$TEST_TMP/original.sh" "$TEST_TMP/current.sh"
+    cmp "$TEST_TMP/original.sh" "$TEST_TMP/system.sh"
+    if grep -q 'command not found' "$TEST_TMP/menu.err"; then fail "$channel update called missing helper"; fi
+
+    if ! LC_ALL=C _update_script_from_channel "$channel" <<<'y' >"$TEST_TMP/menu.log" 2>"$TEST_TMP/menu.err"; then
+        fail "$channel menu update failed"
+    fi
+    if grep -q 'command not found' "$TEST_TMP/menu.err"; then fail "$channel update called missing helper"; fi
+    cmp "$TEST_TMP/remote-script" "$TEST_TMP/current.sh"
+    cmp "$TEST_TMP/remote-script" "$TEST_TMP/system.sh"
+    cmp "$TEST_TMP/original.sh" "$TEST_TMP/current.sh.bak"
+    [[ "$(stat -c %a "$TEST_TMP/current.sh")" == 755 && "$(stat -c %a "$TEST_TMP/system.sh")" == 755 ]] || fail "$channel update permissions"
+done
+printf 'ok - stable/dev menu updates cancel cleanly or replace and sync verified scripts without missing helpers\n'
