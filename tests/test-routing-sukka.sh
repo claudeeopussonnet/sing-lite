@@ -135,7 +135,10 @@ test_menu_and_access() {
     cp "$DB_FILE" "$TEST_TMP/access.before"
     _regenerate_proxy_configs() { return 1; }
     if enable_access_restriction <<<'' >"$TEST_TMP/access.log" 2>&1; then fail 'failed CN activation succeeded'; fi
-    cmp "$TEST_TMP/access.before" "$DB_FILE"
+    # 回滚通过数据库写入接口恢复规则，更新时间戳可以跨秒变化。
+    jq -S 'del(.meta.updated)' "$TEST_TMP/access.before" >"$TEST_TMP/access.expected"
+    jq -S 'del(.meta.updated)' "$DB_FILE" >"$TEST_TMP/access.actual"
+    cmp "$TEST_TMP/access.expected" "$TEST_TMP/access.actual"
 }
 
 test_native_presets() {
