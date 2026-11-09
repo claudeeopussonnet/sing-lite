@@ -22,22 +22,22 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.0.3 [服务端]
+#  sing-lite v1.0.4 [服务端]
 #  官方 sing-box 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 sing。
 #  适配: Alpine/Debian/Ubuntu/CentOS
 #
 #
 #  作者: Zyx0rx
-#  项目地址: https://github.com/mikuuu3981/sing-lite
+#  项目地址: https://github.com/claudeeopussonnet/sing-lite
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.0.3"
+readonly VERSION="1.0.4"
 readonly AUTHOR="Zyx0rx"
-readonly REPO_URL="https://github.com/mikuuu3981/sing-lite"
-readonly SCRIPT_REPO="mikuuu3981/sing-lite"
-readonly SCRIPT_SOURCE_REPO="mikuuu3981/sing-lite"
+readonly REPO_URL="https://github.com/claudeeopussonnet/sing-lite"
+readonly SCRIPT_REPO="claudeeopussonnet/sing-lite"
+readonly SCRIPT_SOURCE_REPO="claudeeopussonnet/sing-lite"
 readonly SCRIPT_STABLE_REF="main"
 readonly SCRIPT_TEST_REF="dev"
 SCRIPT_SOURCE_REF="${SING_SCRIPT_SOURCE_REF:-$SCRIPT_STABLE_REF}"
@@ -264,10 +264,6 @@ db_add() { # db_add core proto json
     fi
 
     _db_apply --arg p "$proto" --argjson c "$json" ".${core}[\$p]=\$c"
-
-    # 协议配置更新后，自动同步隧道配置（如果有隧道）
-    # 确保隧道配置与新协议兼容
-    _sync_tunnel_config 2>/dev/null || true
 }
 
 
@@ -599,9 +595,6 @@ ask_password() {
 get_protocol_name() {
     case "$1" in
         vless-singbox) echo 'VLESS Vision REALITY' ;;
-        vless-vision) echo 'VLESS Vision TLS' ;;
-        vless-ws) echo 'VLESS WS TLS' ;;
-        vless-ws-notls) echo 'VLESS WS' ;;
         snell-v5) echo 'Snell v5 (sing-box)' ;;
         snell-v5-official) echo 'Snell v5 (Surge 原厂)' ;;
         snell-v6) echo 'Snell v6 (Surge 原厂)' ;;
@@ -2070,16 +2063,6 @@ regenerate_singbox_snell_v5_join_info() {
     regenerate_singbox_protocol_join_info snell-v5
 }
 
-# 检测 TLS 主协议并返回外部端口（用于 WS 类回落协议）
-# 注意：Reality (vless) 不支持 WS 回落，只有 vless-vision 和 trojan 可以
-# 仅当主协议端口为 8443 时才触发回落
-# 用法: outer_port=$(_get_master_port "$default_port")
-_get_master_port() { printf '%s\n' "$1"; }
-
-# 检测是否有 TLS 主协议且端口为 8443 (支持 WS 回落的协议)
-# 注意：Reality 使用 uTLS，不支持 WS 类型的回落
-_has_master_protocol() { return 1; }
-
 # 检查证书是否为 CA 签发的真实证书
 _is_real_cert() {
     [[ ! -f "$CFG/certs/server.crt" ]] && return 1
@@ -2152,28 +2135,6 @@ EOF
     return 0
 }
 
-# 处理独立协议的证书 (WS 类协议独立安装时使用)
-# 用法: _handle_standalone_cert "$sni" "$force_new_cert"
-_handle_standalone_cert() {
-    local sni="$1" force_new="${2:-false}"
-
-    if [[ "$force_new" == "true" ]]; then
-        if _is_real_cert; then
-            _warn "检测到 CA 签发的真实证书，不会覆盖"
-            return 1
-        fi
-        rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key"
-        gen_self_cert "$sni"
-        # 自签证书使用独立的标记文件，不写入 cert_domain (避免与 ACME 证书混淆)
-        echo "$sni" > "$CFG/self_cert_sni"
-        rm -f "$CFG/cert_domain"  # 清除可能存在的 ACME 域名记录
-    elif [[ ! -f "$CFG/certs/server.crt" ]]; then
-        gen_self_cert "$sni"
-        echo "$sni" > "$CFG/self_cert_sni"
-    fi
-    return 0
-}
-
 # 检测系统是否支持 IPv6
 _has_ipv6() {
     [[ -e /proc/net/if_inet6 ]]
@@ -2220,14 +2181,20 @@ set -o pipefail
 # 日志文件
 LOG_FILE="/var/log/sing-lite.log"
 
-# 统一日志函数 - 同时输出到终端和日志文件
+# 写入纯文本日志；终端颜色由调用者处理。
 _log() {
     local level="$1"
     shift
     local msg="$*"
+    # 同时清除实际 ANSI SGR 和颜色变量中的字面转义，不解释其他反斜杠。
+    local color_pattern='(\\e|\\033|\\x1[bB])'
+    color_pattern="("$'\033'"|${color_pattern})"'\[[0-9;]*m'
+    while [[ "$msg" =~ $color_pattern ]]; do
+        msg=${msg//"${BASH_REMATCH[0]}"/}
+    done
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     # 写入日志文件（无颜色）
-    echo "[$timestamp] [$level] $msg" >> "$LOG_FILE" 2>/dev/null
+    printf '[%s] [%s] %s\n' "$timestamp" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null
 }
 
 # 初始化日志文件
@@ -2294,7 +2261,7 @@ fi
 
 # 协议分类定义 (重构: Sing-box 接管独立协议)
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
-SINGBOX_PROTOCOLS="vless-singbox vless-vision vless-ws vless-ws-notls ss2022 ss-legacy socks hy2 tuic anytls naive ss2022-shadowtls snell-v5 snell-v6-singbox"
+SINGBOX_PROTOCOLS="vless-singbox ss2022 ss-legacy socks hy2 tuic anytls naive ss2022-shadowtls snell-v5 snell-v6-singbox"
 readonly SINGBOX_SNELL_MIN_VERSION="1.14.0"
 # Sing-box Snell v4/v5 协议键保持稳定，供管理和客户端订阅识别。
 SINGBOX_SNELL_V45_PROTOCOLS="snell-v5"
@@ -2517,7 +2484,7 @@ get_protocol() {
     local installed=$(get_installed_protocols)
     if [[ -n "$installed" ]]; then
         # 优先返回 Xray 主协议
-        for proto in vless-singbox vless-vision vless-ws socks ss2022; do
+        for proto in vless-singbox socks ss2022; do
             if echo "$installed" | grep -q "^$proto$"; then
                 echo "$proto"
                 return
@@ -3057,7 +3024,7 @@ recommend_port() {
         return 0
     fi
     case "$protocol" in
-        vless-ws|vless-vision|anytls|naive)
+        anytls|naive)
             for port in 443 8443 2096; do
                 if ! ss -tuln 2>/dev/null | grep -q ":$port " && ! is_internal_port_occupied "$port" >/dev/null; then
                     printf '%s\n' "$port"; return 0
@@ -3227,16 +3194,6 @@ diagnose_certificate() {
         _err "证书文件不存在"
     fi
 
-    # 检查端口监听 (从数据库读取)
-    local port=$(db_get_field "singbox" "vless-ws" "port")
-    if [[ -n "$port" ]]; then
-        if ss -tlnp | grep -q ":$port "; then
-            _ok "端口 $port 正在监听"
-        else
-            _err "端口 $port 未监听"
-        fi
-    fi
-
     # DNS解析检查
     local resolved_ip=$(dig +short "$domain" 2>/dev/null | head -1)
     local server_ip=$(get_ipv4)
@@ -3333,8 +3290,8 @@ EOF
         # 根据协议选择Nginx监听端口和模式
         local nginx_port="80"
         local nginx_listen="127.0.0.1:$nginx_port"
-        local nginx_comment="作为Xray的fallback后端"
-        local nginx_ssl=""
+        local nginx_comment="提供订阅服务"
+        local is_real_domain=false
 
         if [[ "$protocol" == "vless" || "$protocol" == "vless-singbox" ]]; then
             # Reality协议：Nginx独立运行，提供HTTP订阅服务
@@ -3343,89 +3300,16 @@ EOF
             nginx_comment="独立提供订阅服务 (HTTP)，不与Reality冲突"
 
             # 检测是否使用真实证书 (真实域名模式)
-            local is_real_domain=false
             if [[ "$domain" == "$(cat "$CFG/cert_domain" 2>/dev/null)" ]] && _is_real_cert; then
                 is_real_domain=true
                 # 真实域名模式：回落和外部访问用同一个 HTTPS 端口
                 nginx_port="${custom_nginx_port:-8443}"
-                nginx_ssl="ssl"
             fi
-        elif [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" ]]; then
-            # 证书协议：Nginx 同时监听 80 (fallback) 和自定义端口 (HTTPS订阅)
-            nginx_port="${custom_nginx_port:-8443}"
-            nginx_listen="127.0.0.1:80"  # fallback 后端
-            nginx_comment="80端口作为fallback，${nginx_port}端口提供HTTPS订阅"
-            nginx_ssl="ssl"
         fi
 
         # 配置Nginx
-        # TLS协议：双端口配置 (80回落 + 外部HTTPS)
         # Reality真实域名模式：单端口 HTTPS (同时作为回落和外部访问)
-        if [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" ]]; then
-            cat > "$nginx_conf_file" << EOF
-# Fallback 后端 (供 Xray 回落使用)
-server {
-    listen 127.0.0.1:80;
-    server_name $domain;
-
-    root $web_dir;
-    index index.html;
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-
-    server_tokens off;
-}
-
-# HTTPS 订阅服务 (独立端口)
-server {
-    listen $nginx_port ssl http2;
-    listen [::]:$nginx_port ssl http2;
-    server_name $domain;
-
-    ssl_certificate $CFG/certs/server.crt;
-    ssl_certificate_key $CFG/certs/server.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    root $web_dir;
-    index index.html;
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-
-    # 订阅文件目录 - v2ray 映射到 base64
-    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-
-    # 订阅文件目录 - clash
-    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-
-    # 订阅文件目录 - surge
-    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-
-    # 订阅文件目录 - 通用
-    location /sub/ {
-        alias $CFG/subscription/;
-        autoindex off;
-        default_type text/plain;
-    }
-
-    server_tokens off;
-}
-EOF
-        elif [[ "$is_real_domain" == "true" ]]; then
+        if [[ "$is_real_domain" == "true" ]]; then
             # Reality真实域名模式：
             # - 127.0.0.1:nginx_port 供 Reality dest 回落（只显示伪装网页，无订阅）
             # - 0.0.0.0:nginx_port 供外部直接访问（伪装网页 + 订阅服务）
@@ -3597,8 +3481,6 @@ EOF
                     if [[ -n "$reality_port" ]]; then
                         _ok "伪装网页: https://$domain:$reality_port"
                     fi
-                elif [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" ]]; then
-                    _ok "伪装网页: https://$domain:$nginx_port"
                 else
                     _ok "伪装网页: http://$domain:$nginx_port"
                 fi
@@ -3620,8 +3502,8 @@ EOF
         # 保存订阅配置信息
         local sub_uuid=$(get_sub_uuid)
         local use_https="false"
-        # TLS协议 或 Reality真实域名模式 用 HTTPS
-        if [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" ]] || [[ "$is_real_domain" == "true" ]]; then
+        # Reality真实域名模式用 HTTPS
+        if [[ "$is_real_domain" == "true" ]]; then
             use_https="true"
         fi
 
@@ -3717,7 +3599,9 @@ gen_qr() {
 
     # 使用 qrencode 生成终端二维码 (标准黑白二维码)
     if command -v qrencode &>/dev/null; then
-        echo "$text" | qrencode -t UTF8 -m "$margin" 2>/dev/null && return 0
+        printf '%s' "$text" | qrencode -t UTF8 -m "$margin" 2>/dev/null && return 0
+        echo "[二维码生成失败，请复制上方链接]"
+        return 1
     fi
 
     # 未安装 qrencode，提示用户安装
@@ -3728,6 +3612,12 @@ gen_qr() {
 # 检查是否能生成终端二维码
 _can_gen_qr() {
     command -v qrencode &>/dev/null
+}
+
+# 二维码仅辅助展示，缺少工具或编码失败不能中断分享菜单。
+_show_link_qr() {
+    printf '  二维码:\n'
+    gen_qr "$1" || :
 }
 
 
@@ -3742,31 +3632,6 @@ gen_hy2_link() {
 }
 
 
-
-gen_vless_ws_link() {
-    local ip="$1" port="$2" uuid="$3" sni="$4" path="${5:-/}" country="${6:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}VLESS-WS${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${sni}&path=$(urlencode "$path")&allowInsecure=1#${name}"
-}
-
-# VLESS-WS (无TLS) 分享链接 - 用于 CF Tunnel
-gen_vless_ws_notls_link() {
-    local ip="$1" port="$2" uuid="$3" path="${4:-/}" host="${5:-}" country="${6:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}VLESS-WS-CF${ip_suffix:+-${ip_suffix}}"
-    # security=none 表示不使用 TLS
-    local link="vless://${uuid}@${ip}:${port}?encryption=none&security=none&type=ws&path=$(urlencode "$path")"
-    [[ -n "$host" ]] && link="${link}&host=${host}"
-    printf '%s\n' "${link}#${name}"
-}
-
-gen_vless_vision_link() {
-    local ip="$1" port="$2" uuid="$3" sni="$4" country="${5:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}VLESS-Vision${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${sni}&type=tcp&flow=xtls-rprx-vision&allowInsecure=1#${name}"
-}
 
 gen_ss2022_link() {
     local ip="$1" port="$2" method="$3" password="$4" country="${5:-}"
@@ -4504,246 +4369,11 @@ get_acme_cert() {
     fi
 }
 
-# 检测并设置证书和 Nginx 配置（统一入口）
-# 返回: 0=成功（有证书和Nginx），1=失败（无证书或用户取消）
-# 设置全局变量: CERT_DOMAIN, NGINX_PORT
-setup_cert_and_nginx() {
-    local protocol="$1"
-    local default_nginx_port="18443"
-
-    # 全局变量，供调用方使用
-    CERT_DOMAIN=""
-    NGINX_PORT="$default_nginx_port"
-
-    # === 回落子协议检测：如果是 WS 协议且主协议在 8443 端口，跳过 Nginx 配置 ===
-    local is_fallback_mode=false
-    if [[ "$protocol" == "vless-ws" ]]; then
-        local master_port=""
-        for proto in vless-vision; do
-            if db_exists "singbox" "$proto"; then
-                master_port=$(db_get_field "singbox" "$proto" "port" 2>/dev/null)
-                if [[ "$master_port" == "8443" ]]; then
-                    is_fallback_mode=true
-                    break
-                fi
-            fi
-        done
-    fi
-
-    # 检测是否已有证书
-    if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]]; then
-        # 验证证书是否有效
-        if openssl x509 -in "$CFG/certs/server.crt" -noout -checkend 2592000 >/dev/null 2>&1; then
-            CERT_DOMAIN=$(cat "$CFG/cert_domain")
-
-            # 检查是否是自签名证书
-            local is_self_signed=true
-            local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-            if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]] || [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]; then
-                is_self_signed=false
-            fi
-
-            # 如果是自签名证书，询问用户是否申请真实证书
-            if [[ "$is_self_signed" == "true" && "$is_fallback_mode" == "false" ]]; then
-                echo ""
-                _warn "检测到自签名证书 (域名: $CERT_DOMAIN)"
-                echo -e "  ${G}1)${NC} 申请真实证书 (推荐 - 订阅功能可用)"
-                echo -e "  ${G}2)${NC} 继续使用自签名证书 (订阅功能不可用)"
-                echo ""
-                read -rp "  请选择 [1]: " self_cert_choice
-
-                if [[ "$self_cert_choice" != "2" ]]; then
-                    # 用户选择申请真实证书，清除旧证书，走正常申请流程
-                    rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key" "$CFG/cert_domain"
-                    CERT_DOMAIN=""
-                    # 继续往下走到证书申请流程
-                else
-                    # 继续使用自签名证书，跳过 Nginx 配置
-                    _ok "继续使用自签名证书: $CERT_DOMAIN"
-                    return 0
-                fi
-            else
-                # 真实证书，正常处理
-                # 回落模式：只设置证书域名，跳过 Nginx 配置
-                if [[ "$is_fallback_mode" == "true" ]]; then
-                    _ok "检测到现有证书: $CERT_DOMAIN (回落模式，跳过 Nginx)"
-                    return 0
-                fi
-
-                # Reality 协议：询问用户是否使用现有证书
-                if [[ "$protocol" == "vless" || "$protocol" == "vless-singbox" ]]; then
-                    echo ""
-                    _ok "检测到现有证书: $CERT_DOMAIN"
-                    echo ""
-                    echo -e "  ${Y}Reality 协议可选择:${NC}"
-                    echo -e "  ${G}1)${NC} 使用真实域名 (使用现有证书，支持订阅服务)"
-                    echo -e "  ${G}2)${NC} 无域名模式 (使用随机 SNI，更隐蔽)"
-                    echo ""
-                    read -rp "  请选择 [1]: " reality_cert_choice
-
-                    if [[ "$reality_cert_choice" == "2" ]]; then
-                        # 用户选择无域名模式，清除证书域名变量和旧证书
-                        CERT_DOMAIN=""
-                        rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key" "$CFG/cert_domain"
-                        _info "将使用随机 SNI (无域名模式)"
-                        return 0
-                    fi
-                    # 继续使用真实证书，标记SNI已确定，避免ask_sni_config再次询问
-                    REALITY_SNI_CONFIRMED="$CERT_DOMAIN"
-                fi
-
-                # 读取已有的订阅配置
-                if [[ -f "$CFG/sub.info" ]]; then
-                    _load_sub_info "$CFG/sub.info" 2>/dev/null || true
-                    NGINX_PORT="${sub_port:-$default_nginx_port}"
-
-                    # Reality 协议使用真实域名时，必须用 HTTPS 端口，不能用 80
-                    if [[ "$protocol" == "vless" || "$protocol" == "vless-singbox" ]]; then
-                        if [[ "$NGINX_PORT" == "80" ]]; then
-                            NGINX_PORT="$default_nginx_port"
-                        fi
-                    fi
-                fi
-
-                _ok "使用证书域名: $CERT_DOMAIN"
-
-                # 检查 Nginx 配置文件是否存在 (包括 Alpine http.d)
-                local nginx_conf_exists=false
-                if [[ -f "/etc/nginx/http.d/sing-fake.conf" ]] || [[ -f "/etc/nginx/conf.d/sing-fake.conf" ]] || [[ -f "/etc/nginx/sites-available/sing-fake" ]]; then
-                    nginx_conf_exists=true
-                fi
-
-                # 检查订阅文件是否存在
-                local sub_uuid=$(get_sub_uuid)  # 使用统一的函数获取或生成 UUID
-                local sub_files_exist=false
-                if [[ -f "$CFG/subscription/$sub_uuid/base64" ]]; then
-                    sub_files_exist=true
-                fi
-
-                # 如果 Nginx 配置或订阅文件不存在，重新配置
-                if [[ "$nginx_conf_exists" == "false" ]] || [[ "$sub_files_exist" == "false" ]]; then
-                    _info "配置订阅服务 (端口: $NGINX_PORT)..."
-                    generate_sub_files
-                    create_fake_website "$CERT_DOMAIN" "$protocol" "$NGINX_PORT"
-                else
-                    # 检查 Nginx 配置是否有正确的订阅路由 (使用 alias 指向 subscription 目录)
-                    local nginx_conf_valid=false
-                    if grep -q "alias.*subscription" "/etc/nginx/http.d/sing-fake.conf" 2>/dev/null; then
-                        nginx_conf_valid=true
-                    elif grep -q "alias.*subscription" "/etc/nginx/conf.d/sing-fake.conf" 2>/dev/null; then
-                        nginx_conf_valid=true
-                    elif grep -q "alias.*subscription" "/etc/nginx/sites-available/sing-fake" 2>/dev/null; then
-                        nginx_conf_valid=true
-                    fi
-
-                    if [[ "$nginx_conf_valid" == "false" ]]; then
-                        _warn "检测到旧版 Nginx 配置，正在更新..."
-                        generate_sub_files
-                        create_fake_website "$CERT_DOMAIN" "$protocol" "$NGINX_PORT"
-                    fi
-
-                    # Reality 协议不显示 Nginx 端口（外部访问走 Reality 端口）
-                    if [[ "$protocol" != "vless" && "$protocol" != "vless-singbox" ]]; then
-                        _ok "订阅服务端口: $NGINX_PORT"
-                    fi
-
-                    # 确保订阅文件是最新的
-                    generate_sub_files
-
-                    # 确保 Nginx 运行
-                    if ! ss -tlnp 2>/dev/null | grep -qE ":${NGINX_PORT}\s|:${NGINX_PORT}$"; then
-                        _info "启动 Nginx 服务..."
-                        systemctl stop nginx 2>/dev/null
-                        sleep 1
-                        systemctl start nginx 2>/dev/null || rc-service nginx start 2>/dev/null
-                        sleep 1
-                    fi
-
-                    # 再次检查端口是否监听
-                    if ss -tlnp 2>/dev/null | grep -qE ":${NGINX_PORT}\s|:${NGINX_PORT}$"; then
-                        _ok "Nginx 服务运行正常"
-                        # Reality 协议不显示 Nginx 端口
-                        if [[ "$protocol" != "vless" && "$protocol" != "vless-singbox" ]]; then
-                            _ok "伪装网页: https://$CERT_DOMAIN:$NGINX_PORT"
-                        fi
-                    else
-                        _warn "Nginx 端口 $NGINX_PORT 未监听，尝试重新配置..."
-                        generate_sub_files
-                        create_fake_website "$CERT_DOMAIN" "$protocol" "$NGINX_PORT"
-                    fi
-                fi
-
-                return 0
-            fi
-        fi
-    fi
-
-    # 没有证书或用户选择申请新证书，询问用户
-        # 其他模式：提供真实证书和自签证书两个选项
-        echo ""
-        _line
-        echo -e "  ${W}证书配置模式${NC}"
-        echo -e "  ${G}1)${NC} 使用真实域名 (推荐 - 自动申请 Let's Encrypt 证书)"
-        echo -e "  ${G}2)${NC} 无域名 (使用自签证书 - 安全性较低，易被识别)"
-        echo ""
-        read -rp "  请选择 [1-2，默认 2]: " cert_choice
-
-        if [[ "$cert_choice" == "1" ]]; then
-            echo -e "  ${Y}提示: 域名必须已解析到本机 IP${NC}"
-            read -rp "  请输入你的域名: " input_domain
-
-            if [[ -n "$input_domain" ]]; then
-                if ! _is_valid_dns_name "$input_domain"; then
-                    _err "域名格式无效"
-                    return 1
-                fi
-                CERT_DOMAIN="$input_domain"
-
-                # 确保配置目录存在
-                mkdir -p "$CFG" 2>/dev/null
-
-                # 保存端口到临时文件，供 create_fake_website 使用
-                echo "$NGINX_PORT" > "$CFG/.nginx_port_tmp" 2>/dev/null
-
-                # 申请证书（内部会调用 create_fake_website，会自动保存 sub.info）
-                if get_acme_cert "$CERT_DOMAIN" "$protocol"; then
-                    echo "$CERT_DOMAIN" > "$CFG/cert_domain"
-                    # 确保订阅文件存在
-                    generate_sub_files
-                    rm -f "$CFG/.nginx_port_tmp"
-                    return 0
-                else
-                    _warn "证书申请失败，使用自签证书"
-                    gen_self_cert "$CERT_DOMAIN"
-                    echo "$CERT_DOMAIN" > "$CFG/cert_domain"
-                    rm -f "$CFG/.nginx_port_tmp"
-                    return 1
-                fi
-            fi
-        fi
-
-
-    # 使用自签证书（仅对需要真实 TLS 证书的协议）
-    # Reality 协议 (vless、vless-xhttp) 不需要证书，使用 TLS 指纹伪装
-    if [[ "$protocol" != "vless" && "$protocol" != "vless-singbox" ]]; then
-        gen_self_cert "localhost"
-    fi
-    return 1
-}
-
 # SNI配置交互式询问
 # 参数: $1=默认SNI (可选), $2=已申请的域名 (可选)
 ask_sni_config() {
     local default_sni="${1:-$(gen_sni)}"
     local cert_domain="${2:-}"
-
-    # 如果 Reality 协议已在 setup_cert_and_nginx 中确定使用真实域名，直接返回
-    if [[ -n "$REALITY_SNI_CONFIRMED" ]]; then
-        _ok "使用真实域名: $REALITY_SNI_CONFIRMED" >&2
-        echo "$REALITY_SNI_CONFIRMED"
-        unset REALITY_SNI_CONFIRMED  # 清除标记
-        return 0
-    fi
 
     # 如果有证书域名，检查是否是真实证书
     if [[ -n "$cert_domain" && -f "$CFG/certs/server.crt" ]]; then
@@ -5969,7 +5599,7 @@ _lite_singbox_inbounds() {
             if [[ -f "$CFG/certs/$proto/server.crt" ]]; then
                 cert="$CFG/certs/$proto/server.crt"; key="$CFG/certs/$proto/server.key"
             fi ;;
-        vless-singbox|vless-vision|vless-ws|vless-ws-notls|ss2022|ss-legacy|ss2022-shadowtls|socks|anytls|naive|snell-v5|snell-v6-singbox) ;;
+        vless-singbox|ss2022|ss-legacy|ss2022-shadowtls|socks|anytls|naive|snell-v5|snell-v6-singbox) ;;
         *) _err "不支持的 Sing-box 服务端协议: $proto"; return 1 ;;
     esac
     jq -e 'type == "object" and (.port | type == "number" and . == floor and . >= 1 and . <= 65535)' <<<"$cfg" >/dev/null || return 1
@@ -5988,15 +5618,11 @@ _lite_singbox_inbounds() {
         (if has("users") then (.users // []) else
             [{name:"default",uuid:(.uuid // .password),password:.password,username:.username}] end |
             map(select(.enabled != false))) as $users |
-        if ($p | startswith("vless")) then
-            $base + {type:"vless", users:[$users[] | {name:($p+"-"+.name),uuid:.uuid} +
-                (if $p == "vless-singbox" or $p == "vless-vision" then {flow:"xtls-rprx-vision"} else {} end)]} |
-            if $p == "vless-singbox" then . + {tls:{enabled:true,server_name:$c.sni,reality:{enabled:true,
+        if $p == "vless-singbox" then
+            $base + {type:"vless", users:[$users[] | {name:($p+"-"+.name),uuid:.uuid,flow:"xtls-rprx-vision"}],
+                tls:{enabled:true,server_name:$c.sni,reality:{enabled:true,
                 handshake:{server:($c.reality_server // $c.sni),server_port:($c.reality_port // 443)},
                 private_key:$c.private_key,short_id:[$c.short_id]}}}
-            elif $p == "vless-vision" then . + {tls:$tls}
-            elif $p == "vless-ws" then . + {tls:$tls,transport:{type:"ws",path:($c.path // "/vless")}}
-            else . + {transport:{type:"ws",path:($c.path // "/vless")}} end
         elif $p == "hy2" or $p == "anytls" then
             $base + {type:(if $p == "hy2" then "hysteria2" else "anytls" end),tls:$tls,
                 users:[$users[] | {name:($p+"-"+.name),password:(.uuid // .password)}]} +
@@ -6952,50 +6578,6 @@ gen_hy2_server_config() {
     echo "server" > "$CFG/role"
 }
 
-# Trojan 服务端配置
-
-# Trojan+WS+TLS 服务端配置
-
-# VLESS+WS+TLS 服务端配置
-gen_vless_ws_server_config() {
-    local uuid="$1" port="$2" sni="${3:-bing.com}" path="${4:-/vless}" force_new_cert="${5:-false}"
-    mkdir -p "$CFG"
-
-    local outer_port="$port"
-    [[ -s "$CFG/certs/server.crt" && -s "$CFG/certs/server.key" ]] || {
-        _err "VLESS WebSocket TLS 证书不存在"; return 1;
-    }
-
-    _lite_apply_protocol "vless-ws" "$(_lite_build_config \
-        uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")" || return 1
-    echo "server" > "$CFG/role"
-}
-
-# VLESS+WS (无TLS) 服务端配置 - 专为 CF Tunnel 设计
-gen_vless_ws_notls_server_config() {
-    local uuid="$1" port="$2" path="${3:-/vless}" host="${4:-}"
-    mkdir -p "$CFG"
-
-    # 无需证书，直接使用外部端口
-    _lite_apply_protocol "vless-ws-notls" "$(_lite_build_config \
-        uuid "$uuid" port "$port" path "$path" host "$host")" || return 1
-    echo "server" > "$CFG/role"
-}
-
-
-# VMess+WS 服务端配置
-
-# VLESS-XTLS-Vision 服务端配置
-gen_vless_vision_server_config() {
-    local uuid="$1" port="$2" sni="${3:-bing.com}"
-    mkdir -p "$CFG"
-
-    [[ ! -f "$CFG/certs/server.crt" ]] && gen_self_cert "$sni"
-
-    _lite_apply_protocol "vless-vision" "$(_lite_build_config uuid "$uuid" port "$port" sni "$sni")" || return 1
-    echo "server" > "$CFG/role"
-}
-
 # Shadowsocks 2022 服务端配置
 gen_ss2022_server_config() {
     local password="$1" port="$2" method="${3:-2022-blake3-aes-128-gcm}"
@@ -7235,7 +6817,7 @@ _lite_build_config() {
 # Rebuild every enabled account and every port into a candidate JOIN file.
 regenerate_singbox_protocol_join_info() {
     local protocol="$1" records record output tmp aggregate join ipv4 ipv6 ip host label
-    local port uuid password username sni path method psk public sid data link prefix mode country
+    local port uuid password username sni method psk public sid data link prefix mode country
     output="$CFG/$protocol.join"
     tmp=$(mktemp "$CFG/.protocol-join.XXXXXX") || return 1
     records=$(jq -c --arg p "$protocol" '
@@ -7252,7 +6834,7 @@ regenerate_singbox_protocol_join_info() {
         [[ -n "$record" ]] || continue
         port=$(jq -r '.port' <<<"$record"); uuid=$(jq -r '.uuid // empty' <<<"$record")
         password=$(jq -r '.password // empty' <<<"$record"); username=$(jq -r '.username // empty' <<<"$record")
-        sni=$(jq -r '.sni // .domain // .host // empty' <<<"$record"); path=$(jq -r '.path // "/vless"' <<<"$record")
+        sni=$(jq -r '.sni // .domain // .host // empty' <<<"$record")
         method=$(jq -r '.method // empty' <<<"$record"); psk=$(jq -r '.psk // empty' <<<"$record")
         public=$(jq -r '.public_key // empty' <<<"$record"); sid=$(jq -r '.short_id // empty' <<<"$record")
         prefix=$(tr '[:lower:]-' '[:upper:]_' <<<"$protocol")
@@ -7262,9 +6844,6 @@ regenerate_singbox_protocol_join_info() {
             host="$ip"; [[ "$label" != V6 ]] || host="[$ip]"
             case "$protocol" in
                 vless-singbox) data="REALITY|$host|$port|$uuid|$public|$sid|$sni"; link=$(gen_vless_link "$host" "$port" "$uuid" "$public" "$sid" "$sni") ;;
-                vless-vision) data="VLESS-VISION|$host|$port|$uuid|$sni"; link=$(gen_vless_vision_link "$host" "$port" "$uuid" "$sni") ;;
-                vless-ws) data="VLESS-WS|$host|$port|$uuid|$sni|$path"; link=$(gen_vless_ws_link "$host" "$port" "$uuid" "$sni" "$path") ;;
-                vless-ws-notls) data="VLESS-WS-CF|$host|$port|$uuid|$path|$sni"; link=$(gen_vless_ws_notls_link "$host" "$port" "$uuid" "$path" "$sni") ;;
                 hy2) data="HY2|$host|$port|$password|$sni"; link=$(gen_hy2_link "$host" "$port" "$password" "$sni") ;;
                 tuic) data="TUIC|$host|$port|$uuid|$password|$sni"; link=$(gen_tuic_link "$host" "$port" "$uuid" "$password" "$sni") ;;
                 anytls) data="ANYTLS|$host|$port|$password|$sni"; link=$(gen_anytls_link "$host" "$port" "$password" "$sni") ;;
@@ -13377,39 +12956,37 @@ show_all_share_links() {
 # 显示单个协议的详细配置信息（包含链接和二维码）
 # 参数: $1=协议名, $2=是否清屏(可选，默认true), $3=指定端口(可选)
 show_single_protocol_info() {
-    local protocol="$1" clear_screen="${2:-true}" selected_port="${3:-}" core records cfg port address ipv4 ipv6 link
+    local protocol="$1" clear_screen="${2:-true}" selected_port="${3:-}" core records cfg port link links surge_lines
     core=$(protocol_db_core "$protocol") || return 1
     records=$(db_protocol_configs "$core" "$protocol") || return 1
     [[ "$clear_screen" != true ]] || _header
     printf '  %s\n' "$(get_protocol_name "$protocol")"
-    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
-    address=${ipv4:-[$ipv6]}
     while IFS= read -r cfg; do
         [[ -n "$cfg" ]] || continue
         port=$(jq -r .port <<< "$cfg")
         [[ -z "$selected_port" || "$selected_port" == "$port" ]] || continue
         printf '  端口: %s\n' "$port"
-        case "$protocol" in
-            snell-v5|snell-v5-official|snell-v6|snell-v6-singbox)
-                gen_snell_surge_line "$(get_protocol_name "$protocol")-$port" "$address" "$port" \
-                    "$(jq -r .psk <<< "$cfg")" "$(jq -r '.version // 5' <<< "$cfg")" \
-                    "$(jq -r '.mode // "default"' <<< "$cfg")" "$(jq -r '.tfo // true' <<< "$cfg")"
-                ;;
-            ss2022-shadowtls)
-                printf 'SS2022-ShadowTLS = ss, %s, %s, encrypt-method=%s, password=%s, shadow-tls-password=%s, shadow-tls-sni=%s, shadow-tls-version=3\n' \
-                    "$address" "$port" "$(jq -r .method <<< "$cfg")" "$(jq -r .password <<< "$cfg")" \
-                    "$(jq -r .stls_password <<< "$cfg")" "$(jq -r .sni <<< "$cfg")"
-                ;;
-            *)
-                link=$(
-                    get_installed_protocols() { printf '%s\n' "$protocol"; }
-                    get_all_external_links() { :; }
-                    db_protocol_configs() { printf '%s\n' "$cfg"; }
-                    gen_v2ray_sub | base64 -d
-                ) || return 1
-                printf '%s\n' "$link"
-                ;;
-        esac
+        links=$(
+            get_installed_protocols() { printf '%s\n' "$protocol"; }
+            get_all_external_links() { :; }
+            db_protocol_configs() { printf '%s\n' "$cfg"; }
+            gen_v2ray_sub | base64 -d
+        ) || return 1
+        while IFS= read -r link; do
+            [[ -n "$link" ]] || continue
+            printf '  分享链接:\n%s\n' "$link"
+            [[ "$protocol" != snell-* ]] || printf '  Snell 为自定义 URI；Surge 请使用下方配置或订阅链接。\n'
+            _show_link_qr "$link"
+        done <<< "$links"
+        surge_lines=$(
+            get_installed_protocols() { printf '%s\n' "$protocol"; }
+            get_all_external_links() { :; }
+            db_protocol_configs() { printf '%s\n' "$cfg"; }
+            gen_surge_sub | awk '/^\[Proxy\]$/ {printing=1; next} /^\[/ {printing=0} printing && NF'
+        ) || return 1
+        if [[ -n "$surge_lines" ]]; then
+            printf '  Surge 节点配置（粘贴到 [Proxy]）：\n%s\n' "$surge_lines"
+        fi
     done <<< "$records"
     [[ "$clear_screen" != true ]] || _pause
     return 0
@@ -13653,36 +13230,30 @@ select_protocol() {
     local choice
     _line
     _item 1 "VLESS REALITY (Sing-box)"
-    _item 2 "VLESS Vision TLS"
-    _item 3 "VLESS WebSocket TLS"
-    _item 4 "VLESS WebSocket 无 TLS"
-    _item 5 "Shadowsocks 2022 / 传统版"
-    _item 6 "SOCKS5 明文"
-    _item 7 "Hysteria2"
-    _item 8 "TUIC v5"
-    _item 9 "AnyTLS"
-    _item 10 "Naive (Sing-box)"
-    _item 11 "SS2022 + ShadowTLS v3"
-    _item 12 "Snell v5"
-    _item 13 "Snell v6"
+    _item 2 "Shadowsocks 2022 / 传统版"
+    _item 3 "SOCKS5 明文"
+    _item 4 "Hysteria2"
+    _item 5 "TUIC v5"
+    _item 6 "AnyTLS"
+    _item 7 "Naive (Sing-box)"
+    _item 8 "SS2022 + ShadowTLS v3"
+    _item 9 "Snell v5"
+    _item 10 "Snell v6"
     _item 0 "返回"
     while true; do
-        read -rp "  选择协议 [0-13]: " choice || return 1
+        read -rp "  选择协议 [0-10]: " choice || return 1
         case "$choice" in
             0) SELECTED_PROTOCOL=""; return 1 ;;
             1) select_vless_mode; return ;;
-            2) SELECTED_PROTOCOL=vless-vision ;;
-            3) SELECTED_PROTOCOL=vless-ws ;;
-            4) SELECTED_PROTOCOL=vless-ws-notls ;;
-            5) select_ss_version; return $? ;;
-            6) SELECTED_PROTOCOL=socks ;;
-            7) SELECTED_PROTOCOL=hy2 ;;
-            8) SELECTED_PROTOCOL=tuic ;;
-            9) SELECTED_PROTOCOL=anytls ;;
-            10) SELECTED_PROTOCOL=naive ;;
-            11) SELECTED_PROTOCOL=ss2022-shadowtls ;;
-            12) select_snell_v5_implementation; return $? ;;
-            13) select_snell_v6_implementation; return $? ;;
+            2) select_ss_version; return $? ;;
+            3) SELECTED_PROTOCOL=socks ;;
+            4) SELECTED_PROTOCOL=hy2 ;;
+            5) SELECTED_PROTOCOL=tuic ;;
+            6) SELECTED_PROTOCOL=anytls ;;
+            7) SELECTED_PROTOCOL=naive ;;
+            8) SELECTED_PROTOCOL=ss2022-shadowtls ;;
+            9) select_snell_v5_implementation; return $? ;;
+            10) select_snell_v6_implementation; return $? ;;
             *) _err "无效选择"; continue ;;
         esac
         return 0
@@ -13747,7 +13318,7 @@ select_ss_version() {
 do_install_server() {
     _header
     select_protocol || return 1
-    local protocol="$SELECTED_PROTOCOL" core port record password username uuid keys sid sni path method psk
+    local protocol="$SELECTED_PROTOCOL" core port record password username uuid keys sid sni method psk
     core=$(protocol_core "$protocol")
     unset INSTALL_MODE REPLACE_PORT
     check_dependencies && install_deps || return 1
@@ -13772,24 +13343,6 @@ do_install_server() {
             keys=$(gen_singbox_reality_keys) || return 1
             sni=$(ask_sni_config "$(gen_sni)") || return 1
             gen_vless_singbox_server_config "$uuid" "$port" "$(jq -r '.private_key' <<<"$keys")" "$(jq -r '.public_key' <<<"$keys")" "$sid" "$sni" || return 1
-            ;;
-        vless-vision|vless-ws|vless-ws-notls)
-            uuid=$(gen_uuid)
-            path=/vless
-            if [[ "$protocol" != vless-vision ]]; then
-                read -rp "  WebSocket 路径 [/vless]: " path || return 1
-                path="${path:-/vless}"
-                [[ "$path" == /* ]] || path="/$path"
-            fi
-            if [[ "$protocol" != vless-ws-notls ]]; then
-                configure_anytls_certificate || return 1
-                sni="$ANYTLS_CERT_SNI"
-            fi
-            case "$protocol" in
-                vless-vision) gen_vless_vision_server_config "$uuid" "$port" "$sni" || return 1 ;;
-                vless-ws) gen_vless_ws_server_config "$uuid" "$port" "$sni" "$path" false || return 1 ;;
-                vless-ws-notls) gen_vless_ws_notls_server_config "$uuid" "$port" "$path" "" || return 1 ;;
-            esac
             ;;
         ss2022|ss2022-shadowtls)
             sync_time
@@ -15209,13 +14762,12 @@ gen_v2ray_sub() {
             local sni=$(echo "$cfg" | jq -r '.sni // empty')
             local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
             local public_key=$(echo "$cfg" | jq -r '.public_key // empty')
-            local path=$(echo "$cfg" | jq -r '.path // empty')
             local password=$(echo "$cfg" | jq -r '.password // empty')
             local username=$(echo "$cfg" | jq -r '.username // empty')
             local method=$(echo "$cfg" | jq -r '.method // empty')
             local psk=$(echo "$cfg" | jq -r '.psk // empty')
 
-            # 对于回落子协议，使用主协议端口
+            # 分享链接使用实例端口。
             local actual_port="$port"
 
             local link=""
@@ -15228,9 +14780,6 @@ gen_v2ray_sub() {
                         [[ -n "$server_ip" ]] && link=$(gen_vless_link "$server_ip" "$actual_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code")
                     fi
                     ;;
-                vless-ws-notls)
-                    [[ -n "$server_ip" ]] && link=$(gen_vless_ws_notls_link "$server_ip" "$actual_port" "$uuid" "$path" "$country_code")
-                    ;;
                 naive)
                     local domain=$(jq -r '.domain // .sni // ""' <<< "$cfg")
                     link=$(gen_naive_link "$domain" "$actual_port" "$username" "$password" "$country_code")
@@ -15240,12 +14789,6 @@ gen_v2ray_sub() {
                     ;;
                 snell-v6-singbox)
                     link=$(gen_snell_link "$server_ip" "$actual_port" "$psk" 6 "$country_code" "$(jq -r '.mode // "default"' <<< "$cfg")" singbox)
-                    ;;
-                vless-ws)
-                    [[ -n "$server_ip" ]] && link=$(gen_vless_ws_link "$server_ip" "$actual_port" "$uuid" "$sni" "$path" "$country_code")
-                    ;;
-                vless-vision)
-                    [[ -n "$server_ip" ]] && link=$(gen_vless_vision_link "$server_ip" "$actual_port" "$uuid" "$sni" "$country_code")
                     ;;
                 ss2022)
                     [[ -n "$server_ip" ]] && link=$(gen_ss2022_link "$server_ip" "$actual_port" "$method" "$password" "$country_code")
@@ -15317,13 +14860,12 @@ gen_clash_sub() {
             local sni=$(echo "$cfg" | jq -r '.sni // empty')
             local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
             local public_key=$(echo "$cfg" | jq -r '.public_key // empty')
-            local path=$(echo "$cfg" | jq -r '.path // empty')
             local password=$(echo "$cfg" | jq -r '.password // empty')
             local username=$(echo "$cfg" | jq -r '.username // empty')
             local method=$(echo "$cfg" | jq -r '.method // empty')
             local psk=$(echo "$cfg" | jq -r '.psk // empty')
 
-            # 对于回落子协议，使用主协议端口
+            # 分享配置使用实例端口。
             local actual_port="$port"
 
             local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
@@ -15346,52 +14888,6 @@ gen_clash_sub() {
     reality-opts:
       public-key: $public_key
       short-id: $short_id
-    client-fingerprint: chrome"
-                ;;
-            vless-ws-notls)
-                [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
-    type: vless
-    server: \"$server_ip\"
-    port: $actual_port
-    uuid: $uuid
-    network: ws
-    tls: false
-    udp: true
-    skip-cert-verify: true
-    servername: $sni
-    ws-opts:
-      path: $path
-      headers:
-        Host: $sni"
-                ;;
-            vless-ws)
-                [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
-    type: vless
-    server: \"$server_ip\"
-    port: $actual_port
-    uuid: $uuid
-    network: ws
-    tls: true
-    udp: true
-    skip-cert-verify: true
-    servername: $sni
-    ws-opts:
-      path: $path
-      headers:
-        Host: $sni"
-                ;;
-            vless-vision)
-                [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
-    type: vless
-    server: \"$server_ip\"
-    port: $actual_port
-    uuid: $uuid
-    network: tcp
-    tls: true
-    udp: true
-    flow: xtls-rprx-vision
-    skip-cert-verify: true
-    servername: $sni
     client-fingerprint: chrome"
                 ;;
             ss2022)
@@ -15756,12 +15252,15 @@ show_sub_links() {
     _line
     echo -e "  ${Y}Clash/Clash Verge (推荐):${NC}"
     echo -e "  ${G}${base_url}/clash${NC}"
+    _show_link_qr "${base_url}/clash"
     echo ""
     echo -e "  ${Y}Surge:${NC}"
     echo -e "  ${G}${base_url}/surge${NC}"
+    _show_link_qr "${base_url}/surge"
     echo ""
     echo -e "  ${Y}V2Ray/Loon/通用:${NC}"
     echo -e "  ${G}${base_url}/v2ray${NC}"
+    _show_link_qr "${base_url}/v2ray"
     _line
     echo -e "  ${D}订阅路径包含随机UUID，请妥善保管${NC}"
 
@@ -16107,1088 +15606,6 @@ HTMLEOF
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
-# Cloudflare Tunnel 内网穿透
-#═══════════════════════════════════════════════════════════════════════════════
-
-# Cloudflare Tunnel 常量
-readonly CLOUDFLARED_BIN="$CFG/bin/cloudflared"
-readonly CLOUDFLARED_DIR="$CFG/cloudflared"
-readonly CLOUDFLARED_CONFIG="$CLOUDFLARED_DIR/config.yml"
-readonly CLOUDFLARED_SERVICE="sing-cloudflared"
-
-# cloudflared 全局参数（支持 IPv6-only 机器）
-# --edge-ip-version auto: 让 cloudflared 自动选择 IPv4/IPv6 连接 Cloudflare 边缘
-readonly CLOUDFLARED_EDGE_OPTS="--edge-ip-version auto"
-
-# 检测 cloudflared 是否已安装
-_is_cloudflared_installed() {
-    [[ -x "$CLOUDFLARED_BIN" ]] && return 0
-    check_cmd cloudflared && return 0
-    return 1
-}
-
-# 获取 cloudflared 版本
-_get_cloudflared_version() {
-    if _is_cloudflared_installed; then
-        "$CLOUDFLARED_BIN" --version 2>/dev/null | awk '{print $3}' | head -1
-    else
-        echo "未安装"
-    fi
-}
-
-# 获取隧道运行状态
-_get_tunnel_status() {
-    if ! _is_cloudflared_installed; then
-        echo "未安装"
-        return
-    fi
-
-    if [[ ! -f "$CLOUDFLARED_CONFIG" ]]; then
-        echo "未配置"
-        return
-    fi
-
-    # 检查服务状态
-    if [[ "$DISTRO" == "alpine" ]]; then
-        if rc-service "$CLOUDFLARED_SERVICE" status 2>/dev/null | grep -q "started"; then
-            echo "运行中"
-        else
-            echo "已停止"
-        fi
-    else
-        if systemctl is-active "$CLOUDFLARED_SERVICE" 2>/dev/null | grep -q "^active"; then
-            echo "运行中"
-        else
-            echo "已停止"
-        fi
-    fi
-}
-
-# 获取当前隧道名称
-_get_tunnel_name() {
-    if [[ -f "$CLOUDFLARED_DIR/tunnel.info" ]]; then
-        grep "^tunnel_name=" "$CLOUDFLARED_DIR/tunnel.info" 2>/dev/null | cut -d'=' -f2
-    fi
-}
-
-# 获取当前隧道域名
-_get_tunnel_hostname() {
-    # 优先从 tunnel.info 读取
-    if [[ -f "$CLOUDFLARED_DIR/tunnel.info" ]]; then
-        local hostname=$(grep "^hostname=" "$CLOUDFLARED_DIR/tunnel.info" 2>/dev/null | cut -d'=' -f2)
-        if [[ -n "$hostname" ]]; then
-            echo "$hostname"
-            return
-        fi
-    fi
-    # 备用：从 config.yml 读取
-    if [[ -f "$CLOUDFLARED_CONFIG" ]]; then
-        grep "hostname:" "$CLOUDFLARED_CONFIG" 2>/dev/null | head -1 | sed 's/.*hostname:[[:space:]]*//'
-    fi
-}
-
-# 同步隧道配置（协议安装后调用）
-# 解决协议配置更新后隧道连接失败的问题
-_sync_tunnel_config() {
-    [[ -f "$CLOUDFLARED_DIR/tunnel.info" && -f "$CLOUDFLARED_CONFIG" ]] || return 0
-    local proto scheme=http
-    proto=$(sed -n 's/^protocol=//p' "$CLOUDFLARED_DIR/tunnel.info" | tail -1)
-    case "$proto" in vless-ws) scheme=https ;; vless-ws-notls) ;; *) return 0 ;; esac
-    if grep -q "service: $scheme://" "$CLOUDFLARED_CONFIG"; then return 0; fi
-    sed -i "s|service: https\?://|service: $scheme://|g" "$CLOUDFLARED_CONFIG" || return 1
-    svc restart "$CLOUDFLARED_SERVICE"
-}
-
-# 安装 cloudflared
-install_cloudflared() {
-    mkdir -p "$CFG/bin" || return 1
-    _header
-    echo -e "  ${W}安装 cloudflared${NC}"
-    _line
-
-    if _is_cloudflared_installed; then
-        local ver=$(_get_cloudflared_version)
-        echo -e "  ${Y}cloudflared 已安装 (v$ver)${NC}"
-        echo ""
-        read -rp "  是否重新安装? [y/N]: " reinstall
-        [[ ! "$reinstall" =~ ^[yY]$ ]] && return 0
-    fi
-
-    _info "检测系统架构..."
-    local arch=$(uname -m)
-    local dl_arch=""
-    case "$arch" in
-        x86_64|amd64)
-            dl_arch="amd64"
-            ;;
-        aarch64|arm64)
-            dl_arch="arm64"
-            ;;
-        armv7l|armhf)
-            dl_arch="arm"
-            ;;
-        *)
-            _err "不支持的架构: $arch"
-            return 1
-            ;;
-    esac
-    echo -e "  架构: ${G}$arch${NC} → ${G}linux-$dl_arch${NC}"
-
-    _info "下载 cloudflared..."
-    local release_tag release_version
-    release_tag=$(curl -fsSL --connect-timeout 10 --max-time 30 \
-        "https://api.github.com/repos/cloudflare/cloudflared/releases/latest" |
-        jq -r '.tag_name // empty' 2>/dev/null) || return 1
-    [[ -n "$release_tag" ]] || { _err "无法获取 cloudflared 发布版本"; return 1; }
-    release_version="${release_tag#v}"
-    local dl_url="https://github.com/cloudflare/cloudflared/releases/download/${release_tag}/cloudflared-linux-$dl_arch"
-    local tmp_file=$(mktemp)
-
-    if curl -fsSL --connect-timeout 30 -o "$tmp_file" -- "$dl_url"; then
-        if ! _verify_github_release_asset "cloudflare/cloudflared" "$release_version" "$dl_url" "$tmp_file"; then
-            rm -f "$tmp_file"
-            _err "cloudflared SHA-256 校验失败，已拒绝安装"
-            return 1
-        fi
-        chmod 755 "$tmp_file"
-        mv "$tmp_file" "$CLOUDFLARED_BIN" || { rm -f "$tmp_file"; return 1; }
-
-        # 创建配置目录
-        mkdir -p "$CLOUDFLARED_DIR"
-        : >"$CFG/.managed_cloudflared_binary"
-        : >"$CLOUDFLARED_DIR/.managed_by_sing"
-
-        local ver=$(_get_cloudflared_version)
-        _ok "cloudflared 安装成功 (v$ver)"
-        return 0
-    else
-        rm -f "$tmp_file"
-        _err "下载失败，请检查网络连接"
-        return 1
-    fi
-}
-
-# 登录认证
-cloudflared_login() {
-    _header
-    echo -e "  ${W}Cloudflare 登录认证${NC}"
-    _line
-
-    if ! _is_cloudflared_installed; then
-        _err "cloudflared 未安装，请先安装"
-        _pause
-        return 1
-    fi
-
-    # 检查是否已认证
-    if [[ -f "$CLOUDFLARED_DIR/cert.pem" ]]; then
-        echo -e "  ${Y}检测到已有认证证书${NC}"
-        read -rp "  是否重新认证? [y/N]: " reauth
-        if [[ ! "$reauth" =~ ^[yY]$ ]]; then
-            _ok "保留现有认证"
-            return 0
-        fi
-    fi
-
-    echo ""
-    echo -e "  ${C}请在浏览器中打开以下链接完成认证:${NC}"
-    echo ""
-
-    # 运行登录命令
-    "$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel login
-
-    if [[ -f "$HOME/.cloudflared/cert.pem" ]]; then
-        # 移动证书到配置目录
-        mkdir -p "$CLOUDFLARED_DIR"
-        mv "$HOME/.cloudflared/cert.pem" "$CLOUDFLARED_DIR/cert.pem"
-        _ok "认证成功"
-        return 0
-    elif [[ -f "$CLOUDFLARED_DIR/cert.pem" ]]; then
-        _ok "认证成功"
-        return 0
-    else
-        _err "认证失败或已取消"
-        return 1
-    fi
-}
-
-# 创建隧道（交互式）- 合并创建和配置流程
-create_tunnel_interactive() {
-    _header
-    echo -e "  ${W}创建/配置 Cloudflare Tunnel${NC}"
-    _line
-
-    if ! _is_cloudflared_installed; then
-        _err "cloudflared 未安装"
-        return 1
-    fi
-
-    if [[ ! -f "$CLOUDFLARED_DIR/cert.pem" ]]; then
-        _err "未认证，请先登录"
-        return 1
-    fi
-
-    # 检查现有隧道（本地配置）
-    local existing_tunnel=$(_get_tunnel_name)
-    local need_create=true
-
-    # 初始化变量，防止后续引用报错
-    local tunnel_name=""
-    local tunnel_id=""
-
-    # 同时检查 Cloudflare 远程是否有隧道（本地配置可能已丢失）
-    if [[ -z "$existing_tunnel" ]]; then
-        _info "检查 Cloudflare 账户中的隧道..."
-        local remote_tunnels=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel list 2>/dev/null) || true
-        local tunnel_names=$(echo "$remote_tunnels" | grep -E "^[a-f0-9-]{36}" | awk '{print $2}' | head -5 || true)
-        if [[ -n "$tunnel_names" ]]; then
-            echo ""
-            echo -e "  ${Y}Cloudflare 账户中已有隧道:${NC}"
-            echo "$tunnel_names" | while read tname; do
-                echo -e "    ${D}• $tname${NC}"
-            done
-            echo ""
-            echo -e "  ${D}提示: 使用相同名称会创建失败，请选择不同的名称${NC}"
-        fi
-    fi
-
-    if [[ -n "$existing_tunnel" ]]; then
-        echo -e "  ${Y}检测到已有隧道: $existing_tunnel${NC}"
-        echo ""
-        echo -e "  ${G}1${NC}) 配置现有隧道"
-        echo -e "  ${G}2${NC}) 删除并创建新隧道"
-        echo -e "  ${G}0${NC}) 取消"
-        echo ""
-        read -rp "  请选择: " tunnel_choice
-
-        case "$tunnel_choice" in
-            1)
-                need_create=false
-                tunnel_name="$existing_tunnel"
-
-                # 尝试从 tunnel.info 读取 ID
-                if [[ -f "$CLOUDFLARED_DIR/tunnel.info" ]]; then
-                    tunnel_id=$(grep "^tunnel_id=" "$CLOUDFLARED_DIR/tunnel.info" | cut -d'=' -f2)
-                fi
-
-                # 如果文件里没读到，尝试通过命令行获取
-                if [[ -z "$tunnel_id" ]]; then
-                    _info "正在获取隧道 ID..."
-                    tunnel_id=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel list 2>/dev/null | grep "$tunnel_name" | awk '{print $1}' | head -1)
-                fi
-
-                if [[ -z "$tunnel_id" ]]; then
-                    _err "无法获取隧道 ID，建议选择删除并重建"
-                    _pause
-                    return 1
-                fi
-
-                # 确保 tunnel.info 文件存在且包含正确信息
-                if [[ ! -f "$CLOUDFLARED_DIR/tunnel.info" ]] || ! grep -q "^tunnel_id=" "$CLOUDFLARED_DIR/tunnel.info"; then
-                    cat > "$CLOUDFLARED_DIR/tunnel.info" << EOF
-tunnel_name=$tunnel_name
-tunnel_id=$tunnel_id
-EOF
-                fi
-                ;;
-            2)
-                _info "删除现有隧道..."
-                _stop_tunnel_service 2>/dev/null
-                "$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel delete "$existing_tunnel" 2>/dev/null
-                rm -f "$CLOUDFLARED_DIR/tunnel.info"
-                rm -f "$CLOUDFLARED_DIR/config.yml"
-                rm -f "$CLOUDFLARED_DIR"/*.json
-                ;;
-            *)
-                return 0
-                ;;
-        esac
-    fi
-
-    # 创建新隧道
-    if [[ "$need_create" == "true" ]]; then
-        echo ""
-        echo -e "  ${D}隧道名称仅用于标识，不影响访问域名${NC}"
-        local default_name="sing-tunnel"
-        read -rp "  隧道名称 [$default_name]: " tunnel_name
-        tunnel_name="${tunnel_name:-$default_name}"
-
-        _info "创建隧道..."
-        local output=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel create "$tunnel_name" 2>&1)
-
-        if echo "$output" | grep -q "Created tunnel"; then
-            local tunnel_id=$(echo "$output" | awk '/Created tunnel/ {for(i=1;i<=NF;i++) if($i ~ /^[a-f0-9-]{36}$/) print $i}' | head -1)
-
-            # 保存隧道信息
-            cat > "$CLOUDFLARED_DIR/tunnel.info" << EOF
-tunnel_name=$tunnel_name
-tunnel_id=$tunnel_id
-created=$(date '+%Y-%m-%d %H:%M:%S')
-EOF
-
-            # 移动凭证文件
-            if [[ -f "$HOME/.cloudflared/$tunnel_id.json" ]]; then
-                mv "$HOME/.cloudflared/$tunnel_id.json" "$CLOUDFLARED_DIR/"
-            fi
-
-            _ok "隧道创建成功"
-            echo -e "  隧道名称: ${G}$tunnel_name${NC}"
-            echo -e "  隧道 ID: ${G}$tunnel_id${NC}"
-        elif echo "$output" | grep -q "tunnel with name already exists"; then
-            # 隧道已存在于 Cloudflare，尝试同步到本地
-            echo ""
-            echo -e "  ${Y}隧道 '$tunnel_name' 已存在于 Cloudflare 账户中${NC}"
-            echo ""
-            echo -e "  ${G}1${NC}) 同步已有隧道到本地（复用）"
-            echo -e "  ${G}2${NC}) 删除远程隧道并重新创建"
-            echo -e "  ${G}3${NC}) 使用其他名称创建"
-            echo -e "  ${G}0${NC}) 取消"
-            echo ""
-            read -rp "  请选择: " exist_choice
-
-            case "$exist_choice" in
-                1)
-                    # 同步已有隧道
-                    _info "同步隧道信息..."
-                    local tunnel_info=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel list 2>/dev/null | grep "$tunnel_name")
-                    local tunnel_id=$(echo "$tunnel_info" | awk '{print $1}')
-                    if [[ -n "$tunnel_id" && "$tunnel_id" =~ ^[a-f0-9-]{36}$ ]]; then
-                        cat > "$CLOUDFLARED_DIR/tunnel.info" << EOF
-tunnel_name=$tunnel_name
-tunnel_id=$tunnel_id
-created=$(date '+%Y-%m-%d %H:%M:%S')
-synced=true
-EOF
-                        # 尝试下载凭证
-                        if [[ ! -f "$CLOUDFLARED_DIR/$tunnel_id.json" ]]; then
-                            _warn "凭证文件不存在，需要重新创建隧道或手动恢复凭证"
-                            echo -e "  ${D}提示: 隧道凭证在创建时生成，无法重新下载${NC}"
-                            echo -e "  ${D}      建议选择 2 删除后重新创建${NC}"
-                            _pause
-                            return 1
-                        fi
-                        _ok "隧道同步成功"
-                        echo -e "  隧道 ID: ${G}$tunnel_id${NC}"
-                    else
-                        _err "无法获取隧道信息"
-                        _pause
-                        return 1
-                    fi
-                    ;;
-                2)
-                    # 删除远程隧道
-                    _info "删除远程隧道..."
-                    if "$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel delete "$tunnel_name" 2>&1; then
-                        _ok "远程隧道已删除"
-                        # 递归调用重新创建
-                        create_tunnel_interactive
-                        return $?
-                    else
-                        _err "删除失败"
-                        _pause
-                        return 1
-                    fi
-                    ;;
-                3)
-                    # 重新选择名称
-                    echo ""
-                    read -rp "  请输入新的隧道名称: " new_name
-                    if [[ -n "$new_name" ]]; then
-                        tunnel_name="$new_name"
-                        # 递归创建（简化处理）
-                        local output2=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel create "$tunnel_name" 2>&1)
-                        if echo "$output2" | grep -q "Created tunnel"; then
-                            local tunnel_id=$(echo "$output2" | awk '/Created tunnel/ {for(i=1;i<=NF;i++) if($i ~ /^[a-f0-9-]{36}$/) print $i}' | head -1)
-                            cat > "$CLOUDFLARED_DIR/tunnel.info" << EOF
-tunnel_name=$tunnel_name
-tunnel_id=$tunnel_id
-created=$(date '+%Y-%m-%d %H:%M:%S')
-EOF
-                            [[ -f "$HOME/.cloudflared/$tunnel_id.json" ]] && mv "$HOME/.cloudflared/$tunnel_id.json" "$CLOUDFLARED_DIR/"
-                            _ok "隧道创建成功"
-                            echo -e "  隧道 ID: ${G}$tunnel_id${NC}"
-                        else
-                            _err "创建失败"
-                            echo "$output2"
-                            _pause
-                            return 1
-                        fi
-                    else
-                        return 0
-                    fi
-                    ;;
-                *)
-                    return 0
-                    ;;
-            esac
-        else
-            _err "隧道创建失败"
-            echo ""
-            echo -e "  ${Y}错误输出:${NC}"
-            echo "$output"
-            echo ""
-            echo -e "  ${D}提示: 如果是纯 IPv6 机器，请确保 cloudflared 版本 >= 2023.3.0${NC}"
-            echo -e "  ${D}      可以尝试手动执行: cloudflared --edge-ip-version 6 tunnel create test${NC}"
-            _pause
-            return 1
-        fi
-    fi
-
-    # 自动进入配置协议流程
-    echo ""
-    printf "  是否现在配置协议? [Y/n]: "
-    config_now=""
-    read config_now || true
-    config_now="${config_now:-y}"
-
-    # Alpine 兼容性：使用 case 替代正则表达式
-    case "$config_now" in
-        [nN]|[nN][oO])
-            return 0
-            ;;
-        *)
-            add_protocol_to_tunnel
-            return $?
-            ;;
-    esac
-}
-
-# 快速隧道模式 (trycloudflare.com)
-create_quick_tunnel() {
-    _header
-    echo -e "  ${W}快速隧道 (Quick Tunnel)${NC}"
-    _line
-
-    if ! _is_cloudflared_installed; then
-        _err "cloudflared 未安装"
-        _pause
-        return 1
-    fi
-
-    echo -e "  ${Y}注意：快速隧道无需认证和域名${NC}"
-    echo -e "  ${Y}      但域名每次重启会变化，仅适合临时测试${NC}"
-    echo ""
-
-    # 列出可用的 CDN 协议
-    local ws_protocols=""
-    local idx=1
-    local proto_array=()
-
-    if db_exists "singbox" "vless-ws"; then
-        local port=$(db_get_field "singbox" "vless-ws" "port")
-        echo -e "  ${G}$idx${NC}) VLESS-WS (端口: $port)"
-        proto_array+=("vless-ws:$port")
-        ((idx++))
-    fi
-
-
-    if db_exists "singbox" "vless-ws-notls"; then
-        local port=$(db_get_field "singbox" "vless-ws-notls" "port")
-        echo -e "  ${G}$idx${NC}) VLESS-WS-CF (端口: $port, 无TLS)"
-        proto_array+=("vless-ws-notls:$port")
-        ((idx++))
-    fi
-
-    if [[ ${#proto_array[@]} -eq 0 ]]; then
-        _warn "未找到支持 CDN 穿透的协议"
-        echo -e "  ${D}快速隧道支持: VLESS-WS, VLESS-WS-CF${NC}"
-        _pause
-        return 1
-    fi
-
-    echo -e "  ${G}0${NC}) 取消"
-    echo ""
-    read -rp "  选择要暴露的协议: " proto_choice
-
-    if [[ "$proto_choice" == "0" || -z "$proto_choice" ]]; then
-        return 0
-    fi
-
-    if [[ ! "$proto_choice" =~ ^[0-9]+$ ]] || [[ $proto_choice -gt ${#proto_array[@]} ]]; then
-        _err "无效选择"
-        return 1
-    fi
-
-    local selected="${proto_array[$((proto_choice-1))]}"
-    local proto_name="${selected%%:*}"
-    local proto_port="${selected##*:}"
-
-    # 检测协议是否为独立模式（使用 TLS）
-    # 回落模式监听 127.0.0.1，独立模式监听 0.0.0.0/::
-    local is_standalone=false
-    local tunnel_url="http://127.0.0.1:$proto_port"
-
-    # 检查是否有主协议
-    if [[ "$proto_name" == vless-ws ]]; then
-        is_standalone=true
-        # 独立模式使用 HTTPS（跳过证书验证）
-        tunnel_url="https://127.0.0.1:$proto_port"
-        echo -e "  ${Y}检测到独立模式 (TLS)，将使用 HTTPS 转发${NC}"
-    fi
-
-    echo ""
-    _info "启动快速隧道..."
-    echo -e "  ${D}按 Ctrl+C 停止隧道${NC}"
-    echo ""
-
-    # 启动快速隧道
-    if [[ "$is_standalone" == "true" ]]; then
-        # 独立模式：使用 HTTPS 并跳过证书验证
-        "$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel --no-tls-verify --url "$tunnel_url"
-    else
-        # 回落模式：使用 HTTP
-        "$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel --url "$tunnel_url"
-    fi
-}
-
-# 将协议添加到隧道
-add_protocol_to_tunnel() {
-    _is_cloudflared_installed || { _err "请先安装 cloudflared"; return 1; }
-    local tunnel_id tunnel_name proto port hostname scheme origin listen=127.0.0.1 choice idx=1
-    local -a protocols
-    tunnel_name=$(_get_tunnel_name)
-    tunnel_id=$(sed -n 's/^tunnel_id=//p' "$CLOUDFLARED_DIR/tunnel.info" | tail -1)
-    [[ -n "$tunnel_name" && -n "$tunnel_id" ]] || { _err "请先创建隧道"; return 1; }
-    for proto in vless-ws vless-ws-notls; do
-        db_exists singbox "$proto" || continue
-        protocols+=("$proto")
-        _item "$idx" "$(get_protocol_name "$proto")"
-        idx=$((idx+1))
-    done
-    ((${#protocols[@]})) || { _err "请先安装 VLESS WebSocket 协议"; return 1; }
-    read -rp "  选择协议 (0 返回): " choice || return
-    [[ "$choice" == 0 ]] && return
-    [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice <= ${#protocols[@]})) || return 1
-    proto=${protocols[choice-1]}
-    port=$(db_list_ports singbox "$proto" | head -1)
-    read -rp "  隧道域名: " hostname || return
-    _is_valid_dns_name "$hostname" || { _err "域名格式无效"; return 1; }
-    read -rp "  仅监听本地地址? [Y/n]: " choice
-    [[ "$choice" =~ ^[nN]$ ]] && listen=0.0.0.0
-    _db_apply --arg proto "$proto" --argjson port "$port" --arg listen "$listen" '
-        .singbox[$proto] |= (if type == "array" then
-            map(if .port == $port then .listen_addr=$listen else . end)
-            else .listen_addr=$listen end)
-    ' || return 1
-    rebuild_and_reload_singbox || return 1
-    scheme=http; origin=""
-    if [[ "$proto" == vless-ws ]]; then
-        scheme=https
-        origin="    originRequest:
-      noTLSVerify: true"
-    fi
-    cat > "$CLOUDFLARED_CONFIG" <<EOF
-tunnel: $tunnel_id
-credentials-file: $CLOUDFLARED_DIR/$tunnel_id.json
-ingress:
-  - hostname: $hostname
-    service: $scheme://127.0.0.1:$port
-$origin
-  - service: http_status:404
-EOF
-    sed -i '/^hostname=/d; /^protocol=/d; /^port=/d' "$CLOUDFLARED_DIR/tunnel.info"
-    printf 'hostname=%s\nprotocol=%s\nport=%s\n' "$hostname" "$proto" "$port" >> "$CLOUDFLARED_DIR/tunnel.info"
-    "$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel route dns "$tunnel_name" "$hostname" ||
-        _warn "DNS 自动配置失败，请添加 CNAME: $hostname → $tunnel_id.cfargotunnel.com"
-    _setup_cloudflared_service || return 1
-    _start_tunnel_service || return 1
-    show_tunnel_status
-}
-
-# 创建 systemd/openrc 服务
-_setup_cloudflared_service() {
-    _info "创建系统服务..."
-    mkdir -p "$CLOUDFLARED_DIR"
-    : >"$CLOUDFLARED_DIR/.managed_by_sing"
-
-    if [[ "$DISTRO" == "alpine" ]]; then
-        # OpenRC 服务
-        cat > "/etc/init.d/$CLOUDFLARED_SERVICE" << 'EOF'
-#!/sbin/openrc-run
-
-name="cloudflared"
-description="Cloudflare Tunnel"
-command="/etc/sing-lite/bin/cloudflared"
-command_args="--edge-ip-version auto tunnel --config /etc/sing-lite/cloudflared/config.yml run"
-command_background="yes"
-pidfile="/run/${RC_SVCNAME}.pid"
-output_log="/var/log/sing-cloudflared.log"
-error_log="/var/log/sing-cloudflared.log"
-
-depend() {
-    need net
-    after firewall
-}
-EOF
-        chmod +x "/etc/init.d/$CLOUDFLARED_SERVICE"
-        rc-update add "$CLOUDFLARED_SERVICE" default 2>/dev/null
-        _ok "OpenRC 服务已创建"
-    else
-        # systemd 服务
-        cat > "/etc/systemd/system/${CLOUDFLARED_SERVICE}.service" << EOF
-[Unit]
-Description=Cloudflare Tunnel
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$CLOUDFLARED_BIN --edge-ip-version auto tunnel --config $CLOUDFLARED_CONFIG run
-Restart=on-failure
-RestartSec=5
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable "$CLOUDFLARED_SERVICE" 2>/dev/null
-        _ok "systemd 服务已创建"
-    fi
-}
-
-# 启动隧道服务
-_start_tunnel_service() {
-    _info "启动隧道服务..."
-
-    if [[ "$DISTRO" == "alpine" ]]; then
-        rc-service "$CLOUDFLARED_SERVICE" start 2>/dev/null
-    else
-        systemctl start "$CLOUDFLARED_SERVICE" 2>/dev/null
-    fi
-
-    sleep 2
-
-    local status=$(_get_tunnel_status)
-    if [[ "$status" == "运行中" ]]; then
-        _ok "隧道已启动"
-    else
-        _warn "隧道启动可能失败，请检查日志"
-    fi
-}
-
-# 停止隧道服务
-_stop_tunnel_service() {
-    _info "停止隧道服务..."
-
-    if [[ "$DISTRO" == "alpine" ]]; then
-        rc-service "$CLOUDFLARED_SERVICE" stop 2>/dev/null
-    else
-        systemctl stop "$CLOUDFLARED_SERVICE" 2>/dev/null
-    fi
-
-    _ok "隧道已停止"
-}
-
-# 显示隧道状态
-show_tunnel_status() {
-    _header
-    echo -e "  ${W}Cloudflare Tunnel 状态${NC}"
-    _line
-
-    local status=$(_get_tunnel_status)
-    local tunnel_name=$(_get_tunnel_name)
-    local hostname=$(_get_tunnel_hostname)
-    local version=$(_get_cloudflared_version)
-
-    echo -e "  cloudflared: ${G}v$version${NC}"
-    echo ""
-
-    case "$status" in
-        "运行中")
-            echo -e "  状态: ${G}● 运行中${NC}"
-            ;;
-        "已停止")
-            echo -e "  状态: ${R}○ 已停止${NC}"
-            ;;
-        "未配置")
-            echo -e "  状态: ${Y}◐ 未配置${NC}"
-            ;;
-        *)
-            echo -e "  状态: ${D}未安装${NC}"
-            _pause
-            return
-            ;;
-    esac
-
-    if [[ -n "$tunnel_name" ]]; then
-        echo -e "  隧道: ${G}$tunnel_name${NC}"
-    fi
-
-    if [[ -n "$hostname" ]]; then
-        echo -e "  域名: ${G}$hostname${NC}"
-    fi
-
-    # 显示配置的协议和分享链接
-    if [[ -f "$CLOUDFLARED_DIR/tunnel.info" ]]; then
-        local proto=$(grep "^protocol=" "$CLOUDFLARED_DIR/tunnel.info" 2>/dev/null | cut -d'=' -f2)
-        local port=$(grep "^port=" "$CLOUDFLARED_DIR/tunnel.info" 2>/dev/null | cut -d'=' -f2)
-        if [[ -n "$proto" ]]; then
-            echo -e "  协议: ${G}$proto${NC} (端口: $port)"
-        fi
-
-        # 如果有域名和协议配置，显示隧道分享链接
-        if [[ -n "$hostname" && -n "$proto" ]]; then
-            echo ""
-            _line
-            echo -e "  ${W}隧道连接信息${NC}"
-            _line
-
-            # 获取协议配置
-            local uuid=""
-            local path=""
-
-            case "$proto" in
-                "vless-ws")
-                    uuid=$(db_get_field "singbox" "vless-ws" "uuid")
-                    path=$(db_get_field "singbox" "vless-ws" "path")
-                    path="${path:-/vless}"
-
-                    if [[ -n "$uuid" ]]; then
-                        local encoded_path=$(echo "$path" | sed 's/\//%2F/g')
-                        local share_link="vless://${uuid}@${hostname}:443?encryption=none&security=tls&sni=${hostname}&type=ws&host=${hostname}&path=${encoded_path}#CF-VLESS-WS"
-
-                        echo -e "  ${C}分享链接:${NC}"
-                        echo -e "  $share_link"
-                        echo ""
-                        echo -e "  ${C}二维码:${NC}"
-                        echo -e "  $(gen_qr "$share_link")"
-                        echo ""
-                        echo -e "  ${D}客户端配置: 地址=${hostname}, 端口=443, TLS=开启${NC}"
-                    fi
-                    ;;
-                "vless-ws-notls")
-                    uuid=$(db_get_field "singbox" "vless-ws-notls" "uuid")
-                    path=$(db_get_field "singbox" "vless-ws-notls" "path")
-                    path="${path:-/vless}"
-
-                    if [[ -n "$uuid" ]]; then
-                        local encoded_path=$(echo "$path" | sed 's/\//%2F/g')
-                        # CF Tunnel 提供 TLS，所以分享链接使用 TLS
-                        local share_link="vless://${uuid}@${hostname}:443?encryption=none&security=tls&sni=${hostname}&type=ws&host=${hostname}&path=${encoded_path}#CF-VLESS-WS"
-
-                        echo -e "  ${C}分享链接:${NC}"
-                        echo -e "  $share_link"
-                        echo ""
-                        echo -e "  ${C}二维码:${NC}"
-                        echo -e "  $(gen_qr "$share_link")"
-                        echo ""
-                        echo -e "  ${D}客户端配置: 地址=${hostname}, 端口=443, TLS=开启${NC}"
-                    fi
-                    ;;
-            esac
-        fi
-    fi
-
-    _pause
-}
-
-# 切换隧道服务状态
-toggle_tunnel_service() {
-    local status=$(_get_tunnel_status)
-
-    if [[ "$status" == "运行中" ]]; then
-        _stop_tunnel_service
-    elif [[ "$status" == "已停止" ]]; then
-        _start_tunnel_service
-    else
-        _warn "隧道未配置"
-    fi
-
-    _pause
-}
-
-# 查看隧道日志
-show_tunnel_logs() {
-    _header
-    echo -e "  ${W}Cloudflare Tunnel 日志${NC}"
-    _line
-
-    if [[ "$DISTRO" == "alpine" ]]; then
-        if [[ -f /var/log/cloudflared.log ]]; then
-            tail -n 50 /var/log/cloudflared.log
-        else
-            _warn "日志文件不存在"
-        fi
-    else
-        journalctl -u "$CLOUDFLARED_SERVICE" --no-pager -n 50 2>/dev/null || _warn "无法获取日志"
-    fi
-
-    _pause
-}
-
-# 卸载 cloudflared
-uninstall_cloudflared() {
-    _header
-    echo -e "  ${W}卸载 Cloudflare Tunnel${NC}"
-    _line
-
-    if ! _is_cloudflared_installed; then
-        _warn "cloudflared 未安装"
-        _pause
-        return
-    fi
-
-    echo -e "  ${Y}警告：这将删除所有隧道配置和认证信息${NC}"
-    echo ""
-    read -rp "  确认卸载? [y/N]: " confirm
-    if [[ ! "$confirm" =~ ^[yY]$ ]]; then
-        return
-    fi
-
-    # 停止服务
-    _info "停止服务..."
-    if [[ "$DISTRO" == "alpine" ]]; then
-        rc-service "$CLOUDFLARED_SERVICE" stop 2>/dev/null
-        rc-update del "$CLOUDFLARED_SERVICE" 2>/dev/null
-        rm -f "/etc/init.d/$CLOUDFLARED_SERVICE"
-    else
-        systemctl stop "$CLOUDFLARED_SERVICE" 2>/dev/null
-        systemctl disable "$CLOUDFLARED_SERVICE" 2>/dev/null
-        rm -f "/etc/systemd/system/${CLOUDFLARED_SERVICE}.service"
-        systemctl daemon-reload
-    fi
-
-    # 删除隧道
-    local tunnel_name=$(_get_tunnel_name)
-    if [[ -n "$tunnel_name" ]]; then
-        _info "删除隧道..."
-        "$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel delete "$tunnel_name" 2>/dev/null
-    fi
-
-    # 只删除本脚本明确拥有的文件；保留用户级 Cloudflare 登录资料。
-    _info "清理文件..."
-    [[ -f "$CFG/.managed_cloudflared_binary" ]] && rm -f "$CLOUDFLARED_BIN" "$CFG/.managed_cloudflared_binary"
-    [[ -f "$CLOUDFLARED_DIR/.managed_by_sing" ]] && rm -rf "$CLOUDFLARED_DIR"
-    _info "已保留 $HOME/.cloudflared，避免删除其他隧道的认证资料"
-
-    _ok "cloudflared 已卸载"
-    _pause
-}
-
-# 删除隧道（保留 cloudflared）
-delete_tunnel() {
-    _header
-    echo -e "  ${W}删除 Cloudflare Tunnel${NC}"
-    _line
-
-    if ! _is_cloudflared_installed; then
-        _err "cloudflared 未安装"
-        _pause
-        return
-    fi
-
-    # 获取所有远程隧道
-    _info "获取 Cloudflare 账户中的隧道列表..."
-    local tunnel_list=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel list 2>/dev/null)
-
-    if [[ -z "$tunnel_list" ]] || ! echo "$tunnel_list" | grep -q "^[a-f0-9]"; then
-        _warn "没有找到任何隧道"
-        _pause
-        return
-    fi
-
-    echo ""
-    echo -e "  ${W}Cloudflare 账户中的隧道:${NC}"
-    echo ""
-
-    # 解析并显示隧道列表
-    local idx=1
-    local tunnel_ids=()
-    local tunnel_names=()
-
-    while IFS= read -r line; do
-        # 跳过表头
-        [[ "$line" =~ ^ID ]] && continue
-        [[ -z "$line" ]] && continue
-
-        local tid=$(echo "$line" | awk '{print $1}')
-        local tname=$(echo "$line" | awk '{print $2}')
-        local tcreated=$(echo "$line" | awk '{print $3, $4}')
-        local tconns=$(echo "$line" | awk '{print $5}')
-
-        # 验证是否为有效 UUID
-        if [[ "$tid" =~ ^[a-f0-9-]{36}$ ]]; then
-            tunnel_ids+=("$tid")
-            tunnel_names+=("$tname")
-
-            # 标记本地配置的隧道
-            local local_marker=""
-            local local_name=$(_get_tunnel_name)
-            if [[ "$tname" == "$local_name" ]]; then
-                local_marker=" ${G}[本地]${NC}"
-            fi
-
-            echo -e "  ${G}$idx${NC}) $tname$local_marker"
-            echo -e "     ${D}ID: $tid | 创建: $tcreated | 连接: $tconns${NC}"
-            ((idx++))
-        fi
-    done <<< "$tunnel_list"
-
-    if [[ ${#tunnel_ids[@]} -eq 0 ]]; then
-        _warn "没有找到有效的隧道"
-        _pause
-        return
-    fi
-
-    echo ""
-    echo -e "  ${G}0${NC}) 取消"
-    echo ""
-    read -rp "  选择要删除的隧道: " choice
-
-    if [[ "$choice" == "0" || -z "$choice" ]]; then
-        return
-    fi
-
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [[ $choice -gt ${#tunnel_ids[@]} ]]; then
-        _err "无效选择"
-        _pause
-        return
-    fi
-
-    local selected_id="${tunnel_ids[$((choice-1))]}"
-    local selected_name="${tunnel_names[$((choice-1))]}"
-
-    echo ""
-    echo -e "  ${Y}警告：即将删除隧道 '$selected_name'${NC}"
-    echo -e "  ${D}ID: $selected_id${NC}"
-    echo ""
-    read -rp "  确认删除? [y/N]: " confirm
-    if [[ ! "$confirm" =~ ^[yY]$ ]]; then
-        return
-    fi
-
-    # 停止服务（如果是本地配置的隧道）
-    local local_name=$(_get_tunnel_name)
-    if [[ "$selected_name" == "$local_name" ]]; then
-        _info "停止本地隧道服务..."
-        _stop_tunnel_service 2>/dev/null
-    fi
-
-    # 尝试清理连接
-    _info "清理隧道连接..."
-    "$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel cleanup "$selected_name" 2>/dev/null
-
-    # 删除隧道
-    _info "删除隧道..."
-    local delete_output=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel delete "$selected_name" 2>&1)
-    local delete_exit_code=$?
-
-    # 调试：显示错误信息以便诊断
-    if [[ $delete_exit_code -eq 0 ]] || echo "$delete_output" | grep -qiE "deleted|success"; then
-        _ok "隧道 '$selected_name' 已删除"
-
-        # 如果是本地配置的隧道，清理本地文件
-        if [[ "$selected_name" == "$local_name" ]]; then
-            rm -f "$CLOUDFLARED_DIR/tunnel.info"
-            rm -f "$CLOUDFLARED_CONFIG"
-            rm -f "$CLOUDFLARED_DIR/$selected_id.json"
-            _info "本地配置文件已清理"
-        fi
-
-        echo ""
-        echo -e "  ${Y}提示: 相关的 DNS 记录可能需要手动在 Cloudflare 后台删除${NC}"
-    else
-        _err "删除失败"
-        echo ""
-        echo -e "  ${Y}错误信息:${NC}"
-        echo "$delete_output"
-    fi
-
-    _pause
-}
-
-# Cloudflare Tunnel 管理菜单
-manage_cloudflare_tunnel() {
-    while true; do
-        _header
-        echo -e "  ${W}Cloudflare Tunnel 内网穿透${NC}"
-        _line
-
-        # 显示当前状态
-        local status=$(_get_tunnel_status)
-        local tunnel_name=$(_get_tunnel_name)
-        local hostname=$(_get_tunnel_hostname)
-
-        case "$status" in
-            "运行中")
-                echo -e "  状态: ${G}● 运行中${NC}"
-                [[ -n "$tunnel_name" ]] && echo -e "  隧道: ${G}$tunnel_name${NC}"
-                [[ -n "$hostname" ]] && echo -e "  域名: ${G}$hostname${NC}"
-                ;;
-            "已停止")
-                echo -e "  状态: ${R}○ 已停止${NC}"
-                [[ -n "$tunnel_name" ]] && echo -e "  隧道: ${D}$tunnel_name${NC}"
-                ;;
-            "未配置")
-                echo -e "  状态: ${Y}◐ 已安装 (未配置)${NC}"
-                ;;
-            *)
-                echo -e "  状态: ${D}未安装${NC}"
-                ;;
-        esac
-
-        echo ""
-        _line
-
-        if _is_cloudflared_installed; then
-            _item "1" "安装/重装 cloudflared"
-            _item "2" "登录 Cloudflare 认证"
-            _item "3" "创建/配置隧道"
-            _item "4" "快速隧道 (临时测试)"
-            echo -e "  ${D}───────────────────────────────────────────${NC}"
-            _item "5" "查看隧道状态"
-            _item "6" "启动/停止隧道"
-            _item "7" "查看隧道日志"
-            echo -e "  ${D}───────────────────────────────────────────${NC}"
-            _item "8" "删除隧道"
-            _item "9" "卸载 cloudflared"
-        else
-            _item "1" "安装 cloudflared"
-        fi
-        _item "0" "返回"
-        _line
-
-        read -rp "  请选择: " choice
-
-        case $choice in
-            1) install_cloudflared; _pause ;;
-            2)
-                if _is_cloudflared_installed; then
-                    cloudflared_login
-                    _pause
-                else
-                    _err "请先安装 cloudflared"
-                    _pause
-                fi
-                ;;
-            3)
-                if _is_cloudflared_installed; then
-                    create_tunnel_interactive
-                else
-                    _err "请先安装 cloudflared"
-                    _pause
-                fi
-                ;;
-            4)
-                if _is_cloudflared_installed; then
-                    create_quick_tunnel
-                else
-                    _err "请先安装 cloudflared"
-                    _pause
-                fi
-                ;;
-            5) show_tunnel_status ;;
-            6) toggle_tunnel_service ;;
-            7) show_tunnel_logs ;;
-            8) delete_tunnel ;;
-            9) uninstall_cloudflared ;;
-            0) return ;;
-            *) _err "无效选择"; _pause ;;
-        esac
-    done
-}
-
-#═══════════════════════════════════════════════════════════════════════════════
 # 日志查看
 #═══════════════════════════════════════════════════════════════════════════════
 
@@ -17348,7 +15765,6 @@ _gen_user_share_link() {
     local sni=$(echo "$cfg" | jq -r '.sni // empty')
     local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
     local public_key=$(echo "$cfg" | jq -r '.public_key // empty')
-    local path=$(echo "$cfg" | jq -r '.path // empty')
     local method=$(echo "$cfg" | jq -r '.method // empty')
     local domain=$(echo "$cfg" | jq -r '.domain // empty')
 
@@ -17358,7 +15774,7 @@ _gen_user_share_link() {
     local country_code=$(get_ip_country "$ipv4")
     [[ -z "$country_code" ]] && country_code=$(get_ip_country "$ipv6")
 
-    # 检测回落协议端口
+    # 用户分享链接使用实例端口。
     local display_port="$port"
 
     local remark="${country_code}-${user_name}"
@@ -17379,9 +15795,6 @@ _gen_user_share_link() {
                     link=$(gen_vless_link "$ipv4" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$remark")
                 fi
                 ;;
-            vless-vision) link=$(gen_vless_vision_link "$ipv4" "$display_port" "$uuid" "$sni" "$remark") ;;
-            vless-ws-notls) link=$(gen_vless_ws_notls_link "$ipv4" "$display_port" "$uuid" "$path" "$remark") ;;
-            vless-ws) link=$(gen_vless_ws_link "$ipv4" "$display_port" "$uuid" "$sni" "$path" "$remark") ;;
             ss2022) link=$(gen_ss2022_link "$ipv4" "$display_port" "$method" "$uuid" "$remark") ;;
             hy2) link=$(gen_hy2_link "$ipv4" "$display_port" "$uuid" "$sni" "$remark") ;;
             tuic)
@@ -17692,7 +16105,7 @@ _add_user() {
     # 生成 UUID/密码
     local uuid
     case "$proto" in
-        vless-singbox|vless-ws-notls|vless-ws|vless-vision|tuic)
+        vless-singbox|tuic)
             uuid=$(gen_uuid)
             ;;
         ss2022)
@@ -19212,9 +17625,6 @@ main_menu() {
 
     _check_script_update || _warn "脚本更新检查失败，请稍后重试"
 
-    # 自动同步隧道配置
-    _sync_tunnel_config 2>/dev/null
-
     while true; do
         _header
         echo -e "  ${W}服务端管理${NC}"
@@ -19265,26 +17675,24 @@ main_menu() {
             _item "6" "订阅服务管理"
             _item "7" "管理协议服务"
             _item "8" "分流管理"
-            _item "9" "CF Tunnel(Argo)"
-            _item "10" "端口转发"
+            _item "9" "端口转发"
             echo -e "  ${D}───────────────────────────────────────────${NC}"
-            _item "11" "BBR 网络优化"
-            _item "12" "查看运行日志"
-            echo -e "  ${D}───────────────────────────────────────────${NC}"
-            local script_update_item="检查脚本更新"
-            [[ -n "$script_update_ver" ]] && script_update_item="检查脚本更新 ${Y}[有更新 v${script_update_ver}]${NC}"
-            _item "13" "$script_update_item"
-            _item "14" "完全卸载"
-        else
-            _item "1" "安装协议"
-            echo -e "  ${D}───────────────────────────────────────────${NC}"
-            _item "9" "CF Tunnel(Argo)"
-            _item "10" "端口转发"
-            _item "11" "BBR 网络优化"
+            _item "10" "BBR 网络优化"
+            _item "11" "查看运行日志"
             echo -e "  ${D}───────────────────────────────────────────${NC}"
             local script_update_item="检查脚本更新"
             [[ -n "$script_update_ver" ]] && script_update_item="检查脚本更新 ${Y}[有更新 v${script_update_ver}]${NC}"
             _item "12" "$script_update_item"
+            _item "13" "完全卸载"
+        else
+            _item "1" "安装协议"
+            echo -e "  ${D}───────────────────────────────────────────${NC}"
+            _item "2" "端口转发"
+            _item "3" "BBR 网络优化"
+            echo -e "  ${D}───────────────────────────────────────────${NC}"
+            local script_update_item="检查脚本更新"
+            [[ -n "$script_update_ver" ]] && script_update_item="检查脚本更新 ${Y}[有更新 v${script_update_ver}]${NC}"
+            _item "4" "$script_update_item"
         fi
         _item "0" "退出"
         _line
@@ -19302,22 +17710,20 @@ main_menu() {
                 6) manage_subscription; skip_pause=true ;;
                 7) manage_protocol_services; skip_pause=true ;;
                 8) manage_routing; skip_pause=true ;;
-                9) manage_cloudflare_tunnel; skip_pause=true ;;
-                10) manage_port_forwarding_backends; skip_pause=true ;;
-                11) enable_bbr; skip_pause=true ;;
-                12) show_logs; skip_pause=true ;;
-                13) do_update ;;
-                14) do_uninstall ;;
+                9) manage_port_forwarding_backends; skip_pause=true ;;
+                10) enable_bbr; skip_pause=true ;;
+                11) show_logs; skip_pause=true ;;
+                12) do_update ;;
+                13) do_uninstall ;;
                 0) exit 0 ;;
                 *) _err "无效选择"; skip_pause=true ;;
             esac
         else
             case $choice in
                 1) do_install_server; skip_pause=true ;;
-                9) manage_cloudflare_tunnel; skip_pause=true ;;
-                10) manage_port_forwarding_backends; skip_pause=true ;;
-                11) enable_bbr; skip_pause=true ;;
-                12) do_update ;;
+                2) manage_port_forwarding_backends; skip_pause=true ;;
+                3) enable_bbr; skip_pause=true ;;
+                4) do_update ;;
                 0) exit 0 ;;
                 *) _err "无效选择"; skip_pause=true ;;
             esac

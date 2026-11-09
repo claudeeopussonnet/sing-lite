@@ -42,14 +42,14 @@ seed_fixture() {
     mkdir -p "$CFG/bin"
     rm -f "$CFG/bin/sing-box"
     cat >"$DB_FILE" <<'JSON'
-{"singbox":{"vless-ws-notls":[{"port":46001,"uuid":"00000000-0000-4000-8000-000000000001","path":"/first"},{"port":46002,"uuid":"00000000-0000-4000-8000-000000000002","path":"/second"}],"socks":{"port":46003,"username":"test-user","password":"test-password","auth_mode":"password"}},"snell":{"snell-v6":{"port":46006,"psk":"testOfficialSnellKey6","version":6}},"routing":{"warp_mode":"disabled"}}
+{"singbox":{"ss-legacy":[{"port":46001,"method":"aes-256-gcm","password":"test-first-password"},{"port":46002,"method":"aes-256-gcm","password":"test-second-password"}],"socks":{"port":46003,"username":"test-user","password":"test-password","auth_mode":"password"}},"snell":{"snell-v6":{"port":46006,"psk":"testOfficialSnellKey6","version":6}},"routing":{"warp_mode":"disabled"}}
 JSON
     chmod 600 "$DB_FILE"
     printf 'official Snell JOIN sentinel\n' >"$CFG/snell-v6.join"
     printf 'official Snell configuration sentinel\n' >"$CFG/snell-v6.conf"
     printf 'official Snell service sentinel\n' >"$SYSTEMD_DIR/sing-snell-v6.service"
     generate_singbox_config
-    regenerate_singbox_protocol_join_info vless-ws-notls
+    regenerate_singbox_protocol_join_info ss-legacy
     regenerate_singbox_protocol_join_info socks
     printf 'server\n' >"$CFG/role"
     printf 'original systemd service\n' >"$SYSTEMD_DIR/sing-singbox.service"
@@ -61,7 +61,7 @@ JSON
 }
 
 # Snapshot public artifacts, including other protocols, rather than internal transaction files.
-artifacts=("$DB_FILE" "$CFG/singbox.json" "$CFG/vless-ws-notls.join" "$CFG/socks.join"
+artifacts=("$DB_FILE" "$CFG/singbox.json" "$CFG/ss-legacy.join" "$CFG/socks.join"
     "$CFG/join.txt" "$CFG/role" "$SYSTEMD_DIR/sing-singbox.service" "$OPENRC_DIR/sing-singbox"
     "$CFG/snell-v6.join" "$CFG/snell-v6.conf" "$SYSTEMD_DIR/sing-snell-v6.service")
 save_artifacts() {
@@ -80,7 +80,7 @@ assert_artifacts_restored() {
         i=$((i + 1))
     done
 }
-replacement='{"port":46011,"uuid":"00000000-0000-4000-8000-000000000011","path":"/replacement"}'
+replacement='{"port":46011,"method":"aes-256-gcm","password":"test-replacement-password"}'
 for initial_running in true false; do
     for initial_enabled in true false; do
         seed_fixture
@@ -89,11 +89,11 @@ for initial_running in true false; do
         save_artifacts
         FAIL_OPERATION=start
         [[ "$initial_running" != true ]] || FAIL_OPERATION=restart
-        if _apply_singbox_vless_config "$replacement" replace 46001 vless-ws-notls; then
+        if _apply_singbox_vless_config "$replacement" replace 46001 ss-legacy; then
             fail 'failed shared service activation committed protocol transaction'
         fi
         # Prove activation was attempted with the replacement before checking rollback.
-        assert_json 'any(.singbox["vless-ws-notls"][]; .port == 46011)' "$TEST_TMP/attempted-db"
+        assert_json 'any(.singbox["ss-legacy"][]; .port == 46011)' "$TEST_TMP/attempted-db"
         assert_json 'any(.inbounds[]; .listen_port == 46011)' "$TEST_TMP/attempted-config"
         assert_artifacts_restored
         [[ "$SERVICE_RUNNING" == "$initial_running" && "$SERVICE_ENABLED" == "$initial_enabled" ]] || fail 'service state not restored'
@@ -106,16 +106,16 @@ SERVICE_RUNNING=true
 SERVICE_ENABLED=true
 cp "$CFG/socks.join" "$TEST_TMP/socks-before"
 cp "$CFG/snell-v6.join" "$TEST_TMP/official-before"
-_apply_singbox_vless_config '{}' remove 46001 vless-ws-notls
+_apply_singbox_vless_config '{}' remove 46001 ss-legacy
 assert_json '[.inbounds[].listen_port] | sort == [46002,46003]'
-assert_json '[.singbox["vless-ws-notls"][].port] == [46002] and .singbox.socks.port == 46003' "$DB_FILE"
-if grep -q '46001' "$CFG/vless-ws-notls.join" "$CFG/join.txt"; then fail 'removed port survived JOIN regeneration'; fi
-grep -q '46002' "$CFG/vless-ws-notls.join" || fail 'remaining port JOIN missing'
+assert_json '[.singbox["ss-legacy"][].port] == [46002] and .singbox.socks.port == 46003' "$DB_FILE"
+if grep -q '46001' "$CFG/ss-legacy.join" "$CFG/join.txt"; then fail 'removed port survived JOIN regeneration'; fi
+grep -q '46002' "$CFG/ss-legacy.join" || fail 'remaining port JOIN missing'
 cmp "$TEST_TMP/socks-before" "$CFG/socks.join"
-_apply_singbox_vless_config '{}' remove all vless-ws-notls
+_apply_singbox_vless_config '{}' remove all ss-legacy
 assert_json '.inbounds | length == 1 and .[0].type == "socks" and .[0].listen_port == 46003'
-assert_json '(.singbox | has("vless-ws-notls") | not) and .singbox.socks.port == 46003' "$DB_FILE"
-[[ ! -e "$CFG/vless-ws-notls.join" ]] || fail 'removed protocol JOIN retained'
+assert_json '(.singbox | has("ss-legacy") | not) and .singbox.socks.port == 46003' "$DB_FILE"
+[[ ! -e "$CFG/ss-legacy.join" ]] || fail 'removed protocol JOIN retained'
 cmp "$TEST_TMP/socks-before" "$CFG/socks.join"
 [[ "$SERVICE_RUNNING" == true && "$SERVICE_ENABLED" == true ]] || fail 'retained protocol service stopped/disabled'
 [[ -f "$SYSTEMD_DIR/sing-singbox.service" && -f "$OPENRC_DIR/sing-singbox" ]] || fail 'retained protocol lost shared service'

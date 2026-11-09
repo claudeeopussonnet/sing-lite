@@ -8,11 +8,11 @@ python3 - "$DB_FILE" <<'PY'
 import base64, json, sys
 uuid = '00000000-0000-4000-8000-000000000001'
 disabled = '00000000-0000-4000-8000-000000000099'
-protocols = 'vless-singbox vless-vision vless-ws vless-ws-notls ss2022 ss-legacy socks hy2 tuic anytls naive ss2022-shadowtls snell-v5 snell-v6-singbox'.split()
+protocols = 'vless-singbox ss2022 ss-legacy socks hy2 tuic anytls naive ss2022-shadowtls snell-v5 snell-v6-singbox'.split()
 records = {}
 for i, proto in enumerate(protocols):
     record = dict(port=43000+i, uuid=uuid, password='test-password', username='default',
-                  sni='test.example', path='/test-ws', security_mode='reality', short_id='00123456',
+                  sni='test.example', security_mode='reality', short_id='00123456',
                   private_key='eCtXsJZ27-4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU',
                   public_key='Cr8hWlKvtDt7nrvf-f0brNQQzabAqrjfBvas9pmowjo',
                   auth_mode='password', method='aes-128-gcm', psk='testSnellV5Key123', version=5,
@@ -29,13 +29,12 @@ for i, proto in enumerate(protocols):
 json.dump(dict(singbox=records, snell={}, routing=dict(warp_mode='disabled')), open(sys.argv[1], 'w'))
 PY
 generate_singbox_config >"$TEST_TMP/generate.log"
-assert_json '(.inbounds | length) == 15 and ([.inbounds[].tag]|length) == ([.inbounds[].tag]|unique|length)'
-assert_json '[.inbounds[] | select(.type == "vless")] | length == 4'
+assert_json '(.inbounds | length) == 12 and ([.inbounds[].tag]|length) == ([.inbounds[].tag]|unique|length)'
+assert_json '[.inbounds[] | select(.type == "vless")] | length == 1'
 assert_json 'all(.inbounds[] | select(.type == "vless") | .users; length == 2)'
-assert_json 'all(.inbounds[] | select(.type == "vless" and (.transport.type // "") != "ws") | .users[]; .flow == "xtls-rprx-vision")'
-assert_json 'all(.inbounds[] | select(.transport.type == "ws") | .users[]; has("flow") | not)'
-assert_json 'any(.inbounds[]; .listen_port == 43003 and (has("tls")|not) and .transport.path == "/test-ws")'
-assert_json 'any(.inbounds[]; .listen_port == 43000 and .tls.reality.short_id == ["00123456"])'
+assert_json 'all(.inbounds[] | select(.type == "vless") | .users[]; .flow == "xtls-rprx-vision")'
+assert_json 'all(.inbounds[] | select(.type == "vless"); (has("transport") | not) and .tls.enabled and .tls.reality.enabled)'
+assert_json 'any(.inbounds[]; .listen_port == 43000 and .tls.reality.short_id == ["00123456"] and .tls.reality.private_key == "eCtXsJZ27-4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU")'
 assert_json 'all(.inbounds[] | select(.type == "hysteria2" or .type == "tuic" or .type == "anytls" or .type == "naive" or .type == "socks") | .users; length == 2)'
 assert_json 'any(.inbounds[]; .type == "shadowtls" and .version == 3 and .detour != null)'
 assert_json 'any(.inbounds[]; .type == "snell" and .version == 5)'
@@ -45,23 +44,25 @@ sing-box check -c "$CFG/singbox.json"
 printf 'ok - all supported protocols, enabled/default users and official configuration schema\n'
 
 # An explicit empty list must never restore a top-level/default credential.
-rewrite_db '.singbox |= with_entries(select(.key == "vless-ws-notls")) | .singbox["vless-ws-notls"].users = []'
+rewrite_db '.singbox |= with_entries(select(.key == "vless-singbox")) | .singbox["vless-singbox"].users = []'
 generate_singbox_config >"$TEST_TMP/generate.log"
 assert_json '.inbounds | length == 1 and .[0].users == []'
-rewrite_db '.singbox["vless-ws-notls"].users = [{name:"disabled",uuid:"00000000-0000-4000-8000-000000000099",enabled:false}]'
+rewrite_db '.singbox["vless-singbox"].users = [{name:"disabled",uuid:"00000000-0000-4000-8000-000000000099",enabled:false}]'
 generate_singbox_config >"$TEST_TMP/generate.log"
 assert_json '.inbounds[0].users == []'
-rewrite_db 'del(.singbox["vless-ws-notls"].users)'
+rewrite_db 'del(.singbox["vless-singbox"].users)'
 generate_singbox_config >"$TEST_TMP/generate.log"
 assert_json '.inbounds[0].users | length == 1 and .[0].uuid == "00000000-0000-4000-8000-000000000001"'
 printf 'ok - explicit empty/all-disabled users do not reactivate default credentials\n'
 
 # Unknown protocols and failed checks must not replace the last working file.
 cp "$CFG/singbox.json" "$TEST_TMP/working.json"
-rewrite_db '.singbox["snell-v4"] = {port:43999,psk:"removed",version:4}'
-if generate_singbox_config >"$TEST_TMP/rejected.log" 2>&1; then fail 'unsupported server protocol generated'; fi
-cmp "$TEST_TMP/working.json" "$CFG/singbox.json"
-rewrite_db 'del(.singbox["snell-v4"])'
+for protocol in snell-v4 vless-vision vless-ws vless-ws-notls; do
+    rewrite_db ".singbox[\"$protocol\"] = {port:43999,psk:\"removed\",version:4}"
+    if generate_singbox_config >"$TEST_TMP/rejected.log" 2>&1; then fail "unsupported server protocol generated: $protocol"; fi
+    cmp "$TEST_TMP/working.json" "$CFG/singbox.json"
+    rewrite_db "del(.singbox[\"$protocol\"])"
+done
 sing-box() {
     case "$1" in version) printf 'sing-box version 1.14.4\n' ;; check) return 1 ;; *) forbidden sing-box "$@" ;; esac
 }

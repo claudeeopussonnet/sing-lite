@@ -13,7 +13,7 @@ for binary in sing-box snell-server-v5 snell-server-v6; do
     [[ "$(_core_binary_path "$binary")" == "$CFG/bin/$binary" ]] || fail "managed binary path: $binary"
 done
 
-expected='vless-singbox vless-vision vless-ws vless-ws-notls ss2022 ss-legacy socks hy2 tuic anytls naive ss2022-shadowtls snell-v5 snell-v6-singbox'
+expected='vless-singbox ss2022 ss-legacy socks hy2 tuic anytls naive ss2022-shadowtls snell-v5 snell-v6-singbox'
 [[ "$SINGBOX_PROTOCOLS" == "$expected" ]] || fail 'unexpected Sing-box protocol registry'
 [[ "$STANDALONE_PROTOCOLS" == 'snell-v5-official snell-v6' ]] || fail 'unexpected standalone registry'
 for protocol in $expected; do
@@ -27,7 +27,7 @@ for protocol in snell-v5-official snell-v6; do
         [[ "$($resolver "$protocol")" == snell ]] || fail "$resolver $protocol namespace"
     done
 done
-for protocol in '' unknown vless vmess-ws trojan mieru snell snell-v4 snell-v5-shadowtls; do
+for protocol in '' unknown vless vless-vision vless-ws vless-ws-notls vmess-ws trojan mieru snell snell-v4 snell-v5-shadowtls; do
     if protocol_core "$protocol" >"$TEST_TMP/rejected" 2>&1; then fail "accepted removed/unknown protocol '$protocol'"; fi
     if protocol_db_core "$protocol" >"$TEST_TMP/rejected" 2>&1; then fail "resolved removed/unknown protocol '$protocol'"; fi
 done

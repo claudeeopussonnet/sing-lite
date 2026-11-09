@@ -119,7 +119,7 @@ done
 printf 'ok - official v5/v6 config, service activation and readiness failures restore files, modes and runtime states on systemd/OpenRC\n'
 
 # Exercise the install wizard without installing binaries or touching host services.
-select_protocol() { SELECTED_PROTOCOL=vless-ws-notls; }
+select_protocol() { SELECTED_PROTOCOL=ss-legacy; }
 check_dependencies() { :; }
 install_deps() { :; }
 ensure_dual_stack_listen() { :; }
@@ -127,7 +127,7 @@ install_singbox() { :; }
 handle_existing_protocol() { :; }
 ask_port() { printf '47021\n'; }
 gen_uuid() { printf '00000000-0000-4000-8000-000000000021\n'; }
-gen_vless_ws_notls_server_config() { printf 'activated\n' >"$TEST_TMP/activated"; }
+gen_ss_legacy_server_config() { printf 'activated\n' >"$TEST_TMP/activated"; }
 create_shortcut() { :; }
 show_single_protocol_info() { :; }
 create_watchdog_service() {
@@ -140,7 +140,7 @@ svc() {
 }
 DISTRO=debian
 rm -f "$CFG/sub.info" "$CFG/watchdog.sh" "$TEST_TMP/activated"
-do_install_server <<<'/test-ws'
+do_install_server <<<$'aes-256-gcm\ntest-password'
 [[ -x "$CFG/watchdog.sh" && -s "$SYSTEMD_DIR/sing-watchdog.service" ]] || fail 'fresh install missing watchdog'
 [[ $(cat "$TEST_TMP/watchdog-calls") == $'enable\nstart' ]] || fail 'watchdog not enabled/started'
 printf 'ok - fresh shared install creates watchdog script and enabled service without restarting other cores\n'
