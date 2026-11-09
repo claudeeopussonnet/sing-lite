@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.0.2 [服务端]
+#  sing-lite v1.0.3 [服务端]
 #  官方 sing-box 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 sing。
 #  适配: Alpine/Debian/Ubuntu/CentOS
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.0.2"
+readonly VERSION="1.0.3"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/sing-lite"
 readonly SCRIPT_REPO="mikuuu3981/sing-lite"
@@ -2490,10 +2490,23 @@ _get_query_param() {
     echo "$value"
 }
 
+_logo() {
+    printf '%b' "$C" >&2
+    cat >&2 <<'LOGO'
+  __  __ ___ _   _  _____   _____
+ |  \/  |_ _| | | |/ _ \ \ / / _ \
+ | |\/| || || |_| | | | \ V / | | |
+ | |  | || ||  _  | |_| || || |_| |
+ |_|  |_|___|_| |_|\___/ |_| \___/
+LOGO
+    printf '%b' "$NC" >&2
+}
+
 _header() {
     clear; echo "" >&2
     _dline
-    echo -e "      ${W}多协议代理${NC} ${D}一键部署${NC} ${C}v${VERSION}${NC} ${Y}[服务端]${NC}" >&2
+    _logo
+    echo -e "      ${W}sing-lite${NC} ${C}v${VERSION}${NC} ${Y}[服务端]${NC}" >&2
     echo -e "      ${D}作者: ${AUTHOR}  快捷命令: sing${NC}" >&2
     echo -e "      ${D}${REPO_URL}${NC}" >&2
     _dline

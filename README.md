@@ -9,7 +9,7 @@ curl -fL https://raw.githubusercontent.com/mikuuu3981/sing-lite/main/vless-serve
 bash sing-lite.sh
 ```
 
-完成安装后使用 `sing` 打开菜单。配置、数据库、证书、订阅和缓存存放于 `/etc/sing-lite/`。脚本管理自己的内核与服务，服务名称使用 `sing-` 前缀。
+完成安装后使用 `sing` 打开菜单，菜单顶部显示内置的 `MIHOYO` ASCII Logo。配置、数据库、证书、订阅和缓存存放于 `/etc/sing-lite/`。脚本管理自己的内核与服务，服务名称使用 `sing-` 前缀。
 
 | 内核 | 服务端协议 |
 | --- | --- |
