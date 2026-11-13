@@ -22,8 +22,8 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.0.6 [服务端]
-#  官方 sing-box 与 Surge 原厂 Snell v5/v6。
+#  sing-lite v1.1.0 [服务端]
+#  官方 sing-box、Xray 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 sing。
 #  适配: Alpine/Debian/Ubuntu/CentOS
 #
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.0.6"
+readonly VERSION="1.1.0"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/claudeeopussonnet/sing-lite"
 readonly SCRIPT_REPO="claudeeopussonnet/sing-lite"
@@ -170,14 +170,15 @@ init_db() {
     local now tmp
     if [[ -f "$DB_FILE" ]]; then
         chmod 600 "$DB_FILE" 2>/dev/null || true
-        if jq -e '(.snell | type) == "object" and (.singbox | type) == "object"' \
+        if jq -e '(.snell | type) == "object" and (.singbox | type) == "object" and (.xray | type) == "object"' \
           "$DB_FILE" >/dev/null 2>&1; then
             _db_lock_release
             return 0
         fi
         tmp=$(mktemp "${DB_FILE}.upgrade.XXXXXX") || { _db_lock_release; return 1; }
         if jq '.snell = (if (.snell | type) == "object" then .snell else {} end) |
-               .singbox = (if (.singbox | type) == "object" then .singbox else {} end)' \
+               .singbox = (if (.singbox | type) == "object" then .singbox else {} end) |
+               .xray = (if (.xray | type) == "object" then .xray else {} end)' \
           "$DB_FILE" >"$tmp" 2>/dev/null && chmod 600 "$tmp" && mv "$tmp" "$DB_FILE"; then
             _db_lock_release
             return 0
@@ -190,7 +191,7 @@ init_db() {
     now=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
     tmp=$(mktemp "${DB_FILE}.init.XXXXXX") || { _db_lock_release; return 1; }
     if jq -n --arg v "4.0.0" --arg t "$now" \
-      '{version:$v,snell:{},singbox:{},meta:{created:$t,updated:$t}}' >"$tmp" 2>/dev/null; then
+      '{version:$v,snell:{},singbox:{},xray:{},meta:{created:$t,updated:$t}}' >"$tmp" 2>/dev/null; then
         if chmod 600 "$tmp" && mv "$tmp" "$DB_FILE"; then
             _db_lock_release
             return 0
@@ -200,7 +201,7 @@ init_db() {
         return 1
     fi
     # jq 失败时使用简单方式创建
-    if printf '%s\n' '{"version":"4.0.0","snell":{},"singbox":{},"meta":{}}' >"$tmp" &&
+    if printf '%s\n' '{"version":"4.0.0","snell":{},"singbox":{},"xray":{},"meta":{}}' >"$tmp" &&
        chmod 600 "$tmp" && mv "$tmp" "$DB_FILE"; then
         _db_lock_release
         return 0
@@ -440,8 +441,9 @@ db_list_protocols() {
 # 获取所有已安装协议
 db_get_all_protocols() {
     [[ -f "$DB_FILE" ]] || return 1
-    jq -r --arg protocols "$SINGBOX_PROTOCOLS" --arg standalone "$STANDALONE_PROTOCOLS" '
+    jq -r --arg protocols "$SINGBOX_PROTOCOLS" --arg standalone "$STANDALONE_PROTOCOLS" --arg xray "$XRAY_PROTOCOLS" '
         ((.singbox // {}) | keys[] as $p | select($protocols | split(" ") | index($p)) | $p),
+        ((.xray // {}) | keys[] as $p | select($xray | split(" ") | index($p)) | $p),
         ((.snell // {}) | keys[] as $p | select($standalone | split(" ") | index($p)) | $p)
     ' "$DB_FILE" | sort -u
 }
@@ -595,6 +597,9 @@ ask_password() {
 get_protocol_name() {
     case "$1" in
         vless-singbox) echo 'VLESS Vision REALITY' ;;
+        vless) echo 'VLESS Vision REALITY (Xray)' ;;
+        vless-xhttp) echo 'VLESS XHTTP (Xray)' ;;
+        vless-enc) echo 'VLESS Encryption (Xray)' ;;
         snell-v5) echo 'Snell v5 (sing-box)' ;;
         snell-v5-official) echo 'Snell v5 (Surge 原厂)' ;;
         snell-v6) echo 'Snell v6 (Surge 原厂)' ;;
@@ -658,6 +663,11 @@ db_add_user() {
         _err "协议 $proto 使用固定 PSK，不支持添加用户"
         return 1
     fi
+    if [[ "$core" == xray ]]; then
+        _apply_xray_user_change "$proto" add "$name" "$uuid" "$expire_date" || return 1
+        if [[ -n "$expire_date" ]]; then ensure_expire_check_cron 2>/dev/null || true; fi
+        return 0
+    fi
 
 
 
@@ -703,6 +713,10 @@ db_add_user() {
 db_del_user() {
     local core="$1" proto="$2" name="$3"
     [[ ! -f "$DB_FILE" ]] && return 1
+    if [[ "$core" == xray ]]; then
+        _apply_xray_user_change "$proto" remove "$name"
+        return $?
+    fi
 
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" '
         .[$c][$p] as $cfg |
@@ -839,7 +853,7 @@ db_find_user_by_tg_bind_hash() {
     local token_hash="$1" now_epoch="$2"
     [[ ! -f "$DB_FILE" ]] && return 1
     jq -r --arg hash "$token_hash" --argjson now "$now_epoch" '
-        ["singbox"][] as $core |
+        ["singbox", "xray"][] as $core |
         (.[$core] // {} | to_entries[]) as $proto_entry |
         $proto_entry.key as $proto |
         (if ($proto_entry.value | type) == "array" then $proto_entry.value[] else $proto_entry.value end) |
@@ -855,7 +869,7 @@ db_find_user_by_tg_chat() {
     local chat_id="$1"
     [[ ! -f "$DB_FILE" ]] && return 1
     jq -r --arg chat "$chat_id" '
-        ["singbox"][] as $core |
+        ["singbox", "xray"][] as $core |
         (.[$core] // {} | to_entries[]) as $proto_entry |
         $proto_entry.key as $proto |
         (if ($proto_entry.value | type) == "array" then $proto_entry.value[] else $proto_entry.value end) |
@@ -869,7 +883,7 @@ db_find_user_by_tg_chat() {
 db_list_tg_user_bindings() {
     [[ ! -f "$DB_FILE" ]] && return 1
     jq -r '
-        ["singbox"][] as $core |
+        ["singbox", "xray"][] as $core |
         (.[$core] // {} | to_entries[]) as $proto_entry |
         $proto_entry.key as $proto |
         (if ($proto_entry.value | type) == "array" then $proto_entry.value[] else $proto_entry.value end) |
@@ -960,6 +974,10 @@ db_count_users() {
 db_set_user_enabled() {
     local core="$1" proto="$2" name="$3" enabled="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
+    if [[ "$core" == xray ]]; then
+        _apply_xray_user_change "$proto" enabled "$name" "$enabled"
+        return $?
+    fi
 
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --argjson e "$enabled" '
         .[$c][$p] as $cfg |
@@ -1163,7 +1181,7 @@ db_get_expiring_users() {
     [[ ! -f "$DB_FILE" ]] && return 1
 
     # 遍历所有协议的所有用户
-    for core in singbox; do
+    for core in singbox xray; do
         local protocols=$(db_list_protocols "$core" 2>/dev/null)
         [[ -z "$protocols" ]] && continue
 
@@ -1195,7 +1213,7 @@ db_get_expired_users() {
 
     [[ ! -f "$DB_FILE" ]] && return 1
 
-    for core in singbox; do
+    for core in singbox xray; do
         local protocols=$(db_list_protocols "$core" 2>/dev/null)
         [[ -z "$protocols" ]] && continue
 
@@ -1413,7 +1431,9 @@ db_migrate_to_multiuser() {
         .singbox |= with_entries(
             if .key == "snell-v5" or .key == "snell-v6-singbox" or .key == "ss2022-shadowtls" then . else
                 .value |= (if type == "array" then map(migrate) else migrate end)
-            end)
+            end) |
+        .xray = ((.xray // {}) | with_entries(
+            .value |= (if type == "array" then map(migrate) else migrate end)))
     '
 }
 
@@ -2262,6 +2282,7 @@ fi
 # 协议分类定义 (重构: Sing-box 接管独立协议)
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
 SINGBOX_PROTOCOLS="vless-singbox ss2022 ss-legacy socks hy2 tuic anytls naive ss2022-shadowtls snell-v5 snell-v6-singbox"
+XRAY_PROTOCOLS="vless vless-xhttp vless-enc"
 readonly SINGBOX_SNELL_MIN_VERSION="1.14.0"
 # Sing-box Snell v4/v5 协议键保持稳定，供管理和客户端订阅识别。
 SINGBOX_SNELL_V45_PROTOCOLS="snell-v5"
@@ -2273,6 +2294,8 @@ protocol_core() {
     [[ -n "$protocol" ]] || return 1
     if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
         echo singbox
+    elif [[ " $XRAY_PROTOCOLS " == *" $protocol "* ]]; then
+        echo xray
     elif [[ " $STANDALONE_PROTOCOLS " == *" $protocol "* ]]; then
         echo standalone
     else
@@ -2311,6 +2334,12 @@ for _p in $SINGBOX_PROTOCOLS; do
     PROTO_BIN[$_p]="sing-box"
     PROTO_KIND[$_p]="singbox"
 done
+for _p in $XRAY_PROTOCOLS; do
+    PROTO_SVC[$_p]="sing-xray"
+    PROTO_EXEC[$_p]="$CFG/bin/xray run -c $CFG/xray.json"
+    PROTO_BIN[$_p]="xray"
+    PROTO_KIND[$_p]="xray"
+done
 for _p in $STANDALONE_PROTOCOLS; do
     PROTO_SVC[$_p]="vless-${_p}"
     PROTO_KIND[$_p]="snell"
@@ -2323,6 +2352,7 @@ PROTO_EXEC[snell-v6]="$CFG/bin/snell-server-v6 -c $CFG/snell-v6.conf"
 # OpenRC status 回退：服务名 -> 进程名
 declare -A SVC_PROC=(
     [sing-singbox]="sing-box"
+    [sing-xray]="xray"
     [sing-snell-v5-official]="snell-server-v5"
     [sing-snell-v6]="snell-server-v6"
     [nginx]="nginx"
@@ -2374,7 +2404,7 @@ unregister_protocol() {
 get_installed_protocols() {
     local protocol core
     [[ -f "$DB_FILE" ]] || return 0
-    for protocol in $SINGBOX_PROTOCOLS $STANDALONE_PROTOCOLS; do
+    for protocol in $SINGBOX_PROTOCOLS $XRAY_PROTOCOLS $STANDALONE_PROTOCOLS; do
         core=$(protocol_db_core "$protocol") || return 1 || return 1
         db_exists "$core" "$protocol" && printf '%s\n' "$protocol"
     done
@@ -2405,6 +2435,13 @@ get_singbox_protocols() {
 }
 
 get_standalone_protocols() { filter_installed "$STANDALONE_PROTOCOLS"; }
+get_xray_protocols() {
+    local protocol
+    for protocol in $XRAY_PROTOCOLS; do
+        db_exists xray "$protocol" && printf '%s\n' "$protocol"
+    done
+    return 0
+}
 
 # 生成用户级路由规则
 # 遍历所有用户，为有自定义routing的用户生成Xray routing rules
@@ -2484,7 +2521,7 @@ get_protocol() {
     local installed=$(get_installed_protocols)
     if [[ -n "$installed" ]]; then
         # 优先返回 Xray 主协议
-        for proto in vless-singbox socks ss2022; do
+        for proto in vless-singbox vless vless-xhttp vless-enc socks ss2022; do
             if echo "$installed" | grep -q "^$proto$"; then
                 echo "$proto"
                 return
@@ -2980,7 +3017,7 @@ check_domain_dns() {
 is_internal_port_occupied() {
     local check_port="$1" core proto ports
     # 单对象和多端口数组都要检查，包括未启动的实例。
-    for core in singbox snell; do
+    for core in singbox snell xray; do
         for proto in $(db_list_protocols "$core"); do
             ports=$(db_list_ports "$core" "$proto") || return 1
             if grep -qxF "$check_port" <<<"$ports"; then
@@ -3144,7 +3181,7 @@ check_port_conflict() {
     local check_port="$1" current_protocol="$2" current_core="$3"
     local core proto ports
 
-    for core in singbox snell; do
+    for core in singbox snell xray; do
         for proto in $(db_list_protocols "$core"); do
             [[ "$proto" == "$current_protocol" && "$current_core" == "$core" ]] && continue
 
@@ -3584,8 +3621,69 @@ get_ip_suffix() {
 gen_vless_link() {
     local ip="$1" port="$2" uuid="$3" pbk="$4" sid="$5" sni="$6" country="${7:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}VLESS+Reality${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=reality&type=tcp&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&flow=xtls-rprx-vision#${name}"
+    local name="${country:+${country}-}VLESS+Reality${ip_suffix:+-${ip_suffix}}-${port}" cfg
+    cfg=$(jq -nc --arg port "$port" --arg uuid "$uuid" --arg public_key "$pbk" \
+        --arg short_id "$sid" --arg sni "$sni" \
+        '{port:$port,uuid:$uuid,public_key:$public_key,short_id:$short_id,sni:$sni}') || return 1
+    gen_xray_vless_link "$ip" "$cfg" "$name"
+}
+
+# 仅导出客户端字段；Encryption 的 decryption 和 REALITY 私钥始终留在服务端。
+gen_xray_vless_link() {
+    local host="$1" record="$2" remark="${3:-}" suffix
+    host="${host#[}"; host="${host%]}"
+    [[ -n "$host" ]] || return 1
+    suffix=$(get_ip_suffix "$host")
+    [[ "$host" != *:* ]] || host="[$host]"
+    jq -er --arg host "$host" --arg remark "$remark" --arg suffix "$suffix" '
+        (.transport // "raw") as $transport |
+        (.security_mode // "reality") as $security |
+        (.encryption // "none") as $encryption |
+        if (["raw", "tcp", "xhttp"] | index($transport)) == null or
+           (["reality", "encryption"] | index($security)) == null then
+            error("Unsupported VLESS transport/security")
+        else . end |
+        (if $transport == "xhttp" then "xhttp" else "tcp" end) as $type |
+        (if $security == "reality" then "reality" else "none" end) as $tls |
+        ([ ["encryption", $encryption], ["security", $tls], ["type", $type] ] +
+         (if $tls == "reality" then
+             [["sni", (.sni // "")], ["fp", "chrome"],
+              ["pbk", (.public_key // "")], ["sid", (.short_id // "")]] +
+             (if $type == "tcp" then [["flow", "xtls-rprx-vision"]] else [] end)
+          else [] end) +
+         (if $type == "xhttp" then
+             [["path", (.xhttp_path // "/")], ["mode", (.xhttp_mode // "auto")]]
+          else [] end) |
+         map(.[0] + "=" + (.[1] | tostring | @uri)) | join("&")) as $query |
+        (if $remark != "" then $remark else
+             "VLESS-" + (if $type == "xhttp" then "XHTTP-" else "" end) +
+             (if $tls == "reality" then "REALITY" else "Encryption" end) +
+             "-" + $suffix + "-" + (.port | tostring)
+         end) as $name |
+        "vless://" + (.uuid | @uri) + "@" + $host + ":" + (.port | tostring) +
+        "?" + $query + "#" + ($name | @uri)
+    ' <<< "$record"
+}
+
+# Surge 的 RAW REALITY 以公钥启用 TLS，不使用服务端私钥或 VLESS Encryption。
+gen_vless_surge_line() {
+    local name="$1" host="$2" record="$3"
+    host="${host#[}"; host="${host%]}"
+    [[ -n "$host" ]] || return 1
+    [[ "$host" != *:* ]] || host="[$host]"
+    jq -er --arg name "$name" --arg host "$host" '
+        select((.transport // "raw") == "raw" or .transport == "tcp") |
+        select((.security_mode // "reality") == "reality" and (.encryption // "none") == "none") |
+        select((.public_key // "") != "" and (.sni // "") != "") |
+        select((.flow // "xtls-rprx-vision") as $flow |
+            $flow == "" or $flow == "xtls-rprx-vision" or $flow == "xtls-rprx-vision-udp443") |
+        def safe: tostring | if test("[,\\r\\n]") then error("Invalid Surge field") else . end;
+        ($name | safe) + " = vless, " + ($host | safe) + ", " + (.port | safe) +
+        ", username=" + (.uuid | safe) +
+        (if (.flow // "xtls-rprx-vision") == "" then "" else ", flow=" + ((.flow // "xtls-rprx-vision") | safe) end) +
+        ", sni=" + (.sni | safe) +
+        ", reality-public-key=" + (.public_key | safe) + ", reality-short-id=" + ((.short_id // "") | safe)
+    ' <<< "$record"
 }
 
 
@@ -5089,6 +5187,135 @@ install_singbox() {
         singbox "$channel" "$force" "$version"
 }
 
+_replace_xray_file() {
+    local source="$1" target="$2" staged
+    staged=$(mktemp "${target}.new.XXXXXX") || return 1
+    if ! cp -p "$source" "$staged" || ! mv -f "$staged" "$target"; then
+        rm -f "$staged"
+        return 1
+    fi
+}
+
+_restore_xray_core_snapshot() {
+    local snapshot="$1" binary="$2"
+    if [[ -f "$snapshot/binary" ]]; then
+        _replace_xray_file "$snapshot/binary" "$binary" || return 1
+    else
+        rm -f "$binary" || return 1
+    fi
+    if [[ -f "$snapshot/config" ]]; then
+        _replace_xray_file "$snapshot/config" "$CFG/xray.json" || return 1
+    else
+        rm -f "$CFG/xray.json" || return 1
+    fi
+}
+
+_install_checked_xray_binary() {
+    local binary="$1" version="$2" target output candidate="" snapshot protocols
+    local XRAY_CONFIG_BINARY="$binary"
+    target=$(_core_binary_path xray) || return 1
+    [[ -f "$binary" && ! -L "$binary" ]] && chmod 755 "$binary" || return 1
+    output=$("$binary" version 2>/dev/null) || return 1
+    [[ "$(awk 'NR == 1 && $1 == "Xray" {print $2}' <<<"$output")" == "$version" ]] || {
+        _err "Xray 核心版本校验失败"; return 1
+    }
+    mkdir -p "$CFG/bin" || return 1
+    protocols=$(get_xray_protocols) || :
+    if [[ -n "$protocols" ]]; then
+        candidate=$(mktemp "$CFG/.xray-upgrade.XXXXXX") || return 1
+        if ! generate_xray_config "$candidate" || [[ ! -s "$candidate" ]] || ! chmod 600 "$candidate"; then
+            rm -f "$candidate"
+            return 1
+        fi
+    fi
+    snapshot=$(mktemp -d "$CFG/.xray-install.XXXXXX") || { rm -f "$candidate"; return 1; }
+    if { [[ -f "$target" ]] && ! cp -p "$target" "$snapshot/binary"; } ||
+       { [[ -f "$CFG/xray.json" ]] && ! cp -p "$CFG/xray.json" "$snapshot/config"; }; then
+        rm -f "$candidate"; rm -rf "$snapshot"; return 1
+    fi
+    if ! _replace_singbox_binary "$binary" "$target"; then
+        rm -f "$candidate"; rm -rf "$snapshot"; return 1
+    fi
+    if [[ -n "$candidate" ]] && ! mv -f "$candidate" "$CFG/xray.json"; then
+        rm -f "$candidate"
+        if ! _restore_xray_core_snapshot "$snapshot" "$target"; then
+            _err "Xray 恢复失败，快照保留: $snapshot"; return 1
+        fi
+        rm -rf "$snapshot"
+        return 1
+    fi
+    rm -rf "$snapshot"
+}
+
+_verify_xray_release_asset() {
+    local version="$1" url="$2" file="$3" asset="${2##*/}"
+    local release_json checksum_url checksum_file expected="" actual line digest
+    local sha256_pattern='^[[:space:]]*(SHA2-256|SHA256)([[:space:]]*\(([^()]*)\))?[[:space:]]*=[[:space:]]*([0-9a-fA-F]{64})[[:space:]]*$'
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ ]] || return 1
+    case "$asset" in Xray-linux-64.zip|Xray-linux-arm64-v8a.zip|Xray-linux-arm32-v7a.zip) ;; *) return 1 ;; esac
+    [[ "$url" == "https://github.com/XTLS/Xray-core/releases/download/v${version}/${asset}" ]] || return 1
+    _verify_github_release_asset XTLS/Xray-core "$version" "$url" "$file" && return 0
+
+    # 仅在该 ZIP 缺少 GitHub digest 时使用同版本、同架构的官方 .dgst。
+    release_json=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/tags/v${version}" 2>/dev/null) ||
+    release_json=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/tags/${version}" 2>/dev/null) || return 1
+    checksum_url=$(jq -er --arg name "$asset" --arg url "${url}.dgst" '
+        [.assets[]? | select(.name == $name)] as $archive |
+        select(($archive | length) == 1 and ($archive[0].digest == null or $archive[0].digest == "")) |
+        [.assets[]? | select(.name == ($name + ".dgst") and .browser_download_url == $url)] |
+        select(length == 1) | .[0].browser_download_url' <<<"$release_json") || return 1
+    checksum_file=$(mktemp "${TMPDIR:-/tmp}/xray-checksum.XXXXXX") || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 -o "$checksum_file" -- "$checksum_url"; then
+        rm -f "$checksum_file"
+        return 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        if [[ "$line" =~ $sha256_pattern ]]; then
+            digest="${BASH_REMATCH[4],,}"
+            if [[ -n "${BASH_REMATCH[3]}" && "${BASH_REMATCH[3]}" != "$asset" ]] ||
+               [[ -n "$expected" && "$expected" != "$digest" ]]; then
+                expected=""; break
+            fi
+            expected="$digest"
+        elif [[ "$line" =~ ^[[:space:]]*(SHA2-256|SHA256) ]]; then
+            expected=""; break
+        fi
+    done <"$checksum_file"
+    rm -f "$checksum_file"
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+    actual=$(_sha256_file "$file") || return 1
+    [[ "${actual,,}" == "$expected" ]]
+}
+
+install_xray() {
+    local channel="${1:-stable}" force="${2:-false}" version="${3:-}" arch target tmp url
+    case "$channel" in stable|prerelease|test|beta) ;; *) return 1 ;; esac
+    target=$(_core_binary_path xray) || return 1
+    [[ -x "$target" && "$force" != true ]] && return 0
+    [[ -n "$version" ]] || version=$(_get_xray_target_version "$channel") || return 1
+    version="${version#v}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ ]] || return 1
+    arch=$(_map_arch "64:arm64-v8a:arm32-v7a") || return 1
+    tmp=$(mktemp -d) || return 1
+    url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"
+    if ! curl -fsSL --connect-timeout 20 --max-time 180 --retry 2 -o "$tmp/pkg" -- "$url" ||
+       ! _verify_xray_release_asset "$version" "$url" "$tmp/pkg" ||
+       ! _archive_paths_safe "$tmp/pkg" zip || ! unzip -q "$tmp/pkg" xray -d "$tmp"; then
+        rm -rf "$tmp"
+        _err "Xray 下载或 SHA-256 校验失败"
+        return 1
+    fi
+    if ! _install_checked_xray_binary "$tmp/xray" "$version"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+    _ok "Xray v$version 已安装"
+}
+
 _singbox_supports_snell_version() {
     local version="${1#v}"
     [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([-.][A-Za-z0-9.-]+)?$ ]] || return 1
@@ -5124,6 +5351,7 @@ _get_core_version() {
     local core="$1" binary output version saved major
     case "$core" in
         singbox|sing-box) core=sing-box ;;
+        xray) core=xray ;;
         snell-server-v5|snell-v5-official|snellv5) core=snell-server-v5; major=5 ;;
         snell-server-v6|snell-v6|snellv6) core=snell-server-v6; major=6 ;;
         *) return 1 ;;
@@ -5133,6 +5361,9 @@ _get_core_version() {
     if [[ "$core" == sing-box ]]; then
         output=$("$binary" version 2>/dev/null) || true
         version=$(awk 'NR == 1 {print $3}' <<<"$output")
+    elif [[ "$core" == xray ]]; then
+        output=$("$binary" version 2>/dev/null) || true
+        version=$(awk 'NR == 1 && $1 == "Xray" {print $2}' <<<"$output")
     else
         output=$("$binary" --v 2>&1 || "$binary" --version 2>&1 || true)
         version=$(grep -oE "${major}\.[0-9]+\.[0-9]+([A-Za-z][A-Za-z0-9._-]*)?" <<<"$output" | head -n 1)
@@ -5147,7 +5378,7 @@ _get_core_version_with_status() { _get_core_version "$1"; }
 
 _core_binary_path() {
     case "$1" in
-        sing-box|snell-server-v5|snell-server-v6) printf '%s/bin/%s\n' "$CFG" "$1" ;;
+        sing-box|xray|snell-server-v5|snell-server-v6) printf '%s/bin/%s\n' "$CFG" "$1" ;;
         *) return 1 ;;
     esac
 }
@@ -5157,6 +5388,18 @@ _get_singbox_target_version() {
     case "$1" in
         stable) version=$(_get_latest_version SagerNet/sing-box) || return 1 ;;
         prerelease|test|beta) version=$(_get_latest_prerelease_version SagerNet/sing-box) || return 1 ;;
+        *) return 1 ;;
+    esac
+    version="${version#v}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ ]] || { _err "查询失败"; return 1; }
+    printf '%s\n' "$version"
+}
+
+_get_xray_target_version() {
+    local version
+    case "$1" in
+        stable) version=$(_get_latest_version XTLS/Xray-core) || return 1 ;;
+        prerelease|test|beta) version=$(_get_latest_prerelease_version XTLS/Xray-core) || return 1 ;;
         *) return 1 ;;
     esac
     version="${version#v}"
@@ -5180,6 +5423,7 @@ _get_snell_v5_channel_version() {
 _core_target_version() {
     case "$1" in
         sing-box) _get_singbox_target_version "$2" ;;
+        xray) _get_xray_target_version "$2" ;;
         snell-server-v5) _get_snell_v5_channel_version "$2" ;;
         snell-server-v6) _get_snell_v6_channel_version "$2" ;;
         *) return 1 ;;
@@ -5188,9 +5432,10 @@ _core_target_version() {
 
 _show_core_versions() {
     local filter="${1:-all}" binary current stable test label
-    for binary in sing-box snell-server-v5 snell-server-v6; do
+    for binary in sing-box xray snell-server-v5 snell-server-v6; do
         case "$binary" in
             sing-box) label=Sing-box; [[ "$filter" == all || "$filter" == singbox ]] || continue ;;
+            xray) label=Xray; [[ "$filter" == all || "$filter" == xray ]] || continue ;;
             snell-server-v5) label='官方 Snell v5'; [[ "$filter" == all || "$filter" == snellv5 ]] || continue ;;
             snell-server-v6) label='官方 Snell v6'; [[ "$filter" == all || "$filter" == snellv6 ]] || continue ;;
         esac
@@ -5254,6 +5499,39 @@ _update_singbox_core_to_version() {
     return 1
 }
 
+_update_xray_core_to_version() {
+    local channel="$1" version="${2#v}" install_func="${3:-install_xray}"
+    local snapshot binary was_running=false installed=false success=false
+    case "$channel" in stable|prerelease|test|beta) ;; *) return 1 ;; esac
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ ]] || return 1
+    mkdir -p "$CFG" || return 1
+    binary=$(_core_binary_path xray) || return 1
+    snapshot=$(mktemp -d "$CFG/.xray-core.XXXXXX") || return 1
+    if { [[ -f "$binary" ]] && ! cp -p "$binary" "$snapshot/binary"; } ||
+       { [[ -f "$CFG/xray.json" ]] && ! cp -p "$CFG/xray.json" "$snapshot/config"; }; then
+        rm -rf "$snapshot"; return 1
+    fi
+    if [[ ! -f "$CFG/paused" ]] && svc status sing-xray >/dev/null 2>&1; then was_running=true; fi
+    if "$install_func" "$channel" true "$version"; then
+        installed=true
+        if [[ "$was_running" != true ]] || { svc restart sing-xray && _wait_for_owned_service sing-xray; }; then success=true; fi
+    fi
+    if [[ "$success" == true ]]; then rm -rf "$snapshot"; _ok "Xray 已更新至 v$version"; return 0; fi
+    if [[ "$installed" == false ]] &&
+       { [[ -f "$snapshot/binary" ]] && cmp -s "$snapshot/binary" "$binary" || [[ ! -f "$snapshot/binary" && ! -e "$binary" ]]; } &&
+       { [[ -f "$snapshot/config" ]] && cmp -s "$snapshot/config" "$CFG/xray.json" || [[ ! -f "$snapshot/config" && ! -e "$CFG/xray.json" ]]; }; then
+        rm -rf "$snapshot"; _err "更新失败，原 Xray 核心与配置未变化"; return 1
+    fi
+    if [[ "$was_running" == true ]] && ! svc stop sing-xray; then _err "停止失败，快照保留: $snapshot"; return 1; fi
+    if ! _restore_xray_core_snapshot "$snapshot" "$binary"; then _err "Xray 回滚失败，快照保留: $snapshot"; return 1; fi
+    if [[ "$was_running" == true ]] && ! { svc start sing-xray && _wait_for_owned_service sing-xray; }; then
+        _err "服务恢复失败，快照保留: $snapshot"; return 1
+    fi
+    rm -rf "$snapshot"
+    _err "更新失败，已恢复原 Xray 核心与配置"
+    return 1
+}
+
 _update_official_snell_core() {
     local major="$1" version="$2" binary service snapshot was_running=false target metadata
     case "$major" in
@@ -5290,6 +5568,11 @@ update_singbox_core() {
     version=$(_get_singbox_target_version "${1:-stable}") || return 1
     _update_singbox_core_to_version "${1:-stable}" "$version"
 }
+update_xray_core() {
+    local version
+    version=$(_get_xray_target_version "${1:-stable}") || return 1
+    _update_xray_core_to_version "${1:-stable}" "$version"
+}
 update_snell_v5_core() {
     local version="${1:-}"
     [[ -n "$version" ]] || version=$(_get_snell_v5_channel_version stable) || return 1
@@ -5315,6 +5598,7 @@ _update_core_with_channel_select() {
     _info "更新 $name: $current → $version"
     case "$binary" in
         sing-box) _update_singbox_core_to_version "$channel" "$version" ;;
+        xray) _update_xray_core_to_version "$channel" "$version" ;;
         snell-server-v5) _update_official_snell_core 5 "$version" ;;
         snell-server-v6) _update_official_snell_core 6 "$version" ;;
         *) return 1 ;;
@@ -5329,7 +5613,7 @@ update_core_menu() {
         printf '  核心版本管理\n'
         _show_core_versions
         installed=(); i=1
-        for binary in sing-box snell-server-v5 snell-server-v6; do
+        for binary in sing-box xray snell-server-v5 snell-server-v6; do
             current=$(_get_core_version "$binary")
             [[ "$current" != 未安装 ]] || continue
             installed+=("$binary")
@@ -6319,6 +6603,41 @@ EOF
 }
 
 # 新装共享核心也需要 watchdog unit，不能依赖其他独立协议顺带创建。
+create_xray_service() {
+    local binary="$CFG/bin/xray" config="$CFG/xray.json" service=sing-xray
+    if [[ "$DISTRO" == alpine ]]; then
+        cat >"$OPENRC_DIR/$service" <<EOF || return 1
+#!/sbin/openrc-run
+name="Xray Proxy Server"
+command="$binary"
+command_args="run -c \"$config\""
+command_background="yes"
+pidfile="/run/$service.pid"
+output_log="/var/log/$service.log"
+error_log="/var/log/$service.log"
+depend() { need net; }
+start_pre() { "$binary" run -test -c "$config"; }
+EOF
+        chmod 755 "$OPENRC_DIR/$service"
+    else
+        cat >"$SYSTEMD_DIR/$service.service" <<EOF || return 1
+[Unit]
+Description=Xray Proxy Server
+After=network.target
+[Service]
+Type=simple
+ExecStartPre="$binary" run -test -c "$config"
+ExecStart="$binary" run -c "$config"
+Restart=always
+RestartSec=3
+LimitNOFILE=51200
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+    fi
+}
+
 create_watchdog_service() {
     if [[ "$DISTRO" == alpine ]]; then
         cat >"$OPENRC_DIR/sing-watchdog" <<EOF || return 1
@@ -6506,6 +6825,75 @@ gen_self_cert() {
 # VLESS+Reality 服务端配置
 
 # Sing-box REALITY 使用自身的 X25519 密钥生成器，不依赖 Xray。
+gen_xray_reality_keys() {
+    local output private public binary
+    binary=$(_lite_xray_binary) || return 1
+    output=$("$binary" x25519) || return 1
+    private=$(awk -F ': *' '/^Private[Kk]ey:|^Private key:/ {print $2; exit}' <<<"$output")
+    public=$(awk -F ': *' '/^Public[Kk]ey:|^Public key:|^Password( \(PublicKey\))?:/ {print $2; exit}' <<<"$output")
+    [[ "$private" =~ ^[A-Za-z0-9_-]{43}$ && "$public" =~ ^[A-Za-z0-9_-]{43}$ ]] || {
+        _err 'Xray REALITY 密钥生成失败'; return 1;
+    }
+    jq -n --arg private "$private" --arg public "$public" '{private_key:$private,public_key:$public}'
+}
+
+gen_xray_encryption() {
+    local output decryption encryption binary
+    binary=$(_lite_xray_binary) || return 1
+    output=$("$binary" vlessenc) || { _err '当前 Xray 不支持 VLESS Encryption，请先更新内核'; return 1; }
+    # vlessenc 输出两组成对参数；选择首组 X25519 认证，不能交叉混用。
+    decryption=$(sed -n 's/^[[:space:]]*"decryption":[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$output" | head -n 1)
+    encryption=$(sed -n 's/^[[:space:]]*"encryption":[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$output" | head -n 1)
+    [[ "$decryption" =~ ^mlkem768x25519plus\.(native|xorpub|random)\.[0-9]+s\.[A-Za-z0-9_-]+$ &&
+       "$encryption" =~ ^mlkem768x25519plus\.(native|xorpub|random)\.(0rtt|1rtt)\.[A-Za-z0-9_-]+$ ]] || {
+        _err 'Xray Encryption 参数生成失败'; return 1;
+    }
+    jq -n --arg decryption "$decryption" --arg encryption "$encryption" '{decryption:$decryption,encryption:$encryption}'
+}
+
+configure_xray_vless() {
+    local protocol="$1" port="$2" uuid record keys sni dest encryption=none decryption=none
+    local choice path mode security=reality transport=raw
+    uuid=$(gen_uuid) || return 1
+    [[ "$protocol" != vless-enc ]] || security=encryption
+    [[ "$protocol" != vless-xhttp ]] || transport=xhttp
+    record=$(_lite_build_config port "$port" uuid "$uuid" security_mode "$security" transport "$transport") || return 1
+    if [[ "${INSTALL_MODE:-add}" != replace ]]; then
+        record=$(jq '.users=[{name:"default",uuid:.uuid,enabled:true}]' <<<"$record") || return 1
+    fi
+    if [[ "$security" == reality ]]; then
+        keys=$(gen_xray_reality_keys) || return 1
+        sni=$(ask_sni_config "$(gen_sni)") || return 1
+        read -rp "  REALITY 回落目标 [${sni}:443]: " dest || return 1
+        dest="${dest:-$sni:443}"
+        local target_host target_port
+        IFS='|' read -r target_host target_port <<<"$(_parse_hostport "$dest")"
+        _is_valid_domain_or_ip "$target_host" && _is_valid_port "$target_port" || { _err '回落目标格式应为 host:port'; return 1; }
+        record=$(jq --argjson keys "$keys" --arg sni "$sni" --arg sid "$(gen_sid)" --arg dest "$dest" \
+            '. + $keys + {sni:$sni,short_id:$sid,dest:$dest}' <<<"$record") || return 1
+        read -rp '  启用 VLESS Encryption? (Surge 暂不支持) [y/N]: ' choice || return 1
+    else
+        choice=y
+    fi
+    if [[ "$choice" =~ ^[yY]$ ]]; then
+        keys=$(gen_xray_encryption) || return 1
+        encryption=$(jq -r '.encryption' <<<"$keys")
+        decryption=$(jq -r '.decryption' <<<"$keys")
+    fi
+    record=$(jq --arg encryption "$encryption" --arg decryption "$decryption" \
+        '. + {encryption:$encryption,decryption:$decryption}' <<<"$record") || return 1
+    if [[ "$transport" == xhttp ]]; then
+        read -rp '  XHTTP 路径 [/xhttp]: ' path || return 1
+        path="${path:-/xhttp}"
+        [[ "$path" == /* && "$path" != *[$'\r\n\t ']* ]] || { _err 'XHTTP 路径必须以 / 开头且不含空白'; return 1; }
+        read -rp '  XHTTP 模式 [auto/packet-up/stream-up/stream-one，默认 auto]: ' mode || return 1
+        mode="${mode:-auto}"
+        case "$mode" in auto|packet-up|stream-up|stream-one) ;; *) _err '无效的 XHTTP 模式'; return 1 ;; esac
+        record=$(jq --arg path "$path" --arg mode "$mode" '. + {xhttp_path:$path,xhttp_mode:$mode}' <<<"$record") || return 1
+    fi
+    _apply_xray_config "$record" "${INSTALL_MODE:-add}" "${REPLACE_PORT:-}" "$protocol"
+}
+
 gen_singbox_reality_keys() {
     local keys private_key public_key binary
     binary=$(_lite_singbox_binary) || return 1
@@ -6945,7 +7333,7 @@ _apply_official_snell_record_locked() {
     tfo=$(jq -r '.tfo // "true"' <<<"$record")
     if jq --arg p "$protocol" --argjson record "$record" '
         def records: if type == "array" then .[] elif type == "object" then . else empty end;
-        if ([to_entries[] | select(.key == "singbox" or .key == "snell") |
+        if ([to_entries[] | select(.key == "singbox" or .key == "snell" or .key == "xray") |
             .key as $core | .value | to_entries[] | select($core != "snell" or .key != $p) |
             .value | records | select(.port == $record.port)] | length) > 0
         then error("duplicate port") else .snell[$p] = $record end
@@ -7206,7 +7594,7 @@ _apply_singbox_vless_config_locked() {
            ($action == "remove" and ($current | length) == 0)
         then error("target missing")
         elif $action != "remove" and
-             ([to_entries[] | select(.key == "singbox" or .key == "snell") |
+              ([to_entries[] | select(.key == "singbox" or .key == "snell" or .key == "xray") |
                .key as $core | .value | to_entries[] | .key as $proto | .value | records |
                select(.port == $record.port) |
                select(($action == "replace" and $core == "singbox" and $proto == $protocol and (.port | tostring) == $old) | not)] | length) > 0
@@ -7293,6 +7681,375 @@ _apply_singbox_vless_config_locked() {
 }
 
 # 仅快照共享 Sing-box 所拥有的资源；官方服务和官方配置不在事务范围内。
+
+_lite_xray_binary() {
+    if [[ -n "${XRAY_CONFIG_BINARY:-}" ]]; then
+        printf '%s\n' "$XRAY_CONFIG_BINARY"
+    elif declare -F xray >/dev/null 2>&1; then
+        printf '%s\n' xray
+    else
+        printf '%s\n' "$CFG/bin/xray"
+    fi
+}
+
+# Xray owns its listeners and direct outbound independently of Sing-box routing.
+generate_xray_config() {
+    local output_file="${1:-$CFG/xray.json}" db_file="${2:-$DB_FILE}" candidate_dir candidate check_log binary listen
+    binary=$(_lite_xray_binary) || return 1
+    listen=$(_listen_addr) || return 1
+    mkdir -p "$CFG" || return 1
+    candidate_dir=$(mktemp -d "${output_file}.tmp.XXXXXX") || return 1
+    candidate="$candidate_dir/config.json"
+    if ! jq --arg listen "$listen" '
+        def require($ok): if $ok then . else error("Invalid Xray record") end;
+        def uuid: type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$");
+        def records:
+            if type == "array" then .[] elif type == "object" then .
+            else error("Invalid Xray records") end;
+        def accounts: if has("users") then .users else [{uuid:.uuid}] end;
+        def checked($p):
+            require(type == "object") |
+            . as $record |
+            require(all(["encryption", "decryption", "dest", "xhttp_path", "xhttp_mode"][];
+                . as $field | ($record | has($field) | not) or ($record[$field] | type) == "string")) |
+            require((.port | type) == "number" and .port >= 1 and .port <= 65535 and (.port | floor) == .port) |
+            require(($p == "vless" and .transport == "raw" and .security_mode == "reality") or
+                    ($p == "vless-xhttp" and .transport == "xhttp" and .security_mode == "reality") or
+                    ($p == "vless-enc" and .transport == "raw" and .security_mode == "encryption")) |
+            (accounts) as $users |
+            require(($users | type) == "array") |
+            require(all($users[]; type == "object" and
+                ((has("enabled") | not) or (.enabled | type) == "boolean") and
+                ((has("name") | not) or ((.name | type) == "string" and (.name | test("[\\x00-\\x1f\\x7f]") | not))) and
+                (.enabled == false or (.uuid | uuid)))) |
+            require(([$users[] | select(.enabled != false) | .uuid] | length) ==
+                    ([$users[] | select(.enabled != false) | .uuid] | unique | length)) |
+            (.encryption // "none") as $encryption | (.decryption // "none") as $decryption |
+            require(($encryption == "none" and $decryption == "none") or
+                (($encryption | type) == "string" and ($decryption | type) == "string" and
+                 ($encryption | test("^mlkem768x25519plus\\.(native|xorpub|random)\\.(0rtt|1rtt)\\.[A-Za-z0-9_-]+$")) and
+                 ($decryption | test("^mlkem768x25519plus\\.(native|xorpub|random)\\.[0-9]+s\\.[A-Za-z0-9_-]+$")) and
+                 ($encryption | split(".")[1]) == ($decryption | split(".")[1]))) |
+            if .security_mode == "encryption" then
+                require($encryption != "none" and $decryption != "none")
+            else
+                require((.sni | type) == "string" and
+                    (.sni | test("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"))) |
+                require((.private_key | type) == "string" and (.private_key | test("^[A-Za-z0-9_-]{43}$"))) |
+                require((.public_key | type) == "string" and (.public_key | test("^[A-Za-z0-9_-]{43}$"))) |
+                require((.short_id | type) == "string" and (.short_id | test("^([A-Fa-f0-9]{2}){0,8}$"))) |
+                (.dest // (.sni + ":443")) as $target |
+                require(($target | type) == "string" and
+                    ($target | test("^(\\[[A-Fa-f0-9:]+\\]|[A-Za-z0-9._-]+):[0-9]+$"))) |
+                ($target | capture(":(?<port>[0-9]+)$").port | tonumber) as $target_port |
+                require($target_port >= 1 and $target_port <= 65535)
+            end |
+            if .transport == "xhttp" then
+                (.xhttp_path // "/") as $path | (.xhttp_mode // "auto") as $mode |
+                require(($path | type) == "string" and ($path | startswith("/")) and
+                    ($path | test("[\\x00-\\x20\\x7f]") | not)) |
+                require(["auto", "packet-up", "stream-up", "stream-one"] | index($mode) != null)
+            else . end;
+        require(type == "object") |
+        (if has("xray") then .xray else {} end) | require(type == "object") |
+        [to_entries[] | select(.key == "vless" or .key == "vless-xhttp" or .key == "vless-enc") |
+            .key as $p | .value | records | checked($p) | {protocol:$p,record:.}] as $listeners |
+        require(([$listeners[].record.port] | length) == ([$listeners[].record.port] | unique | length)) |
+        {log:{loglevel:"warning"},inbounds:[$listeners[] | .protocol as $p | .record as $c |
+            ($c | accounts | map(select(.enabled != false))) as $users |
+            # An explicit empty/disabled account list must never enable a fallback credential or listener.
+            select(($users | length) > 0) |
+            {tag:($p + "-" + ($c.port | tostring)),listen:$listen,port:$c.port,protocol:"vless",
+             settings:{clients:[$users[] | . as $u | {id:$u.uuid} +
+                 (if $c.transport == "raw" and $c.security_mode == "reality" then {flow:"xtls-rprx-vision"} else {} end) +
+                 (if ($u.name // "") != "" then {email:$u.name} else {} end)],decryption:($c.decryption // "none")},
+             streamSettings:({network:$c.transport,security:(if $c.security_mode == "reality" then "reality" else "none" end)} +
+                 (if $c.security_mode == "reality" then {realitySettings:{
+                     target:($c.dest // ($c.sni + ":443")),privateKey:$c.private_key,serverNames:[$c.sni],shortIds:[$c.short_id]}}
+                  else {} end) +
+                 (if $c.transport == "xhttp" then {xhttpSettings:{path:($c.xhttp_path // "/"),mode:($c.xhttp_mode // "auto")}}
+                  else {} end))}],outbounds:[{protocol:"freedom",tag:"direct"}]}
+    ' "$db_file" >"$candidate" || ! chmod 600 "$candidate"; then
+        rm -rf "$candidate_dir"
+        return 1
+    fi
+    check_log=$(mktemp "$candidate_dir/.xray-check.XXXXXX") || { rm -rf "$candidate_dir"; return 1; }
+    if ! "$binary" run -test -format json -c "$candidate" >"$check_log" 2>&1; then
+        _err "Xray 配置校验失败"
+        cat "$check_log" >&2 || true
+        rm -rf "$candidate_dir"
+        return 1
+    fi
+    if ! rm -f "$check_log" || ! mv -f "$candidate" "$output_file"; then
+        rm -rf "$candidate_dir"
+        return 1
+    fi
+    rm -rf "$candidate_dir"
+}
+
+# Only client fields reach the public link generator and JOIN files.
+regenerate_xray_protocol_join_info() {
+    local protocol="$1" records record output tmp aggregate join addresses ipv4 ipv6 host label link code prefix remark port
+    case "$protocol" in vless|vless-xhttp|vless-enc) ;; *) return 1 ;; esac
+    output="$CFG/$protocol.join"
+    records=$(jq -c --arg p "$protocol" '
+        (.xray[$p] // []) | (if type == "array" then .[] elif type == "object" then . else error("Invalid Xray records") end) |
+        . as $c | (if has("users") then .users[] | select(.enabled != false) else {uuid:.uuid} end) as $u |
+        {port:$c.port,uuid:$u.uuid,name:($u.name // ""),transport:$c.transport,security_mode:$c.security_mode,
+         encryption:($c.encryption // "none"),sni:$c.sni,public_key:$c.public_key,short_id:$c.short_id,
+         xhttp_path:($c.xhttp_path // "/"),xhttp_mode:($c.xhttp_mode // "auto")}
+    ' "$DB_FILE") || return 1
+    tmp=$(mktemp "$CFG/.xray-join.XXXXXX") || return 1
+    addresses=$(get_connection_addresses) || { rm -f "$tmp"; return 1; }
+    IFS='|' read -r ipv4 ipv6 <<<"$addresses"
+    prefix=$(tr '[:lower:]-' '[:upper:]_' <<<"$protocol") || { rm -f "$tmp"; return 1; }
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        remark=$(jq -r '.name' <<<"$record") || { rm -f "$tmp"; return 1; }
+        port=$(jq -r '.port' <<<"$record") || { rm -f "$tmp"; return 1; }
+        for label in V4 V6; do
+            host="$ipv4"; [[ "$label" != V6 ]] || host="$ipv6"
+            [[ -n "$host" ]] || continue
+            link=$(gen_xray_vless_link "$host" "$record" "$remark") &&
+                code=$(printf '%s' "$link" | base64 -w 0) &&
+                printf '# %s PORT=%s\nJOIN_%s=%s\n%s_%s=%s\n' "$protocol" "$port" \
+                    "$label" "$code" "$prefix" "$label" "$link" >>"$tmp" || { rm -f "$tmp"; return 1; }
+        done
+    done <<<"$records"
+    if [[ -s "$tmp" ]]; then
+        chmod 600 "$tmp" && mv -f "$tmp" "$output" || { rm -f "$tmp"; return 1; }
+    else
+        rm -f "$tmp" "$output" || return 1
+    fi
+    aggregate=$(mktemp "$CFG/.xray-join-all.XXXXXX") || return 1
+    for join in "$CFG"/*.join; do
+        [[ -f "$join" ]] || continue
+        cat "$join" >>"$aggregate" || { rm -f "$aggregate"; return 1; }
+    done
+    chmod 600 "$aggregate" && mv -f "$aggregate" "$CFG/join.txt" || { rm -f "$aggregate"; return 1; }
+}
+
+_restore_xray_config_transaction() {
+    local snapshot="$1" runtime_changed="$2" activation_attempted="$3" file staged index=0
+    shift 3
+    if [[ "$runtime_changed" == true ]]; then
+        if [[ "$activation_attempted" == true ]] || svc status sing-xray >/dev/null 2>&1; then
+            svc stop sing-xray || { svc status sing-xray >/dev/null 2>&1 && return 1; }
+        fi
+        if [[ ! -f "$snapshot/runtime-only" && ! -f "$snapshot/enabled" ]] && svc enabled sing-xray >/dev/null 2>&1; then
+            svc disable sing-xray || return 1
+        fi
+    fi
+    for file in "$@"; do
+        if [[ -f "$snapshot/$index" ]]; then
+            staged=$(mktemp "${file}.restore.XXXXXX") || return 1
+            if ! cp -p "$snapshot/$index" "$staged" || ! mv -f "$staged" "$file"; then
+                rm -f "$staged"
+                return 1
+            fi
+        else
+            rm -f "$file" || return 1
+        fi
+        index=$((index + 1))
+    done
+    if [[ "$runtime_changed" == true ]]; then
+        if [[ ! -f "$snapshot/runtime-only" ]]; then
+            [[ "$DISTRO" == alpine ]] || systemctl daemon-reload || return 1
+            if [[ -f "$snapshot/enabled" ]]; then
+                svc enable sing-xray || return 1
+            fi
+        fi
+        if [[ -f "$snapshot/running" ]]; then
+            svc start sing-xray && _wait_for_owned_service sing-xray || return 1
+        fi
+    fi
+    return 0
+}
+
+_apply_xray_config() {
+    local record="$1" action="${2:-${INSTALL_MODE:-add}}" old_port="${3:-${REPLACE_PORT:-}}" protocol="${4:-vless}" result=0
+    case "$action" in add|replace|remove) ;; *) return 1 ;; esac
+    case "$protocol" in vless|vless-xhttp|vless-enc) ;; *) return 1 ;; esac
+    [[ -f "$DB_FILE" ]] || init_db || return 1
+    _db_lock_acquire || return 1
+    _apply_xray_config_locked "$record" "$action" "$old_port" "$protocol" || result=1
+    _db_lock_release
+    return "$result"
+}
+
+# User candidates share the protocol transaction, including its pre-mutation DB snapshot.
+_apply_xray_user_change() {
+    local protocol="$1" operation="$2" name="$3" value="${4:-}" expire_date="${5:-}"
+    local record created='' enabled=true result=0
+    case "$protocol" in vless|vless-xhttp|vless-enc) ;; *) return 1 ;; esac
+    case "$operation" in
+        add) created=$(date '+%Y-%m-%d') || return 1 ;;
+        remove) ;;
+        enabled)
+            case "$value" in true|false) enabled="$value" ;; *) return 1 ;; esac ;;
+        *) return 1 ;;
+    esac
+    [[ -f "$DB_FILE" ]] || return 1
+    record=$(jq -cen --arg name "$name" --arg uuid "$value" --argjson enabled "$enabled" \
+        --arg created "$created" --arg expire_date "$expire_date" '
+        select($name != "" and ($name | test("[\\x00-\\x1f\\x7f]") | not)) |
+        {name:$name,uuid:$uuid,enabled:$enabled,created:$created,expire_date:$expire_date}
+    ') || return 1
+    _db_lock_acquire || return 1
+    _apply_xray_config_locked "$record" "user-$operation" '' "$protocol" || result=1
+    _db_lock_release
+    return "$result"
+}
+
+_apply_xray_config_locked() {
+    local record="$1" action="$2" old_port="$3" protocol="$4" snapshot file index=0 key remaining
+    local runtime_changed=false activation_attempted=false success=false operation=start
+    case "$action" in
+        add|replace|remove)
+            case "$protocol" in vless|vless-xhttp|vless-enc) ;; *) return 1 ;; esac
+            [[ "$action" == add || "$old_port" =~ ^[0-9]+$ || ( "$action" == remove && "$old_port" == all ) ]] || return 1 ;;
+        user-add|user-remove|user-enabled)
+            case "$protocol" in vless|vless-xhttp|vless-enc) ;; *) return 1 ;; esac ;;
+        rebuild) ;;
+        *) return 1 ;;
+    esac
+    local -a files=("$DB_FILE" "$CFG/xray.json" "$CFG/join.txt" "$CFG/role"
+        "$SYSTEMD_DIR/sing-xray.service" "$OPENRC_DIR/sing-xray"
+        "$CFG/vless.join" "$CFG/vless-xhttp.join" "$CFG/vless-enc.join")
+    snapshot=$(mktemp -d "$CFG/.xray-config.XXXXXX") || return 1
+    if [[ "$action" == user-* ]]; then
+        # Restart rollback must preserve existing units and service enablement.
+        touch "$snapshot/runtime-only" || { rm -rf "$snapshot"; return 1; }
+    fi
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]] && ! cp -p "$file" "$snapshot/$index"; then
+            rm -rf "$snapshot"
+            return 1
+        fi
+        index=$((index + 1))
+    done
+    if svc status sing-xray >/dev/null 2>&1; then
+        touch "$snapshot/running" || { rm -rf "$snapshot"; return 1; }
+    fi
+    if svc enabled sing-xray >/dev/null 2>&1; then
+        touch "$snapshot/enabled" || { rm -rf "$snapshot"; return 1; }
+    fi
+    if ! jq --arg protocol "$protocol" --arg action "$action" --arg old "$old_port" --argjson record "$record" '
+        def records: if type == "array" then .[] elif type == "object" then . else empty end;
+        def accounts:
+            if has("users") then . else .users=[{name:"default",uuid:.uuid,enabled:true}] end;
+        if $action == "rebuild" then .
+        elif $action == "user-add" or $action == "user-remove" or $action == "user-enabled" then
+            .xray[$protocol] as $original |
+            [$original | records | accounts] as $current |
+            ([$current[].users[] | select(.name == $record.name)] | length) as $matches |
+            if ($current | length) == 0 then error("Xray target missing")
+            elif $action == "user-add" and $matches > 0 then error("Xray user already exists")
+            elif $action != "user-add" and $matches == 0 then error("Xray user missing")
+            else
+                (if $action == "user-add" then $current | .[0].users += [$record]
+                 elif $action == "user-remove" then $current | map(.users |= map(select(.name != $record.name)))
+                 else $current | map(.users |= map(if .name == $record.name then .enabled=$record.enabled else . end))
+                 end) as $next |
+                .xray[$protocol] = (if ($original | type) == "array" then $next else $next[0] end)
+            end
+        else
+            (.xray[$protocol] // [] | [records]) as $current |
+            if ($action != "add" and $old != "all" and
+                ([$current[] | select((.port | tostring) == $old)] | length) != 1) or
+               ($action == "remove" and ($current | length) == 0)
+            then error("Xray target missing")
+            elif $action != "remove" and
+                ([to_entries[] | select(.key == "singbox" or .key == "snell" or .key == "xray") |
+                    .key as $core | .value | to_entries[] | .key as $proto | .value | records |
+                    select((.port | tostring) == ($record.port | tostring)) |
+                    select(($action == "replace" and $core == "xray" and $proto == $protocol and
+                        (.port | tostring) == $old) | not)] | length) > 0
+            then error("duplicate port")
+            else
+                (if $action == "add" then $current + [$record]
+                 elif $action == "replace" then [$current[] | if (.port | tostring) == $old then
+                     if ($record | has("users") | not) and has("users") then $record + {users:.users} else $record end
+                     else . end]
+                 elif $old == "all" then []
+                 else [$current[] | select((.port | tostring) != $old)] end) as $next |
+                if ($next | length) == 0 then del(.xray[$protocol]) else .xray[$protocol] = $next end
+            end
+        end
+    ' "$DB_FILE" >"$snapshot/next-db.json" ||
+       ! generate_xray_config "$snapshot/candidate.json" "$snapshot/next-db.json"; then
+        rm -rf "$snapshot"
+        return 1
+    fi
+    remaining=$(jq '[.xray | to_entries[] | select(.key == "vless" or .key == "vless-xhttp" or .key == "vless-enc") |
+        .value | if type == "array" then .[] else . end] | length' "$snapshot/next-db.json") || { rm -rf "$snapshot"; return 1; }
+    if { [[ "$action" == rebuild ]] || { chmod 600 "$snapshot/next-db.json" && mv -f "$snapshot/next-db.json" "$DB_FILE"; }; } &&
+       mv -f "$snapshot/candidate.json" "$CFG/xray.json"; then
+        success=true
+        for key in vless vless-xhttp vless-enc; do
+            regenerate_xray_protocol_join_info "$key" || { success=false; break; }
+        done
+        if [[ "$success" == true && ( "$action" == add || "$action" == replace ) ]]; then
+            printf '%s\n' server >"$CFG/role" && chmod 600 "$CFG/role" || success=false
+        fi
+        if [[ "$success" == true ]]; then
+            success=false
+            if [[ "$remaining" == 0 && "$action" == remove ]]; then
+                runtime_changed=true
+                if svc stop sing-xray && svc disable sing-xray &&
+                   rm -f "$CFG/xray.json" "$SYSTEMD_DIR/sing-xray.service" "$OPENRC_DIR/sing-xray" &&
+                   { [[ "$DISTRO" == alpine ]] || systemctl daemon-reload; }; then
+                    success=true
+                fi
+            elif [[ "$action" == user-* || ( "$action" == rebuild && "${XRAY_ACTIVATE_SERVICE:-false}" != true ) ]]; then
+                if [[ -f "$snapshot/running" ]]; then
+                    runtime_changed=true
+                    activation_attempted=true
+                    svc restart sing-xray && _wait_for_owned_service sing-xray && success=true
+                else
+                    success=true
+                fi
+            else
+                runtime_changed=true
+                [[ ! -f "$snapshot/running" ]] || operation=restart
+                if create_xray_service && { [[ "$action" == remove ]] || svc enable sing-xray; }; then
+                    if [[ "$action" == remove && ! -f "$snapshot/running" ]]; then
+                        success=true
+                    else
+                        activation_attempted=true
+                        svc "$operation" sing-xray && _wait_for_owned_service sing-xray && success=true
+                    fi
+                fi
+            fi
+        fi
+    fi
+    if [[ "$success" == true ]]; then
+        if [[ "$action" == add || "$action" == replace ]]; then unset INSTALL_MODE REPLACE_PORT; fi
+        rm -rf "$snapshot"
+        return 0
+    fi
+    if ! _restore_xray_config_transaction "$snapshot" "$runtime_changed" "$activation_attempted" "${files[@]}"; then
+        _err "Xray 恢复失败，快照保留: $snapshot"
+        return 1
+    fi
+    rm -rf "$snapshot"
+    _err "Xray 配置变更失败，已恢复原配置"
+    return 1
+}
+
+rebuild_and_reload_xray() {
+    local result=0 XRAY_ACTIVATE_SERVICE=false
+    case "${1:-}" in
+        ''|silent) ;;
+        start) XRAY_ACTIVATE_SERVICE=true ;;
+        *) return 1 ;;
+    esac
+    [[ -f "$DB_FILE" ]] || return 1
+    _db_lock_acquire || return 1
+    _apply_xray_config_locked '{}' rebuild '' '' || result=1
+    _db_lock_release
+    return "$result"
+}
 
 _apply_singbox_snell_change() {
     _apply_singbox_vless_config "$3" "$1" "$2" "${4:-snell-v5}"
@@ -7386,6 +8143,7 @@ get_all_services() {
     local DB_FILE="$CFG/db.json"
     [[ -f "$DB_FILE" && ! -f "$CFG/paused" ]] || return 0
     jq -e '(.singbox // {}) | length > 0' "$DB_FILE" >/dev/null 2>&1 && printf '%s\n' sing-singbox:sing-box
+    jq -e '(.xray // {}) | length > 0' "$DB_FILE" >/dev/null 2>&1 && printf '%s\n' sing-xray:xray
     jq -e '.snell["snell-v5-official"] != null' "$DB_FILE" >/dev/null 2>&1 && printf '%s\n' sing-snell-v5-official:snell-server-v5
     jq -e '.snell["snell-v6"] != null' "$DB_FILE" >/dev/null 2>&1 && printf '%s\n' sing-snell-v6:snell-server-v6
 }
@@ -7400,6 +8158,10 @@ while true; do
            { ! command -v systemctl >/dev/null 2>&1 && ! rc-service "$svc_name" status >/dev/null 2>&1; }; then
             if [[ "$svc_name" == "sing-singbox" ]] && ! sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
                 log "ERROR: Sing-box 配置校验失败，跳过重启 $svc_name"
+                continue
+            fi
+            if [[ "$svc_name" == sing-xray ]] && ! xray run -test -c "$CFG/xray.json" >/dev/null 2>&1; then
+                log "ERROR: Xray 配置校验失败，跳过重启 $svc_name"
                 continue
             fi
             log "CRITICAL: $proc_name 进程不存在，尝试重启 $svc_name..."
@@ -7539,6 +8301,7 @@ create_service() {
     local protocol="${1:-$(get_protocol)}" service binary config
     protocol_core "$protocol" >/dev/null || return 1
     if [[ "${PROTO_KIND[$protocol]}" == singbox ]]; then create_singbox_service; return; fi
+    if [[ "${PROTO_KIND[$protocol]}" == xray ]]; then create_xray_service; return; fi
     db_exists snell "$protocol" || { _err 'Snell 配置不存在'; return 1; }
     service="${PROTO_SVC[$protocol]}"
     binary=$(_core_binary_path "${PROTO_BIN[$protocol]}") || return 1
@@ -7657,6 +8420,7 @@ show_runtime_config() {
     local -a argv=() paths=() kinds=()
     case "$core" in
         singbox) name=sing-singbox; binary=$CFG/bin/sing-box; default_file="$CFG/singbox.json" ;;
+        xray) name=sing-xray; binary=$CFG/bin/xray; default_file="$CFG/xray.json" ;;
         snell-v5-official) name=sing-snell-v5-official; binary=$(_core_binary_path snell-server-v5); default_file="$CFG/snell-v5-official.conf" ;;
         snell-v6) name=sing-snell-v6; binary=$(_core_binary_path snell-server-v6); default_file="$CFG/snell-v6.conf" ;;
         *) printf '未知核心：%s\n' "$core"; return 1 ;;
@@ -7751,12 +8515,14 @@ view_runtime_config_menu() {
         _item "1" "Sing-box 完整配置"
         _item "2" "官方 Snell v5 配置"
         _item "3" "官方 Snell v6 配置"
+        _item "4" "Xray 完整配置"
         _item "0" "返回"
         read -rp "  请选择: " choice || return
         case "$choice" in
             1) show_runtime_config singbox; _pause ;;
             2) show_runtime_config snell-v5-official; _pause ;;
             3) show_runtime_config snell-v6; _pause ;;
+            4) show_runtime_config xray; _pause ;;
             0) return ;;
             *) _err "无效选择"; _pause ;;
         esac
@@ -7844,6 +8610,12 @@ start_services() {
             failures=$((failures+1))
         fi
     fi
+    protocols=$(get_xray_protocols)
+    if [[ -n "$protocols" ]]; then
+        if ! install_xray || ! rebuild_and_reload_xray start; then
+            failures=$((failures+1))
+        fi
+    fi
     for protocol in $(get_standalone_protocols); do
         service="${PROTO_SVC[$protocol]}"
         case "$protocol" in
@@ -7885,8 +8657,20 @@ ensure_singbox_runtime_consistency() {
     fi
 }
 
+ensure_xray_runtime_consistency() {
+    [[ -n "$(get_xray_protocols)" ]] || return 0
+    is_paused && return 0
+    [[ -x "$CFG/bin/xray" ]] || return 0
+    if [[ ! -f "$CFG/xray.json" ]] ||
+       ! "$CFG/bin/xray" run -test -format json -c "$CFG/xray.json" >/dev/null 2>&1; then
+        _info '检测到 Xray 配置缺失或无效，正在自动重建...'
+        rebuild_and_reload_xray start || return 1
+        _ok 'Xray 配置已自动修复'
+    fi
+}
+
 owned_services() {
-    printf '%s\n' sing-watchdog sing-singbox sing-snell-v5-official sing-snell-v6
+    printf '%s\n' sing-watchdog sing-singbox sing-xray sing-snell-v5-official sing-snell-v6
 }
 
 stop_services() {
@@ -12996,6 +13780,16 @@ show_single_protocol_info() {
         if [[ -n "$surge_lines" ]]; then
             printf '  Surge 节点配置（粘贴到 [Proxy]）：\n%s\n' "$surge_lines"
         fi
+        case "$protocol" in
+            vless-singbox|vless|vless-xhttp|vless-enc)
+                if ! jq -e '(.transport // "raw") as $t |
+                    ($t == "raw" or $t == "tcp") and
+                    (.security_mode // "reality") == "reality" and (.encryption // "none") == "none"' \
+                    <<< "$cfg" >/dev/null; then
+                    printf '  兼容性：Surge 不支持此节点的 XHTTP / VLESS Encryption；当前 Clash 订阅也跳过，请使用兼容的 Xray 客户端导入通用链接。\n'
+                fi
+                ;;
+        esac
     done <<< "$records"
     [[ "$clear_screen" != true ]] || _pause
     return 0
@@ -13017,7 +13811,7 @@ manage_protocol_services() {
         _item "2" "停止所有服务"
         _item "3" "启动所有服务"
         _item "4" "查看服务状态"
-        _item "5" "查看运行配置文件（Sing-box / 官方 Snell）"
+        _item "5" "查看运行配置文件（Sing-box / Xray / 官方 Snell）"
         _item "0" "返回"
         _line
 
@@ -13160,6 +13954,8 @@ uninstall_specific_protocol() {
         _apply_singbox_snell_change remove "$SELECTED_PORT" '{}' "$selected" || return 1
     elif [[ "$kind" == singbox ]]; then
         _apply_singbox_vless_config '{}' remove "$SELECTED_PORT" "$selected" || return 1
+    elif [[ "$kind" == xray ]]; then
+        _apply_xray_config '{}' remove "$SELECTED_PORT" "$selected" || return 1
     else
         svc stop "$service" || return 1
         svc disable "$service" || return 1
@@ -13230,20 +14026,45 @@ do_uninstall() {
     _ok "代理卸载完成；已保留核心、证书和独立 nftables 转发配置"
 }
 select_vless_mode() {
-    VLESS_SECURITY_MODE=reality
-    SELECTED_PROTOCOL=vless-singbox
+    local choice
+    _item 1 "VLESS REALITY + Vision"
+    _item 2 "VLESS XHTTP + REALITY (Xray)"
+    _item 3 "VLESS Encryption (Xray)"
+    _item 0 "返回"
+    while true; do
+        read -rp '  请选择 [1]: ' choice || return 1
+        case "${choice:-1}" in
+            1) VLESS_SECURITY_MODE=reality; select_vless_reality_implementation; return $? ;;
+            2) VLESS_SECURITY_MODE=reality; SELECTED_PROTOCOL=vless-xhttp; return 0 ;;
+            3) VLESS_SECURITY_MODE=encryption; SELECTED_PROTOCOL=vless-enc; return 0 ;;
+            0) SELECTED_PROTOCOL=''; return 1 ;;
+            *) _err '无效选择' ;;
+        esac
+    done
 }
 
 # 两个 REALITY 实现使用独立协议键，在检查已有端口前完成选择。
 select_vless_reality_implementation() {
-    SELECTED_PROTOCOL=vless-singbox
+    local choice
+    _item 1 "Sing-box (统一分流)"
+    _item 2 "Xray (独立直连出口)"
+    _item 0 "返回"
+    while true; do
+        read -rp '  请选择 [1]: ' choice || return 1
+        case "${choice:-1}" in
+            1) SELECTED_PROTOCOL=vless-singbox; return 0 ;;
+            2) SELECTED_PROTOCOL=vless; return 0 ;;
+            0) SELECTED_PROTOCOL=''; return 1 ;;
+            *) _err '无效选择' ;;
+        esac
+    done
 }
 
 # 协议选择菜单
 select_protocol() {
     local choice
     _line
-    _item 1 "VLESS REALITY (Sing-box)"
+    _item 1 "VLESS REALITY / XHTTP / Encryption"
     _item 2 "Shadowsocks 2022 / 传统版"
     _item 3 "SOCKS5 明文"
     _item 4 "Hysteria2"
@@ -13342,6 +14163,9 @@ do_install_server() {
         install_singbox || return 1
         [[ "$protocol" != snell-v6-singbox ]] || ensure_singbox_snell_support || return 1
         handle_existing_protocol "$protocol" singbox || return 1
+    elif [[ "$core" == xray ]]; then
+        install_xray || return 1
+        handle_existing_protocol "$protocol" xray || return 1
     else
         case "$protocol" in
             snell-v5-official) install_snell_v5 || return 1 ;;
@@ -13352,6 +14176,9 @@ do_install_server() {
     port=$(ask_port "$protocol") || return 1
     [[ -n "$port" ]] || return 1
     case "$protocol" in
+        vless|vless-xhttp|vless-enc)
+            configure_xray_vless "$protocol" "$port" || return 1
+            ;;
         vless-singbox)
             uuid=$(gen_uuid); sid=$(gen_sid)
             keys=$(gen_singbox_reality_keys) || return 1
@@ -13510,14 +14337,13 @@ parse_vless_link() {
     parse_proxy_link "$link" >/dev/null || return 1
     # vless://uuid@server:port?params#name
     local content="${link#vless://}"
-    local name="${content##*#}"
+    local name=""
+    [[ "$content" != *#* ]] || name="${content#*#}"
     name=$(printf '%b' "${name//%/\\x}")  # URL 解码
-    # 转义 JSON 特殊字符
-    name="${name//\\/\\\\}"
-    name="${name//\"/\\\"}"
     content="${content%%#*}"
 
     local uuid="${content%%@*}"
+    uuid=$(urldecode "$uuid")
     content="${content#*@}"
 
     local server_port="${content%%\?*}"
@@ -13526,12 +14352,15 @@ parse_vless_link() {
     local server="${parsed%%|*}"
     local port="${parsed##*|}"
 
-    local params="${content#*\?}"
+    local params=""
+    [[ "$content" != *\?* ]] || params="${content#*\?}"
 
     # 解析参数
     local security="" type="" sni="" pbk="" sid="" flow="" path="" host="" fp="" encryption=""
-    IFS='&' read -ra PARAMS <<< "$params"
-    for param in "${PARAMS[@]}"; do
+    local param
+    local -a vless_params=()
+    IFS='&' read -ra vless_params <<< "$params"
+    for param in "${vless_params[@]}"; do
         local key="${param%%=*}"
         local value="${param#*=}"
         value=$(printf '%b' "${value//%/\\x}")  # URL 解码
@@ -13556,6 +14385,7 @@ parse_vless_link() {
         echo "错误: 无法解析端口号 '$port'" >&2
         return 1
     fi
+    [[ -n "$name" ]] || name="VLESS-${server}-${port}"
 
     # 输出 JSON 格式 (使用 jq 确保正确转义，port 使用 argjson 存储为数字)
     # 注意：字段名使用完整名称以便 gen_singbox_chain_outbound 正确读取
@@ -14235,6 +15065,18 @@ external_link_to_surge() {
     [[ -n "$server_suffix" && "$name" != *"-${server_suffix}"* && "$name" != *"-${server_suffix}" ]] && name="${name}-${server_suffix}"
 
     case "$type" in
+        vless)
+            local record proxy
+            name="${name}-${port}"
+            record=$(jq -c '{port,uuid,transport,security_mode:.security,
+                encryption:(if .encryption == "" then "none" else (.encryption // "none") end),
+                sni,public_key:.publicKey,short_id:.shortId,flow}' <<< "$json") || return 1
+            if proxy=$(gen_vless_surge_line "$name" "$server" "$record"); then
+                printf '%s\n' "$proxy"
+            else
+                printf 'Surge 跳过外部 VLESS 节点 %s：当前仅转换 RAW REALITY 且 encryption=none；不支持此传输或加密方式。\n' "$name" >&2
+            fi
+            ;;
         vmess)
             local uuid=$(echo "$json" | jq -r '.uuid')
             local network=$(echo "$json" | jq -r '.network')
@@ -14786,12 +15628,14 @@ gen_v2ray_sub() {
 
             local link=""
             case "$protocol" in
-                vless-singbox)
+                vless-singbox|vless|vless-xhttp|vless-enc)
                     local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
-                    if [[ "$security_mode" == "encryption" ]]; then
+                    if [[ "$protocol" == vless-singbox && "$security_mode" == "encryption" ]]; then
                         _err "Sing-box 不支持 VLESS encryption 模式" >&2; return 1
                     else
-                        [[ -n "$server_ip" ]] && link=$(gen_vless_link "$server_ip" "$actual_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code")
+                        local user_name=$(jq -r '.user_name // ""' <<< "$cfg")
+                        local remark="${country_code:+${country_code}-}$(get_protocol_name "$protocol")-$(get_ip_suffix "$server_ip")-${port}${user_name:+-${user_name}}"
+                        [[ -n "$server_ip" ]] && link=$(gen_xray_vless_link "$server_ip" "$cfg" "$remark")
                     fi
                     ;;
                 naive)
@@ -14884,24 +15728,35 @@ gen_clash_sub() {
 
             local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
             local user_name=$(jq -r '.user_name // ""' <<< "$cfg")
-            [[ -z "$user_name" ]] || name="${name}-${port}-${user_name}"
+            case "$protocol" in
+                vless-singbox|vless|vless-xhttp|vless-enc) name="${name}-${port}${user_name:+-${user_name}}" ;;
+                *) [[ -z "$user_name" ]] || name="${name}-${port}-${user_name}" ;;
+            esac
             local proxy=""
+            local yaml_name=$(jq -rn --arg name "$name" '$name | tojson')
 
             case "$protocol" in
-            vless-singbox)
-                [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
+            vless-singbox|vless|vless-xhttp|vless-enc)
+                if ! jq -e '(.transport // "raw") as $t |
+                    ($t == "raw" or $t == "tcp") and
+                    (.security_mode // "reality") == "reality" and (.encryption // "none") == "none"' \
+                    <<< "$cfg" >/dev/null; then
+                    printf 'Clash 跳过 VLESS 节点 %s：当前仅导出 RAW REALITY，未支持 XHTTP / VLESS Encryption。\n' "$name" >&2
+                    continue
+                fi
+                [[ -n "$server_ip" ]] && proxy="  - name: $yaml_name
     type: vless
     server: \"$server_ip\"
     port: $actual_port
-    uuid: $uuid
+    uuid: $(jq -r '.uuid | tojson' <<< "$cfg")
     network: tcp
     tls: true
     udp: true
     flow: xtls-rprx-vision
-    servername: $sni
+    servername: $(jq -r '.sni | tojson' <<< "$cfg")
     reality-opts:
-      public-key: $public_key
-      short-id: $short_id
+      public-key: $(jq -r '.public_key | tojson' <<< "$cfg")
+      short-id: $(jq -r '.short_id // "" | tojson' <<< "$cfg")
     client-fingerprint: chrome"
                 ;;
             ss2022)
@@ -14957,7 +15812,7 @@ gen_clash_sub() {
 
             if [[ -n "$proxy" ]]; then
                 proxies+="$proxy"$'\n'
-                proxy_names+="      - \"$name\""$'\n'
+                proxy_names+="      - $yaml_name"$'\n'
             fi
         done <<< "$cfg_stream"
     done
@@ -14966,6 +15821,15 @@ gen_clash_sub() {
     local external_links=$(get_all_external_links)
     while IFS= read -r link || [[ -n "$link" ]]; do
         [[ -z "$link" || "$link" != *"://"* ]] && continue
+        if [[ "$link" == vless://* ]]; then
+            local ext_vless
+            ext_vless=$(parse_vless_link "$link") || continue
+            if ! jq -e '(.transport == "tcp" or .transport == "raw") and .security == "reality" and
+                ((.encryption // "none") == "none" or .encryption == "")' <<< "$ext_vless" >/dev/null; then
+                printf 'Clash 跳过外部 VLESS 节点：当前仅导出 RAW REALITY，未支持此传输或加密方式。\n' >&2
+                continue
+            fi
+        fi
         local ext_proxy=$(external_link_to_clash "$link")
         if [[ -n "$ext_proxy" ]]; then
             proxies+="$ext_proxy"$'\n'
@@ -14975,6 +15839,12 @@ gen_clash_sub() {
         fi
     done <<< "$external_links"
 
+    local proxies_header="proxies:"
+    if [[ -z "$proxies" ]]; then
+        proxies_header="proxies: []"
+        proxy_names='      - DIRECT'
+    fi
+
     # 生成完整 Clash 配置
     cat << EOF
 mixed-port: 7897
@@ -14982,7 +15852,7 @@ allow-lan: false
 mode: rule
 log-level: info
 
-proxies:
+$proxies_header
 $proxies
 proxy-groups:
   - name: "Proxy"
@@ -15038,15 +15908,27 @@ gen_surge_sub() {
             local stls_password=$(echo "$cfg" | jq -r '.stls_password // empty')
             local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
             case "$protocol" in
+                vless-singbox|vless|vless-xhttp|vless-enc) name="${name}-${port}" ;;
                 snell-v5|snell-v5-official) name="${country_code}-Snell-v5-${port}" ;;
                 snell-v6) name="${country_code}-Snell-v6-official-${port}" ;;
                 snell-v6-singbox) name="${country_code}-Snell-v6-singbox-${port}" ;;
             esac
             local user_name=$(jq -r '.user_name // ""' <<< "$cfg")
-            [[ -z "$user_name" ]] || name="${name}-${port}-${user_name}"
+            if [[ -n "$user_name" ]]; then
+                case "$protocol" in
+                    vless-singbox|vless|vless-xhttp|vless-enc) name="${name}-${user_name}" ;;
+                    *) name="${name}-${port}-${user_name}" ;;
+                esac
+            fi
             local proxy=""
 
             case "$protocol" in
+                vless-singbox|vless|vless-xhttp|vless-enc)
+                    if ! proxy=$(gen_vless_surge_line "$name" "$server_ip" "$cfg"); then
+                        printf 'Surge 跳过 VLESS 节点 %s：仅支持 RAW REALITY 且 encryption=none（需要公钥与 SNI）；不支持 XHTTP / VLESS Encryption。\n' "$name" >&2
+                        continue
+                    fi
+                    ;;
                 ss2022-shadowtls)
                     proxy="$name = ss, $server_ip, $port, encrypt-method=$method, password=$password, shadow-tls-password=$stls_password, shadow-tls-sni=$sni, shadow-tls-version=3"
                     ;;
@@ -15085,7 +15967,7 @@ gen_surge_sub() {
         done <<< "$cfg_stream"
     done
 
-    # 合并外部节点 (仅支持 vmess/trojan/ss/hysteria2)
+    # 合并支持的外部节点。
     local external_links=$(get_all_external_links)
     while IFS= read -r link || [[ -n "$link" ]]; do
         [[ -z "$link" || "$link" != *"://"* ]] && continue
@@ -15093,12 +15975,13 @@ gen_surge_sub() {
         if [[ -n "$ext_proxy" ]]; then
             proxies+="$ext_proxy"$'\n'
             # 从生成的 proxy 中提取名称
-            local ext_name=$(echo "$ext_proxy" | cut -d'=' -f1 | xargs)
+            local ext_name="${ext_proxy%% = *}"
             [[ -n "$proxy_names" ]] && proxy_names+=", "
             proxy_names+="$ext_name"
         fi
     done <<< "$external_links"
 
+    [[ -n "$proxy_names" ]] || proxy_names=DIRECT
     cat << EOF
 [General]
 loglevel = notify
@@ -15719,8 +16602,8 @@ _select_protocol_for_users() {
     while IFS= read -r proto; do
         [[ -z "$proto" ]] && continue
         { is_standalone_protocol "$proto" || is_singbox_snell_protocol "$proto"; } && continue
-        local core="singbox"
-        db_exists "singbox" "$proto" && core="singbox"
+        local core
+        core=$(protocol_db_core "$proto") || continue
         local user_count=$(db_count_users "$core" "$proto")
         local proto_name=$(get_protocol_name "$proto")
         _item "$i" "$proto_name ${D}($user_count 用户)${NC}"
@@ -15761,26 +16644,14 @@ _show_users_list() {
 # 生成用户的分享链接（根据协议类型）
 _gen_user_share_link() {
     local core="$1" proto="$2" uuid="$3" user_name="$4"
-
-    # 获取协议配置
-    local cfg=$(db_get "$core" "$proto")
-    [[ -z "$cfg" || "$cfg" == "null" ]] && return
-
-    # 检查是否为多端口数组格式
-    local is_array=false
-    if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        is_array=true
-        # 多端口：从第一个端口实例获取配置
-        cfg=$(echo "$cfg" | jq '.[0]')
-    fi
-
-    # 提取配置字段
-    local port=$(echo "$cfg" | jq -r '.port // empty')
-    local sni=$(echo "$cfg" | jq -r '.sni // empty')
-    local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
-    local public_key=$(echo "$cfg" | jq -r '.public_key // empty')
-    local method=$(echo "$cfg" | jq -r '.method // empty')
-    local domain=$(echo "$cfg" | jq -r '.domain // empty')
+    local selected_port="${5:-}" records cfg
+    records=$(db_protocol_configs "$core" "$proto" | jq -c --arg name "$user_name" --arg uuid "$uuid" \
+        --arg port "$selected_port" '
+        select($port == "" or (.port | tostring) == $port) |
+        select(if has("users") then
+            any((.users // [])[]; .name == $name and (.uuid // .password // "") == $uuid and .enabled != false)
+        else (.uuid // .password // .username // "") == $uuid end)
+    ') || return 1
 
     # 获取 IP 地址
     local ipv4 ipv6
@@ -15788,25 +16659,26 @@ _gen_user_share_link() {
     local country_code=$(get_ip_country "$ipv4")
     [[ -z "$country_code" ]] && country_code=$(get_ip_country "$ipv6")
 
-    # 用户分享链接使用实例端口。
-    local display_port="$port"
-
-    local remark="${country_code}-${user_name}"
-
     if [[ -z "$ipv4" && -n "$ipv6" ]]; then
         ipv4="[$ipv6]"
     fi
+    [[ -n "$ipv4" ]] || return 0
 
-    # 生成 IPv4 链接
-    if [[ -n "$ipv4" ]]; then
-        local link=""
+    while IFS= read -r cfg; do
+        [[ -n "$cfg" ]] || continue
+        local display_port=$(jq -r '.port // empty' <<< "$cfg")
+        local sni=$(jq -r '.sni // empty' <<< "$cfg")
+        local method=$(jq -r '.method // empty' <<< "$cfg")
+        local remark="${country_code:+${country_code}-}${user_name}" link=""
         case "$proto" in
-            vless-singbox)
+            vless-singbox|vless|vless-xhttp|vless-enc)
                 local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
-                if [[ "$security_mode" == "encryption" ]]; then
-                        _err "Sing-box 不支持 VLESS encryption 模式" >&2; return 1
+                if [[ "$proto" == vless-singbox && "$security_mode" == "encryption" ]]; then
+                    _err "Sing-box 不支持 VLESS encryption 模式" >&2; return 1
                 else
-                    link=$(gen_vless_link "$ipv4" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$remark")
+                    local record=$(jq -c --arg uuid "$uuid" '.uuid = $uuid' <<< "$cfg")
+                    remark="${remark}-$(get_protocol_name "$proto")-$(get_ip_suffix "$ipv4")-${display_port}"
+                    link=$(gen_xray_vless_link "$ipv4" "$record" "$remark") || return 1
                 fi
                 ;;
             ss2022) link=$(gen_ss2022_link "$ipv4" "$display_port" "$method" "$uuid" "$remark") ;;
@@ -15817,8 +16689,9 @@ _gen_user_share_link() {
                 ;;
             socks) link=$(gen_socks_link "$ipv4" "$display_port" "$user_name" "$uuid" "$remark") ;;
         esac
-        [[ -n "$link" ]] && echo "$link"
-    fi
+        [[ -z "$link" ]] || printf '%s\n' "$link"
+    done <<< "$records"
+    return 0
 }
 
 # 显示用户分享链接菜单
@@ -15852,13 +16725,15 @@ _show_user_share_links() {
         # 显示用户列表
         local users=()
         local uuids=()
+        local ports=()
         local idx=1
 
         while IFS='|' read -r name uuid enabled port routing; do
             [[ -z "$name" ]] && continue
             users+=("$name")
             uuids+=("$uuid")
-            echo -e "  ${G}$idx${NC}) $name"
+            ports+=("$port")
+            echo -e "  ${G}$idx${NC}) $name ${D}(端口 $port)${NC}"
             ((idx++))
         done <<< "$stats"
 
@@ -15883,7 +16758,7 @@ _show_user_share_links() {
                 local user="${users[$i]}"
                 local uuid="${uuids[$i]}"
                 echo -e "  ${Y}$user:${NC}"
-                local link=$(_gen_user_share_link "$core" "$proto" "$uuid" "$user")
+                local link=$(_gen_user_share_link "$core" "$proto" "$uuid" "$user" "${ports[$i]}")
                 [[ -n "$link" ]] && echo -e "  ${C}$link${NC}"
                 echo ""
             done
@@ -15900,7 +16775,7 @@ _show_user_share_links() {
             echo -e "  ${W}$user 分享链接${NC}"
             _dline
 
-            local link=$(_gen_user_share_link "$core" "$proto" "$uuid" "$user")
+            local link=$(_gen_user_share_link "$core" "$proto" "$uuid" "$user" "${ports[$((choice-1))]}")
             if [[ -n "$link" ]]; then
                 echo -e "  ${C}$link${NC}"
                 echo ""
@@ -16021,6 +16896,7 @@ _select_user_routing() {
 # 修改用户路由
 _set_user_routing() {
     local core="$1" proto="$2"
+    [[ "$core" != xray ]] || { _warn 'Xray 暂使用独立直连出口'; return 1; }
     local proto_name=$(get_protocol_name "$proto")
 
     local users=$(db_list_users "$core" "$proto")
@@ -16119,7 +16995,7 @@ _add_user() {
     # 生成 UUID/密码
     local uuid
     case "$proto" in
-        vless-singbox|tuic)
+        vless-singbox|vless|vless-xhttp|vless-enc|tuic)
             uuid=$(gen_uuid)
             ;;
         ss2022)
@@ -16161,7 +17037,10 @@ _add_user() {
     # 选择路由 (可选)
     local user_routing=""
     echo ""
-    read -rp "  是否为此用户配置专属路由? [y/N]: " config_routing
+    local config_routing=''
+    if [[ "$core" != xray ]]; then
+        read -rp "  是否为此用户配置专属路由? [y/N]: " config_routing
+    fi
     if [[ "$config_routing" =~ ^[yY]$ ]]; then
         if _select_user_routing; then
             user_routing="$SELECTED_ROUTING"
@@ -16193,7 +17072,11 @@ _add_user() {
 
         # 重新生成配置
         _info "更新配置..."
-        _regenerate_config "$core" "$proto" || return 1
+        if [[ "$core" == xray ]]; then
+            [[ ! -f "$CFG/sub.info" ]] || generate_sub_files || return 1
+        else
+            _regenerate_config "$core" "$proto" || return 1
+        fi
 
         _ok "配置已更新"
     else
@@ -16249,7 +17132,11 @@ _delete_user() {
 
                 # 重新生成配置
                 _info "更新配置..."
-                _regenerate_config "$core" "$proto"
+                if [[ "$core" == xray ]]; then
+                    [[ ! -f "$CFG/sub.info" ]] || generate_sub_files || return 1
+                else
+                    _regenerate_config "$core" "$proto" || return 1
+                fi
 
                 _ok "配置已更新"
             else
@@ -16413,8 +17300,11 @@ _set_user_expire_date() {
 # 重新生成配置 (添加/删除用户后调用)
 _regenerate_config() {
     local core="$1"
-    [[ "$core" == singbox ]] || { _err "该协议不支持用户配置"; return 1; }
-    rebuild_and_reload_singbox || return 1
+    case "$core" in
+        singbox) rebuild_and_reload_singbox || return 1 ;;
+        xray) rebuild_and_reload_xray || return 1 ;;
+        *) _err '该协议不支持用户配置'; return 1 ;;
+    esac
     [[ ! -f "$CFG/sub.info" ]] || generate_sub_files || return 1
     return 0
 }
@@ -16685,8 +17575,8 @@ manage_users() {
             echo -e "  ${D}已安装协议:${NC}"
             while IFS= read -r proto; do
                 [[ -z "$proto" ]] && continue
-                local core="singbox"
-                db_exists "singbox" "$proto" && core="singbox"
+                local core
+                core=$(protocol_db_core "$proto") || continue
                 local user_count=$(db_count_users "$core" "$proto")
                 local proto_name=$(get_protocol_name "$proto")
                 echo -e "  • $proto_name: ${G}$user_count${NC} 用户"
@@ -17627,6 +18517,7 @@ main_menu() {
     init_db   # 初始化 JSON 数据库
     db_migrate_to_multiuser  # 迁移旧的单用户配置到多用户格式
     ensure_singbox_runtime_consistency 2>/dev/null || true
+    ensure_xray_runtime_consistency 2>/dev/null || true
 
     # 自动更新系统脚本 (确保 sing 命令始终是最新版本)
     _auto_update_system_script
@@ -17667,6 +18558,9 @@ main_menu() {
         # 显示版本信息（已包含状态标识）
         echo -e "  ${D}系统: ${os_version} | ${kernel_version}${NC}"
         echo -e "  ${D}核心: Sing-box ${singbox_ver_with_status}${NC}"
+        if [[ -x "$CFG/bin/xray" ]]; then
+            echo -e "  ${D}核心: Xray $(_get_core_version xray)${NC}"
+        fi
         if [[ -n "$script_update_ver" ]]; then
             echo -e "  ${Y}提示: 脚本有新版本 v${script_update_ver}，可在菜单选择「检查脚本更新」${NC}"
         fi

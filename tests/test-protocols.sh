@@ -9,7 +9,7 @@ VLESS_TEST_CFG="$TEST_TMP/wrong-legacy-path" bash -c \
     'source "$1"; [[ "$CFG" == "$SING_TEST_CFG" ]]' test "$TEST_ROOT/vless-server.sh" || fail 'legacy override took precedence'
 env -u SING_TEST_CFG -u VLESS_TEST_CFG bash -c \
     'source "$1"; [[ "$CFG" == /etc/sing-lite ]]' test "$TEST_ROOT/vless-server.sh" || fail 'default configuration identity'
-for binary in sing-box snell-server-v5 snell-server-v6; do
+for binary in sing-box xray snell-server-v5 snell-server-v6; do
     [[ "$(_core_binary_path "$binary")" == "$CFG/bin/$binary" ]] || fail "managed binary path: $binary"
 done
 
@@ -27,17 +27,17 @@ for protocol in snell-v5-official snell-v6; do
         [[ "$($resolver "$protocol")" == snell ]] || fail "$resolver $protocol namespace"
     done
 done
-for protocol in '' unknown vless vless-vision vless-ws vless-ws-notls vmess-ws trojan mieru snell snell-v4 snell-v5-shadowtls; do
+for protocol in '' unknown vless-vision vless-ws vless-ws-notls vmess-ws trojan mieru snell snell-v4 snell-v5-shadowtls; do
     if protocol_core "$protocol" >"$TEST_TMP/rejected" 2>&1; then fail "accepted removed/unknown protocol '$protocol'"; fi
     if protocol_db_core "$protocol" >"$TEST_TMP/rejected" 2>&1; then fail "resolved removed/unknown protocol '$protocol'"; fi
 done
 init_db
-assert_json '(.singbox == {}) and (.snell == {}) and (has("xray")|not) and (has("mihomo")|not)' "$DB_FILE"
+assert_json '(.singbox == {}) and (.snell == {}) and (.xray == {}) and (has("mihomo")|not)' "$DB_FILE"
 [[ "$(stat -c %a "$DB_FILE")" == 600 ]] || fail 'database permissions'
 cp "$DB_FILE" "$TEST_TMP/db.before"
 init_db
 cmp "$TEST_TMP/db.before" "$DB_FILE"
-printf 'ok - protocol ownership, rejected legacy protocols, idempotent database without Xray\n'
+printf 'ok - protocol ownership, rejected legacy protocols, idempotent database with Xray\n'
 
 select_snell_v5_implementation <<<'' >"$TEST_TMP/selection"
 [[ "$SELECTED_PROTOCOL" == snell-v5 ]] || fail 'v5 default implementation'

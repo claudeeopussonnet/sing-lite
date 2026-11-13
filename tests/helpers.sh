@@ -30,6 +30,7 @@ rc-service() { forbidden rc-service "$@"; }
 iptables() { forbidden iptables "$@"; }
 ip6tables() { forbidden ip6tables "$@"; }
 nft() { forbidden nft "$@"; }
+crontab() { forbidden crontab "$@"; }
 curl() { forbidden curl "$@"; }
 sing-box() {
     if [[ -n "${SING_TEST_SINGBOX_BIN:-}" ]]; then
