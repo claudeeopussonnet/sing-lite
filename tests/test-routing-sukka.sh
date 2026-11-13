@@ -22,6 +22,8 @@ url="${@: -1}"
 printf '%s\n' "$url" >>"$SUKKA_TEST_DOWNLOADS"
 case "$url" in
     https://ruleset.skk.moe/sing-box/*.json) ;;
+    https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_ip/twitter.json)
+        cat "$SUKKA_TEST_FIXTURES/yuu-ip.json"; exit 0 ;;
     https://raw.githubusercontent.com/Yuu518/sing-box-rules/*.json)
         cat "$SUKKA_TEST_FIXTURES/yuu.json"; exit 0 ;;
     *) printf 'unexpected download: %s\n' "$url" >&2; exit 91 ;;
@@ -60,6 +62,8 @@ root = pathlib.Path(sys.argv[1])
 aggregate = {'version': 3, 'rules': [{'domain_suffix': ['native.example', 'also-native.example']} ]}
 (root / 'yuu.json').write_text(json.dumps({'version': 2, 'rules': [
     {'domain': ['www.youtube.com'], 'domain_suffix': ['youtube.com', 'google.com']}]}))
+(root / 'yuu-ip.json').write_text(json.dumps({'version': 2, 'rules': [
+    {'ip_cidr': ['192.0.2.0/24', '2001:db8::/32']}]}))
 for phase, names in {
     'domainset': ['reject', 'cdn'],
     'non_ip': ['stream', 'stream_jp', 'ai', 'telegram', 'reject', 'domestic'],
@@ -86,17 +90,45 @@ test_global_phases() {
         {id:"catchall",name:"first manually",type:"all",outbound:"balancer:pool",routing_priority:{singbox:0}},
         {id:"mixed",name:"unchanged",type:"custom",outbound:"chain:node",ip_version:"ipv4_only",routing_priority:{singbox:1},domains:"rule-set:skk-ip-china_ip,example.test,192.0.2.0/24,rule-set:skk-non-ip-telegram,rule-set:skk-domainset-reject"},
         {id:"youtube",type:"youtube",outbound:"balancer:pool",domains:"geosite:youtube"},
+        {id:"twitter",type:"twitter",outbound:"direct",domains:"geosite:twitter"},
         {id:"warp",type:"custom",outbound:"warp",ip_version:"ipv6_only",domains:"rule-set:skk-non-ip-ai,rule-set:skk-ip-ai"},
         {id:"direct",type:"custom",outbound:"direct",ip_version:"as_is",domains:"direct.example"}]'
     cp "$DB_FILE" "$TEST_TMP/db.before"
     gen_singbox_routing_rules >"$TEST_TMP/rules.json"
-    assert_json 'map(if .rule_set then (if (.rule_set[0]|startswith("skk-domainset-")) then 0 elif (.rule_set[0]|test("^(skk|yuu)-non-ip-")) then 1 else 2 end) elif .domain_suffix then 0 elif .ip_cidr then 2 else 3 end) | . == sort' "$TEST_TMP/rules.json"
+    assert_json 'map(if .rule_set then (if (.rule_set[0]|test("^(skk-domainset-|yuu-non-ip-)")) then 0 elif (.rule_set[0]|startswith("skk-non-ip-")) then 1 else 2 end) elif .domain_suffix then 0 elif .ip_cidr then 2 else 3 end) | . == sort' "$TEST_TMP/rules.json"
     assert_json '.[-1] == {outbound:"balancer-pool"}' "$TEST_TMP/rules.json"
+    assert_json 'any(.[]; .rule_set == ["yuu-non-ip-twitter"])' "$TEST_TMP/rules.json"
+    assert_json 'any(.[]; .rule_set == ["yuu-ip-twitter"] and .outbound == "direct-prefer-ipv4")' "$TEST_TMP/rules.json"
     assert_json '[.[] | select(.outbound == "chain-node-ipv4")] | length == 5 and all(.[]; .ip_version == 4)' "$TEST_TMP/rules.json"
     assert_json '[.[] | select(.outbound == "warp-ipv6")] | length == 2 and all(.[]; .ip_version == 6)' "$TEST_TMP/rules.json"
     assert_json 'any(.[]; .outbound == "direct-asis") and any(.[]; .rule_set == ["skk-ip-china_ip"])' "$TEST_TMP/rules.json"
     assert_json 'all(.[]; ((has("rule_set") and has("ip_cidr")) | not)) and all(.[] | .ip_cidr[]?; . != "0.0.0.0/0" and . != "::/0")' "$TEST_TMP/rules.json"
     cmp "$TEST_TMP/db.before" "$DB_FILE"
+}
+
+test_priority_within_global_phases() {
+    reset_db
+    rewrite_db '.routing_rules = [
+        {id:"a",type:"custom",outbound:"chain:a",routing_priority:{singbox:20},domains:"rule-set:skk-ip-stream,rule-set:skk-non-ip-stream,rule-set:skk-domainset-cdn"},
+        {id:"b",type:"custom",outbound:"chain:b",routing_priority:{singbox:10},domains:"rule-set:skk-ip-ai,rule-set:skk-non-ip-ai,rule-set:skk-domainset-reject"}]'
+    gen_singbox_routing_rules >"$TEST_TMP/rules.json"
+    assert_json 'map([.rule_set[0],.outbound]) == [
+        ["skk-domainset-reject","chain-b-prefer-ipv4"],
+        ["skk-domainset-cdn","chain-a-prefer-ipv4"],
+        ["skk-non-ip-ai","chain-b-prefer-ipv4"],
+        ["skk-non-ip-stream","chain-a-prefer-ipv4"],
+        ["skk-ip-ai","chain-b-prefer-ipv4"],
+        ["skk-ip-stream","chain-a-prefer-ipv4"]]' "$TEST_TMP/rules.json"
+    rewrite_db '.routing_rules[0].routing_priority.singbox = 0'
+    gen_singbox_routing_rules >"$TEST_TMP/rules.json"
+    assert_json 'map(.rule_set[0]) == ["skk-domainset-cdn","skk-domainset-reject","skk-non-ip-stream","skk-non-ip-ai","skk-ip-stream","skk-ip-ai"]' "$TEST_TMP/rules.json"
+    rewrite_db '.routing_rules[0].domains = "rule-set:skk-ip-stream,rule-set:skk-non-ip-stream,rule-set:yuu-non-ip-google" |
+        .routing_rules[1].domains = "rule-set:yuu-ip-twitter,rule-set:skk-non-ip-ai,rule-set:yuu-non-ip-twitter,rule-set:yuu-non-ip-youtube"'
+    gen_singbox_routing_rules >"$TEST_TMP/rules.json"
+    assert_json 'map(.rule_set[0]) == ["yuu-non-ip-google","yuu-non-ip-twitter","yuu-non-ip-youtube","skk-non-ip-stream","skk-non-ip-ai","skk-ip-stream","yuu-ip-twitter"]' "$TEST_TMP/rules.json"
+    rewrite_db '.routing_rules[1].routing_priority.singbox = -1'
+    gen_singbox_routing_rules >"$TEST_TMP/rules.json"
+    assert_json 'map(.rule_set[0]) == ["yuu-non-ip-twitter","yuu-non-ip-youtube","yuu-non-ip-google","skk-non-ip-ai","skk-non-ip-stream","yuu-ip-twitter","skk-ip-stream"]' "$TEST_TMP/rules.json"
 }
 
 test_default_priority() {
@@ -106,7 +138,7 @@ test_default_priority() {
     done
     db_add_routing_rule all direct '' as_is
     gen_singbox_routing_rules >"$TEST_TMP/rules.json"
-    assert_json '[.[] | .rule_set[0]? | select(. != null)] == ["skk-non-ip-ai","yuu-non-ip-youtube","skk-non-ip-stream_jp","skk-non-ip-stream","yuu-non-ip-google","skk-ip-ai","skk-ip-stream_jp","skk-ip-stream"]' "$TEST_TMP/rules.json"
+    assert_json '[.[] | .rule_set[0]? | select(. != null)] == ["yuu-non-ip-youtube","yuu-non-ip-google","skk-non-ip-ai","skk-non-ip-stream_jp","skk-non-ip-stream","skk-ip-ai","skk-ip-stream_jp","skk-ip-stream"]' "$TEST_TMP/rules.json"
     cp "$DB_FILE" "$TEST_TMP/db.before"
     if db_add_routing_rule netflix direct '' as_is >"$TEST_TMP/rejected.log" 2>&1; then fail 'unsupported preset persisted'; fi
     cmp "$TEST_TMP/db.before" "$DB_FILE"
@@ -119,11 +151,11 @@ test_menu_and_access() {
     _line() { :; }
     sleep() { :; }
     local key preset
-    for key in 1 2 3 4 5 a b; do
+    for key in 1 2 3 4 5 6 a b; do
         reset_db
         case "$key" in
             1) preset=singbox-ai ;; 2) preset=stream ;; 3) preset=stream-jp ;;
-            4) preset=youtube ;; 5) preset=google ;; a) preset=all ;; b) preset=ads ;;
+            4) preset=youtube ;; 5) preset=google ;; 6) preset=twitter ;; a) preset=all ;; b) preset=ads ;;
         esac
         _add_routing_rule <<<"$key"$'\n\n' >"$TEST_TMP/menu.log"
         assert_json ".routing_rules | length==1 and .[0].type==\"$preset\"" "$DB_FILE"
@@ -179,21 +211,25 @@ test_native_downloads() {
 
 test_yuu_legacy() {
     reset_db
-    rewrite_db '.routing_rules = [{id:"youtube",type:"custom",outbound:"direct",ip_version:"as_is",domains:"geosite:youtube"},{id:"google",type:"custom",outbound:"chain:node",ip_version:"ipv6_only",domains:"geosite:google"}]'
+    rewrite_db '.routing_rules = [{id:"youtube",type:"custom",outbound:"direct",ip_version:"as_is",domains:"geosite:youtube"},{id:"google",type:"custom",outbound:"chain:node",ip_version:"ipv6_only",domains:"geosite:google"},{id:"twitter",type:"custom",outbound:"direct",ip_version:"as_is",domains:"geosite:twitter"}]'
     gen_singbox_routing_rules >"$TEST_TMP/rules.json"
     # The official Yuu site sources contain domains only; no inferred IP set.
-    assert_json 'length == 2 and ([.[].rule_set[]] | sort) == ["yuu-non-ip-google","yuu-non-ip-youtube"] and all(.[]; (has("ip_cidr")|not))' "$TEST_TMP/rules.json"
+    assert_json 'length == 3 and ([.[].rule_set[]] | sort) == ["yuu-non-ip-google","yuu-non-ip-twitter","yuu-non-ip-youtube"] and all(.[]; (has("ip_cidr")|not))' "$TEST_TMP/rules.json"
+    rewrite_db '.routing_rules[2].domains += ",geoip:twitter"'
+    gen_singbox_routing_rules >"$TEST_TMP/rules.json"
+    assert_json 'length == 4 and .[-1].rule_set == ["yuu-ip-twitter"] and .[-1].outbound == "direct-asis"' "$TEST_TMP/rules.json"
     assert_json 'any(.[]; .outbound == "chain-node-ipv6" and .ip_version == 6) and any(.[]; .outbound == "direct-asis")' "$TEST_TMP/rules.json"
     : >"$SUKKA_TEST_DOWNLOADS"
     _ensure_singbox_rulesets_from_routing_rules "$(cat "$TEST_TMP/rules.json")"
     [[ -s "$SUKKA_TEST_DOWNLOADS" ]] || fail 'Yuu source was not downloaded'
-    printf '%s\n' https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_site/google.json https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_site/youtube.json >"$TEST_TMP/expected-downloads"
+    printf '%s\n' https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_ip/twitter.json https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_site/google.json https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_site/twitter.json https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_site/youtube.json >"$TEST_TMP/expected-downloads"
     cmp "$TEST_TMP/expected-downloads" "$SUKKA_TEST_DOWNLOADS"
-    [[ "$(wc -l <"$SUKKA_TEST_DOWNLOADS")" == 2 ]] || fail 'unexpected number of Yuu source downloads'
+    [[ "$(wc -l <"$SUKKA_TEST_DOWNLOADS")" == 4 ]] || fail 'unexpected number of Yuu source downloads'
+    assert_json '.rules[0].ip_cidr == ["192.0.2.0/24","2001:db8::/32"]' "$(_singbox_ruleset_source_path yuu-ip-twitter)"
     _build_singbox_ruleset_defs "$(cat "$TEST_TMP/rules.json")" >"$TEST_TMP/defs.json"
     assert_json 'all(.[]; .type == "local" and .format == "binary" and (has("url")|not))' "$TEST_TMP/defs.json"
     cp "$TEST_TMP/rules.json" "$TEST_TMP/legacy-yuu.json"
-    rewrite_db '.routing_rules[0].type = "youtube" | .routing_rules[1].type = "google"'
+    rewrite_db '.routing_rules[0].type = "youtube" | .routing_rules[1].type = "google" | .routing_rules[2].type = "twitter"'
     gen_singbox_routing_rules >"$TEST_TMP/rules.json"
     cmp "$TEST_TMP/legacy-yuu.json" "$TEST_TMP/rules.json"
 }
@@ -250,7 +286,7 @@ test_config_and_rollback() {
 }
 
 failures=0
-for test_case in test_global_phases test_default_priority test_menu_and_access test_native_presets test_legacy_tokens test_native_downloads test_yuu_legacy test_removed_presets test_config_and_rollback; do
+for test_case in test_global_phases test_priority_within_global_phases test_default_priority test_menu_and_access test_native_presets test_legacy_tokens test_native_downloads test_yuu_legacy test_removed_presets test_config_and_rollback; do
     set +e
     (set -e; "$test_case")
     status=$?

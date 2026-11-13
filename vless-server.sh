@@ -5366,11 +5366,13 @@ ip ai apple_services cdn china_ip china_ip_ipv6 domestic download lan neteasemus
 CATALOG
 }
 
-# Exact repository, branch and path allowlist; Yuu files contain domains only.
+# Exact repository, branch and path allowlist for Yuu site and IP files.
 _singbox_ruleset_source_url() {
     case "$1" in
         yuu-non-ip-youtube) echo https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_site/youtube.json ;;
         yuu-non-ip-google) echo https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_site/google.json ;;
+        yuu-non-ip-twitter) echo https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_site/twitter.json ;;
+        yuu-ip-twitter) echo https://raw.githubusercontent.com/Yuu518/sing-box-rules/rule_set/rule_set_ip/twitter.json ;;
         *) local source
            source=$(_singbox_sukka_tag_source "$1") || return 1
            printf 'https://ruleset.skk.moe/sing-box/%s.json\n' "$source" ;;
@@ -5413,7 +5415,7 @@ _singbox_sukka_tags_for_token() {
                 cn) name=domestic ;;
                 tracker|public-tracker|private-tracker|category-public-tracker|category-pt) _err "Sukka 没有等价的独立 BT/PT 规则: $token" >&2; return 1 ;;
                 category-ads-all|ads) name=reject ;;
-                youtube|google) echo "yuu-non-ip-$name"; return ;;
+                youtube|google|twitter) echo "yuu-non-ip-$name"; return ;;
                 telegram|ai) ;;
                 *) _err "无 Sukka 映射的旧规则: $token" >&2; return 1 ;;
             esac
@@ -5425,6 +5427,7 @@ _singbox_sukka_tags_for_token() {
             case "${token#*:}" in
                 cn) printf '%s\n' skk-ip-china_ip skk-ip-china_ip_ipv6 ;;
                 telegram|ai) echo "skk-ip-${token#*:}" ;;
+                twitter) echo yuu-ip-twitter ;;
                 *) _err "无 Sukka 映射的旧规则: $token" >&2; return 1 ;;
             esac ;;
         *) _err "不支持的规则标记: $token" >&2; return 1 ;;
@@ -5438,6 +5441,7 @@ _singbox_sukka_preset_tokens() {
         stream) echo 'rule-set:skk-non-ip-stream,rule-set:skk-ip-stream' ;;
         stream-jp) echo 'rule-set:skk-non-ip-stream_jp,rule-set:skk-ip-stream_jp' ;;
         youtube|google) echo "rule-set:yuu-non-ip-$name" ;;
+        twitter) echo 'rule-set:yuu-non-ip-twitter,rule-set:yuu-ip-twitter' ;;
         *) [[ -n "${ROUTING_PRESETS[$name]:-}" ]] || return 1
            printf '%s\n' "${ROUTING_PRESETS[$name]}" ;;
     esac
@@ -5474,7 +5478,7 @@ try:
         raise ValueError('无效或空的规则集')
     # Fail explicitly if the selected native Yuu files change matching phase.
     if sys.argv[2].startswith('yuu-'):
-        expected = {'domain', 'domain_suffix', 'domain_keyword', 'domain_regex'}
+        expected = {'ip_cidr'} if sys.argv[2].startswith('yuu-ip-') else {'domain', 'domain_suffix', 'domain_keyword', 'domain_regex'}
         if any(not isinstance(r, dict) or not r or set(r) - expected for r in doc['rules']):
             raise ValueError('Yuu 规则的匹配阶段发生变化')
     Path(sys.argv[1]).write_text(json.dumps(doc, ensure_ascii=False))
@@ -9007,6 +9011,7 @@ declare -A ROUTING_PRESETS=(
     [stream-jp]="rule-set:skk-non-ip-stream_jp,rule-set:skk-ip-stream_jp"
     [youtube]="rule-set:yuu-non-ip-youtube"
     [google]="rule-set:yuu-non-ip-google"
+    [twitter]="rule-set:yuu-non-ip-twitter,rule-set:yuu-ip-twitter"
     [ads]="rule-set:skk-domainset-reject,rule-set:skk-non-ip-reject,rule-set:skk-ip-reject"
 )
 
@@ -9017,6 +9022,7 @@ declare -A ROUTING_PRESET_NAMES=(
     [stream-jp]="Stream JP (Sukka)"
     [youtube]="YouTube"
     [google]="Google"
+    [twitter]="Twitter"
     [ads]="广告屏蔽 (Sukka)"
     [all]="所有流量"
 )
@@ -9645,7 +9651,8 @@ gen_singbox_routing_rules() {
                     tags=$(_singbox_sukka_tags_for_token "$token") || return 1
                     while IFS= read -r rs; do
                         [[ -n "$rs" ]] || continue
-                        case "$rs" in skk-domainset-*) phase=0 ;; skk-non-ip-*|yuu-non-ip-*) phase=1 ;; skk-ip-*) phase=2 ;; *) return 1 ;; esac
+                        # Yuu keeps legacy tag names, but site files belong to the first phase.
+                        case "$rs" in skk-domainset-*|yuu-non-ip-*) phase=0 ;; skk-non-ip-*) phase=1 ;; skk-ip-*|yuu-ip-*) phase=2 ;; *) return 1 ;; esac
                         result=$(jq --argjson base "$base" --arg rs "$rs" --argjson phase "$phase" \
                             '. + [$base + {rule_set:[$rs],_phase:$phase}]' <<<"$result") || return 1
                     done <<<"$tags" ;;
@@ -10074,7 +10081,7 @@ enable_access_restriction() {
     echo -e "  ${D}将写入以下预设拦截规则:${NC}"
     echo -e "  • ${ACCESS_RESTRICT_CN_DOMAINS} -> block"
     echo -e "  ${D}BT/PT 暂无专用规则源，不支持新增启用${NC}"
-    echo -e "  ${D}全局按 domainset → non_ip → ip 匹配，所有流量始终最后；手动优先级仅作用于阶段内部${NC}"
+    echo -e "  ${D}全局按 site（含 domainset）→ non_ip → ip 匹配，所有流量始终最后；手动优先级仅作用于阶段内部${NC}"
     echo ""
     read -rp "  确认启用? [Y/n]: " confirm
     [[ "$confirm" =~ ^[nN]$ ]] && return 0
@@ -10160,7 +10167,7 @@ _add_routing_rule() {
     _header
     echo -e "  ${W}添加分流规则${NC}"
     _line
-    echo -e "  ${D}全局匹配顺序: domainset → non_ip → ip → 所有流量${NC}"
+    echo -e "  ${D}全局匹配顺序: site（含 domainset）→ non_ip → ip → 所有流量${NC}"
     echo -e "  ${D}手动优先级仅作用于各阶段内部；所有流量始终最后${NC}"
     _line
 
@@ -10171,6 +10178,7 @@ _add_routing_rule() {
     _item "3" "Stream JP (Sukka)"
     _item "4" "YouTube (Yuu)"
     _item "5" "Google (Yuu)"
+    _item "6" "Twitter (Yuu)"
     _item "c" "自定义域名"
     _item "b" "广告屏蔽 (Sukka)"
     _item "a" "所有流量"
@@ -10186,6 +10194,7 @@ _add_routing_rule() {
         3) rule_type="stream-jp" ;;
         4) rule_type="youtube" ;;
         5) rule_type="google" ;;
+        6) rule_type="twitter" ;;
         c|C)
             rule_type="custom"
             echo ""
@@ -10481,7 +10490,7 @@ _reorder_routing_rules() {
         _header
         echo -e "  ${W}${core_name} 分流规则顺序${NC}"
         _line
-        _info "全局按 domainset → non_ip → ip 匹配，所有流量始终最后"
+        _info "全局按 site（含 domainset）→ non_ip → ip 匹配，所有流量始终最后"
         _info "手动顺序仅调整各阶段内部的优先级，阶段内首条命中生效"
         idx=1
         while IFS= read -r rule; do
