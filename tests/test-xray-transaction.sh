@@ -243,6 +243,61 @@ grep -qx 'Sing-box JOIN sentinel' "$CFG/join.txt" || fail 'unrelated aggregate J
 grep -qx 'official Snell JOIN sentinel' "$CFG/join.txt" || fail 'official aggregate JOIN lost'
 printf 'ok - replacements retain users, multiport JOINs filter enabled accounts and last removal retains other cores and binary\n'
 
+(
+    FAIL_VISION_JOIN=false
+    mv() {
+        if [[ "$FAIL_VISION_JOIN" == true && "${@: -1}" == "$CFG/join.txt" ]] &&
+           ! cmp -s "$TEST_TMP/vision-join-before" "$CFG/vless-enc.join"; then
+            FAIL_VISION_JOIN=false
+            return 1
+        fi
+        command mv "$@"
+    }
+    for initial_flow in '' xtls-rprx-vision; do
+        seed_fixture
+        SERVICE_RUNNING=true
+        SERVICE_ENABLED=true
+        enc_record=$(jq --arg flow "$initial_flow" \
+            '. + {flow:$flow,users:[{name:"kept",uuid:.uuid,enabled:true}]}' <<<"$encryption_record")
+        _apply_xray_config "$enc_record" add '' vless-enc
+        next_flow=xtls-rprx-vision
+        [[ -z "$initial_flow" ]] || next_flow=''
+        enc_replacement=$(jq --arg flow "$next_flow" '.flow=$flow | del(.users)' <<<"$enc_record")
+        cp -p "$CFG/vless-enc.join" "$TEST_TMP/vision-join-before"
+        save_artifacts
+        for failure in check join restart; do
+            : >"$TEST_TMP/events"
+            case "$failure" in
+                check) FAIL_CHECK=true ;;
+                join) FAIL_VISION_JOIN=true ;;
+                restart) FAIL_OPERATION=restart ;;
+            esac
+            if _apply_xray_config "$enc_replacement" replace 48004 vless-enc; then fail "ENC Vision $failure failure committed"; fi
+            FAIL_CHECK=false
+            assert_restored
+            [[ "$SERVICE_RUNNING" == true && "$SERVICE_ENABLED" == true ]] || fail 'ENC Vision rollback service state'
+            if [[ "$failure" != restart ]]; then
+                [[ "$(cat "$TEST_TMP/events")" == check ]] || fail 'ENC Vision pre-activation failure touched service'
+            else
+                [[ "$(jq -r '.xray["vless-enc"][0].flow' "$TEST_TMP/attempted-db")" == "$next_flow" ]] || fail 'Vision switch not staged before restart'
+            fi
+        done
+        _apply_xray_config "$enc_replacement" replace 48004 vless-enc
+        [[ "$(jq -r '.xray["vless-enc"][0].flow' "$DB_FILE")" == "$next_flow" ]] || fail 'Vision switch not persisted'
+        assert_json '.xray["vless-enc"][0].users == [{name:"kept",uuid:"00000000-0000-4000-8000-000000000004",enabled:true}]' "$DB_FILE"
+        jq -e --arg flow "$next_flow" '.inbounds[] | select(.port == 48004) |
+            .streamSettings == {network:"raw",security:"none"} and
+            .settings.clients[0].id == "00000000-0000-4000-8000-000000000004" and
+            (.settings.clients[0].flow // "") == $flow' "$CFG/xray.json" >/dev/null || fail 'Vision replacement lost users or security'
+        if [[ -n "$next_flow" ]]; then
+            grep -q 'flow=xtls-rprx-vision' "$CFG/vless-enc.join" || fail 'enabled Vision missing from JOIN'
+        elif grep -q 'flow=' "$CFG/vless-enc.join"; then
+            fail 'disabled Vision retained in JOIN'
+        fi
+    done
+)
+printf 'ok - ENC Vision switches preserve users and roll back DB/config/JOIN on validation, JOIN and restart failures\n'
+
 for failure in stop disable; do
     seed_fixture
     SERVICE_RUNNING=true

@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.1.1 [服务端]
+#  sing-lite v1.1.2 [服务端]
 #  官方 sing-box、Xray 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 sing。
 #  适配: Alpine/Debian/Ubuntu/CentOS
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.1.1"
+readonly VERSION="1.1.2"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/claudeeopussonnet/sing-lite"
 readonly SCRIPT_REPO="claudeeopussonnet/sing-lite"
@@ -3821,6 +3821,9 @@ gen_xray_vless_link() {
               ["pbk", (.public_key // "")], ["sid", (.short_id // "")]] +
              (if $type == "tcp" then [["flow", "xtls-rprx-vision"]] else [] end)
           else [] end) +
+         (if $type == "tcp" and $security == "encryption" and (.flow // "") != "" then
+             [["flow", .flow]]
+          else [] end) +
          (if $type == "xhttp" then
              [["path", (.xhttp_path // "/")], ["mode", (.xhttp_mode // "auto")]]
           else [] end) |
@@ -7127,7 +7130,7 @@ gen_xray_encryption() {
 
 configure_xray_vless() {
     local protocol="$1" port="$2" uuid record keys sni dest encryption=none decryption=none
-    local choice path mode security=reality transport=raw
+    local choice path mode flow="" security=reality transport=raw
     uuid=$(gen_uuid) || return 1
     [[ "$protocol" != vless-enc ]] || security=encryption
     [[ "$protocol" != vless-xhttp ]] || transport=xhttp
@@ -7156,6 +7159,18 @@ configure_xray_vless() {
     fi
     record=$(jq --arg encryption "$encryption" --arg decryption "$decryption" \
         '. + {encryption:$encryption,decryption:$decryption}' <<<"$record") || return 1
+    if [[ "$protocol" == vless-enc ]]; then
+        _info 'Vision 可优化内层 TLS 1.3 流量，不启用外层 TLS。'
+        while true; do
+            read -rp '  启用 Vision 流控? [y/N]: ' choice || return 1
+            case "$choice" in
+                y|Y) flow=xtls-rprx-vision; break ;;
+                n|N|'') break ;;
+                *) _err '请输入 y 或 n' ;;
+            esac
+        done
+        record=$(jq --arg flow "$flow" '. + {flow:$flow}' <<<"$record") || return 1
+    fi
     if [[ "$transport" == xhttp ]]; then
         read -rp '  XHTTP 路径 [/xhttp]: ' path || return 1
         path="${path:-/xhttp}"
@@ -8010,7 +8025,8 @@ generate_xray_config() {
                  ($decryption | test("^mlkem768x25519plus\\.(native|xorpub|random)\\.[0-9]+s\\.[A-Za-z0-9_-]+$")) and
                  ($encryption | split(".")[1]) == ($decryption | split(".")[1]))) |
             if .security_mode == "encryption" then
-                require($encryption != "none" and $decryption != "none")
+                require($encryption != "none" and $decryption != "none") |
+                require((has("flow") | not) or .flow == "" or .flow == "xtls-rprx-vision")
             else
                 require((.sni | type) == "string" and
                     (.sni | test("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"))) |
@@ -8040,7 +8056,9 @@ generate_xray_config() {
             select(($users | length) > 0) |
             {tag:($p + "-" + ($c.port | tostring)),listen:$listen,port:$c.port,protocol:"vless",
              settings:{clients:[$users[] | . as $u | {id:$u.uuid} +
-                 (if $c.transport == "raw" and $c.security_mode == "reality" then {flow:"xtls-rprx-vision"} else {} end) +
+                 (if $c.transport == "raw" and ($c.security_mode == "reality" or
+                     ($c.security_mode == "encryption" and $c.flow == "xtls-rprx-vision"))
+                  then {flow:"xtls-rprx-vision"} else {} end) +
                  (if ($u.name // "") != "" then {email:$u.name} else {} end)],decryption:($c.decryption // "none")},
              streamSettings:({network:$c.transport,security:(if $c.security_mode == "reality" then "reality" else "none" end)} +
                  (if $c.security_mode == "reality" then {realitySettings:{
@@ -8077,7 +8095,7 @@ regenerate_xray_protocol_join_info() {
         (.xray[$p] // []) | (if type == "array" then .[] elif type == "object" then . else error("Invalid Xray records") end) |
         . as $c | (if has("users") then .users[] | select(.enabled != false) else {uuid:.uuid} end) as $u |
         {port:$c.port,uuid:$u.uuid,name:($u.name // ""),transport:$c.transport,security_mode:$c.security_mode,
-         encryption:($c.encryption // "none"),sni:$c.sni,public_key:$c.public_key,short_id:$c.short_id,
+         encryption:($c.encryption // "none"),flow:$c.flow,sni:$c.sni,public_key:$c.public_key,short_id:$c.short_id,
          xhttp_path:($c.xhttp_path // "/"),xhttp_mode:($c.xhttp_mode // "auto")}
     ' "$DB_FILE") || return 1
     tmp=$(mktemp "$CFG/.xray-join.XXXXXX") || return 1

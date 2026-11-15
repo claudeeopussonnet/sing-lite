@@ -175,6 +175,24 @@ for protocol in vless vless-xhttp vless-enc; do
 done
 printf 'ok - all Xray protocols normalize legacy defaults and enable/disable/enable immediately\n'
 
+seed_fixture vless-enc
+rewrite_db '.xray["vless-enc"].flow="xtls-rprx-vision"'
+refresh_fixture
+db_add_user xray vless-enc bob "$uuid_new" || fail 'ENC Vision add user'
+assert_json '.inbounds[0].settings.clients | length == 2 and all(.[]; .flow == "xtls-rprx-vision")' "$CFG/xray.json"
+assert_runtime_update
+db_set_user_enabled xray vless-enc default false || fail 'ENC Vision disable user'
+assert_json '.inbounds[0].settings.clients | length == 1 and .[0].flow == "xtls-rprx-vision"' "$CFG/xray.json"
+assert_runtime_update
+db_set_user_enabled xray vless-enc default true || fail 'ENC Vision reenable user'
+assert_json '.inbounds[0].settings.clients | length == 2 and all(.[]; .flow == "xtls-rprx-vision")' "$CFG/xray.json"
+assert_runtime_update
+db_del_user xray vless-enc bob || fail 'ENC Vision remove user'
+assert_json '.xray["vless-enc"].flow == "xtls-rprx-vision"' "$DB_FILE"
+assert_json '.inbounds[0].settings.clients | length == 1 and .[0].flow == "xtls-rprx-vision"' "$CFG/xray.json"
+assert_runtime_update
+printf 'ok - ENC Vision survives user add/remove and disable/enable transactions\n'
+
 seed_fixture
 save_artifacts
 FAIL_RESTART=true

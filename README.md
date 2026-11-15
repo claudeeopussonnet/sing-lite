@@ -21,6 +21,8 @@ bash sing-lite.sh
 
 Xray 用户增删、启停与配置更新使用同一事务；验证或重启失败会恢复用户状态、配置和分享文件，到期禁用失败后仍可重试。已停止的服务在修改用户时保持停止。
 
+安装、新增或替换 VLESS ENC 端口时，可选择启用 Vision 流控，提示 `[y/N]`，默认关闭。同一端口的用户共享该设置，旧配置保持关闭；重新配置端口时可重新选择。Vision 可减少符合条件的内层 TLS 1.3 流量的重复加解密开销，ENC 本身不依赖它；开启后仍为 RAW TCP + ENC，不启用外层 TLS。服务端与客户端的 `flow=xtls-rprx-vision` 必须匹配，脚本会同步生成分享链接、二维码、用户分享和 Surge 配置及订阅，客户端应重新导入更新后的配置。
+
 Surge 自 iOS 6.0.0 / Mac 6.12.0 起支持 VLESS。脚本提供普通 REALITY、VLESS Encryption、XHTTP + REALITY（包括叠加 Encryption）的通用分享链接、可粘贴到 `[Proxy]` 的 Surge 配置行和 Surge 订阅。按 [Surge 官方文档](https://manual.nssurge.com/policies/vless.html) 输出 `username`、`flow`、`sni`、`reality-public-key`、`reality-short-id`、`encryption` 和 `xhttp-*` 字段；XHTTP 支持四种模式，外部同类链接保留路径、Host 和模式。外部 WS / HTTPUpgrade / gRPC、普通 TLS、高级 XHTTP `extra` 和 `downloadSettings` 暂不转换为 Surge，跳过时会说明原因。Clash 订阅中的 VLESS 仍仅导出未叠加 Encryption 的 RAW REALITY。
 
 分享链接、二维码、用户分享和订阅统一使用地区 emoji 与大写简称，例如 `🇯🇵 REALITY-443`、`🇯🇵 ENC-8443`、`🇯🇵 XHTTP-2053`、`🇯🇵 SNELL6-443`。多用户附加大写用户名，重名时补实现标识或编号；名称中的大小写转换不影响实际账户名、密码、密钥和路径。地区按连接服务器地址查询，外部域名先解析 IPv4，再解析 IPv6；无法确定地区时使用 `🌐`。外部节点导出时重新命名，原始导入内容保留；SOCKS5 分享使用支持备注的 `socks5://` URI。

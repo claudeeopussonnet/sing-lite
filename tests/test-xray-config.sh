@@ -51,6 +51,24 @@ assert_json '.inbounds[] | select(.port == 47004) | .streamSettings == {network:
 [[ "$(stat -c %a "$CFG/xray.json")" == 600 ]] || fail 'config permissions'
 [[ "$(wc -l <"$TEST_TMP/checks")" == 1 ]] || fail 'missing Xray candidate check'
 printf 'ok - object/array records, transports, REALITY and Encryption produce checked independent Xray config\n'
+cp -p "$DB_FILE" "$TEST_TMP/legacy-db.json"
+rewrite_db '.xray["vless-enc"] |= [., (. | .port=47005 | .flow=""),
+    (. | .port=47006 | .flow="xtls-rprx-vision" | .users=[
+        {name:"alice",uuid:"00000000-0000-4000-8000-000000000006",enabled:true},
+        {name:"bob",uuid:"00000000-0000-4000-8000-000000000007"},
+        {name:"disabled",uuid:"00000000-0000-4000-8000-000000000008",enabled:false}])]'
+generate_xray_config
+assert_json '.inbounds | length == 6' "$CFG/xray.json"
+assert_json 'all(.inbounds[] | select(.port == 47004 or .port == 47005);
+    all(.settings.clients[]; has("flow") | not))' "$CFG/xray.json"
+assert_json '.inbounds[] | select(.port == 47006) | .settings.clients == [
+    {id:"00000000-0000-4000-8000-000000000006",email:"alice",flow:"xtls-rprx-vision"},
+    {id:"00000000-0000-4000-8000-000000000007",email:"bob",flow:"xtls-rprx-vision"}]' "$CFG/xray.json"
+jq -e --arg server "$server" 'all(.inbounds[] | select(.port >= 47004);
+    .streamSettings == {network:"raw",security:"none"} and .settings.decryption == $server)' \
+    "$CFG/xray.json" >/dev/null || fail 'ENC Vision changed outer security or decryption'
+cp -p "$TEST_TMP/legacy-db.json" "$DB_FILE"
+printf 'ok - ENC legacy/off/on ports preserve no-TLS security and apply Vision to every enabled user\n'
 if [[ -n "${SING_TEST_XRAY_BIN:-}" ]]; then
     jq --arg client "$client" --arg server "$server" \
         '.xray["vless-xhttp"] += {encryption:$client,decryption:$server}' "$DB_FILE" >"$TEST_TMP/encrypted-db.json"
@@ -102,6 +120,13 @@ for mutation in \
     '.xray["vless-enc"].encryption="none"' \
     'del(.xray["vless-enc"].decryption)' \
     '.xray["vless-enc"].decryption="mlkem768x25519plus.xorpub.600s.mockServerKey"' \
+    '.xray["vless-enc"].flow=null' \
+    '.xray["vless-enc"].flow=false' \
+    '.xray["vless-enc"].flow=1' \
+    '.xray["vless-enc"].flow=[]' \
+    '.xray["vless-enc"].flow={}' \
+    '.xray["vless-enc"].flow="invalid"' \
+    '.xray["vless-enc"].flow="xtls-rprx-vision-udp443"' \
     '.xray.vless[0].users=null' \
     '.xray.vless[0].users=[{uuid:"bad-uuid"}]' \
     '.xray.vless[0].users=[{uuid:"00000000-0000-4000-8000-000000000001",enabled:"false"}]' \

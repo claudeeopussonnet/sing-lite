@@ -99,11 +99,30 @@ keys=$(gen_xray_encryption)
 [[ "$(jq -r '.decryption' <<<"$keys")" == mlkem768x25519plus.native.600s.server_key ]] || fail 'first server encryption pair'
 [[ "$(jq -r '.encryption' <<<"$keys")" == mlkem768x25519plus.native.0rtt.client_key ]] || fail 'matching client encryption pair'
 (
+    _info() { :; }
     _apply_xray_config() { printf '%s\n' "$1" >"$TEST_TMP/wizard-record.json"; }
-    configure_xray_vless vless-enc 42003 </dev/null
-    assert_json '.users == [{name:"default",uuid:.uuid,enabled:true}]' "$TEST_TMP/wizard-record.json"
-    INSTALL_MODE=replace REPLACE_PORT=42003 configure_xray_vless vless-enc 42003 </dev/null
-    assert_json 'has("users") | not' "$TEST_TMP/wizard-record.json"
+    for choice in y Y n N ''; do
+        configure_xray_vless vless-enc 42003 <<<"$choice" >/dev/null
+        assert_json '.users == [{name:"default",uuid:.uuid,enabled:true}] and
+            .transport == "raw" and .security_mode == "encryption"' "$TEST_TMP/wizard-record.json"
+        expected_flow=''
+        [[ ! "$choice" =~ ^[yY]$ ]] || expected_flow=xtls-rprx-vision
+        [[ "$(jq -r '.flow' "$TEST_TMP/wizard-record.json")" == "$expected_flow" ]] || fail 'ENC wizard Vision choice'
+    done
+    configure_xray_vless vless-enc 42003 <<< $'invalid\ny' >"$TEST_TMP/vision-prompt" 2>&1
+    grep -q '请输入 y 或 n' "$TEST_TMP/vision-prompt" || fail 'invalid Vision choice not explained'
+    assert_json '.flow == "xtls-rprx-vision"' "$TEST_TMP/wizard-record.json"
+    for choice in y n; do
+        INSTALL_MODE=replace REPLACE_PORT=42003 configure_xray_vless vless-enc 42003 <<<"$choice" >/dev/null
+        assert_json 'has("users") | not' "$TEST_TMP/wizard-record.json"
+        expected_flow=''
+        [[ "$choice" != y ]] || expected_flow=xtls-rprx-vision
+        [[ "$(jq -r '.flow' "$TEST_TMP/wizard-record.json")" == "$expected_flow" ]] || fail 'ENC replacement Vision choice'
+    done
+    rm -f "$TEST_TMP/wizard-record.json"
+    if configure_xray_vless vless-enc 42003 </dev/null >/dev/null; then fail 'ENC Vision EOF accepted'; fi
+    if configure_xray_vless vless-enc 42003 <<< invalid >/dev/null 2>&1; then fail 'ENC Vision retry EOF accepted'; fi
+    [[ ! -e "$TEST_TMP/wizard-record.json" ]] || fail 'ENC Vision EOF committed configuration'
 )
 (
     db_list_users() { printf 'default\n'; }
