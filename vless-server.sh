@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.1.0 [服务端]
+#  sing-lite v1.1.1 [服务端]
 #  官方 sing-box、Xray 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 sing。
 #  适配: Alpine/Debian/Ubuntu/CentOS
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.1.1"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/claudeeopussonnet/sing-lite"
 readonly SCRIPT_REPO="claudeeopussonnet/sing-lite"
@@ -2027,6 +2027,8 @@ build_config() {
 # 数据格式中 %s 会被替换为 IP，%b 会被替换为 [IP] (IPv6 带括号)
 # 示例: _save_join_info "vless" "REALITY|%s|$port|$uuid" gen_vless_link "%s" "$port" "$uuid"
 _save_join_info() {
+    local _SHARE_CATALOG="${_SHARE_CATALOG:-}"
+    [[ -n "$_SHARE_CATALOG" ]] || _SHARE_CATALOG=$(_build_share_catalog) || return 1
     local protocol="$1" data_fmt="$2" link_func="$3"; shift 3
     local join_file="$CFG/${protocol}.join"
     local link_prefix; link_prefix=$(tr '[:lower:]-' '[:upper:]_' <<<"$protocol")
@@ -2069,6 +2071,10 @@ _save_join_info() {
             return 1
         }
 
+        local name_record name
+        name_record=$(db_protocol_configs "$(protocol_db_core "$protocol")" "$protocol" | head -n 1) || return 1
+        name=$(_local_share_name "$protocol" "$ip" "$name_record") || return 1
+        link=$(set_link_name "$link" "$name") || return 1
         printf '# IPv%s\nJOIN_%s=%s\n%s_%s=%s\n' "${label#V}" "$label" "$code" "$link_prefix" "$label" "$link" >>"$join_file"
     done
 
@@ -2466,7 +2472,18 @@ _info()  { echo -e "  ${C}▸${NC} $1" >&2; }
 _ok()    { echo -e "  ${G}✓${NC} $1" >&2; _log "OK" "$1"; }
 _err()   { echo -e "  ${R}✗${NC} $1" >&2; _log "ERROR" "$1"; }
 _warn()  { echo -e "  ${Y}!${NC} $1" >&2; _log "WARN" "$1"; }
-_item()  { echo -e "  ${G}$1${NC}) $2" >&2; }
+# 数字与字母选项共用方括号标签；预留两位序号宽度以对齐菜单文字。
+_menu_badge() {
+    local badge
+    printf -v badge '[%s]' "${1^^}"
+    printf '%-4s' "$badge"
+}
+
+_item() {
+    printf '  %b' "$G" >&2
+    _menu_badge "$1" >&2
+    printf '%b %b\n' "$NC" "$2" >&2
+}
 _pause() { echo "" >&2; read -rp "  按回车继续..."; }
 
 # URL 解码函数 (处理 %XX 编码的中文等字符)
@@ -2931,9 +2948,9 @@ get_ip_country() {
 
     # 使用 HTTPS 查询，避免国家代码在传输途中被篡改。
     if [[ -n "$ip" ]]; then
-        country=$(curl -sf --connect-timeout 3 "https://ipinfo.io/${ip}/country" 2>/dev/null)
+        country=$(curl -sf --connect-timeout 3 --max-time 5 "https://ipinfo.io/${ip}/country" 2>/dev/null)
     else
-        country=$(curl -sf --connect-timeout 3 "https://ipinfo.io/country" 2>/dev/null)
+        country=$(curl -sf --connect-timeout 3 --max-time 5 "https://ipinfo.io/country" 2>/dev/null)
     fi
 
     # 清理结果（去除空白字符）
@@ -3122,9 +3139,9 @@ handle_existing_protocol() {
     echo ""
 
     echo -e "${YELLOW}请选择操作：${NC}"
-    echo -e "  ${G}1${NC}) 添加新端口实例"
-    echo -e "  ${G}2${NC}) 覆盖现有端口"
-    echo "  0) 返回"
+    echo -e "  ${G}$(_menu_badge "1")${NC} 添加新端口实例"
+    echo -e "  ${G}$(_menu_badge "2")${NC} 覆盖现有端口"
+    echo "  $(_menu_badge "0") 返回"
     echo ""
 
     local choice
@@ -3143,10 +3160,10 @@ handle_existing_protocol() {
             local port_array=($ports)
             local i=1
             for port in "${port_array[@]}"; do
-                echo -e "  ${G}$i${NC}) 端口 ${G}$port${NC}"
+                echo -e "  ${G}$(_menu_badge "$i")${NC} 端口 ${G}$port${NC}"
                 ((i++))
             done
-            echo "  0) 返回"
+            echo "  $(_menu_badge "0") 返回"
             echo ""
 
             local port_choice
@@ -3587,7 +3604,7 @@ gen_sni() {
 
 
 urlencode() {
-    local s="$1" i c o=""
+    local LC_ALL=C s="$1" i c o=""
     for ((i=0; i<${#s}; i++)); do
         c="${s:i:1}"
         case "$c" in
@@ -3618,10 +3635,163 @@ get_ip_suffix() {
 # 分享链接生成
 #═══════════════════════════════════════════════════════════════════════════════
 
+# 名称规则由所有分享出口共用；只转换显示名，不转换协议参数或账户凭据。
+_SHARE_NAME_JQ='
+    def flag($country):
+        ($country | ascii_upcase) as $c |
+        (" AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW " |
+         contains(" " + $c + " ")) as $valid |
+        if $valid then ($c | explode | map(. + 127397) | implode) else "🌐" end;
+    def protocol_label($p; $r):
+        if (["vless", "vless-singbox", "vless-enc", "vless-xhttp"] | index($p)) != null then
+            (if ($r.transport // "raw") == "xhttp" or $r.transport == "splithttp" then "XHTTP"
+             elif ($r.security_mode // $r.security // "reality") == "reality" then "REALITY"
+             elif ($r.encryption // "none") != "none" and ($r.encryption // "") != "" then "ENC"
+             else "VLESS" end) as $base |
+            $base + (if $base != "ENC" and ($r.encryption // "none") != "none" and
+                         ($r.encryption // "") != "" then "+ENC" else "" end)
+        else ({hy2:"HY2",hysteria2:"HY2",tuic:"TUIC",ss2022:"SS2022",
+               "ss-legacy":"SS",ss:"SS",shadowsocks:"SS",socks:"SOCKS5",socks5:"SOCKS5",
+               anytls:"ANYTLS",naive:"NAIVE",http:"NAIVE","ss2022-shadowtls":"SHADOWTLS",
+               "snell-v5":"SNELL5","snell-v5-official":"SNELL5",
+               "snell-v6":"SNELL6","snell-v6-singbox":"SNELL6",vmess:"VMESS",trojan:"TROJAN"}[$p]
+              // ($p | ascii_upcase)) end;
+    def basename($country; $p; $r):
+        ($r.user_name // "") as $user |
+        flag($country) + " " + protocol_label($p; $r) + "-" + ($r.port | tostring) +
+        (if $user != "" and ($user != "default" or $r.share_multi == true) then
+            "-" + ($user | ascii_upcase | gsub("[^\\p{L}\\p{N}_-]"; "_") | .[:12])
+         else "" end);
+'
+
+# 地区查询失败时使用 🌐。域名先查 A，再查 AAAA，不回退到管理机地址。
+_share_country() {
+    local host="$1" address country
+    host="${host#[}"; host="${host%]}"
+    [[ -n "$host" ]] && _is_valid_domain_or_ip "$host" || { printf 'XX\n'; return 0; }
+    address="$host"
+    if [[ "$host" != *:* && ! "$host" =~ ^[0-9.]+$ ]]; then
+        address=$(dig +time=2 +tries=1 +short A "$host" 2>/dev/null | awk '/^[0-9.]+$/ {print; exit}')
+        if [[ -z "$address" ]]; then
+            address=$(dig +time=2 +tries=1 +short AAAA "$host" 2>/dev/null | awk '/:/ {print; exit}')
+        fi
+    fi
+    [[ -n "$address" ]] || { printf 'XX\n'; return 0; }
+    country=$(get_ip_country "$address")
+    printf '%s\n' "${country:-XX}"
+}
+
+_share_base_name() {
+    local country="$1" protocol="$2" record="$3"
+    jq -er --arg country "$country" --arg protocol "$protocol" \
+        "$_SHARE_NAME_JQ basename(\$country; \$protocol; .)" <<< "$record"
+}
+
+# 完整集合先分配名字，再由各客户端筛选。目录仅存在本次生成的内存中。
+_build_share_catalog() {
+    local ipv4 ipv6 host country records external link node server
+    local -A countries=()
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
+    host="${ipv4:-$ipv6}"
+    country=$(_share_country "$host")
+    [[ -z "$host" ]] || countries["$host"]="$country"
+    records=$(jq -c --arg host "$host" --arg country "$country" '
+        . as $db | ["singbox", "xray", "snell"][] as $core |
+        ($db[$core] // {}) | to_entries[] | .key as $p |
+        .value | (if type == "array" then .[] else . end) | . as $c |
+        (if has("users") then (.users // [])[] | select(.enabled != false) else {name:""} end) as $u |
+        {key:(["local",$core,$p,($c.port | tostring),($u.name // "")] | tojson),
+         core:$core,protocol:$p,host:(if $p == "naive" then ($c.domain // $c.sni // $host) else $host end),
+         country:$country,port:$c.port,
+         user_name:($u.name // ""),share_multi:([$c.users[]? | select(.enabled != false)] | length > 1),
+         transport:$c.transport,security_mode:$c.security_mode,encryption:$c.encryption}
+    ' "$DB_FILE" 2>/dev/null) || return 1
+    # Naive 使用域名分享，按该域名的实际连接地址确定地区。
+    while IFS= read -r server; do
+        [[ -n "$server" ]] || continue
+        country=$(_share_country "$server")
+        countries["$server"]="$country"
+        records=$(jq -c --arg server "$server" --arg country "$country" \
+            'if .host == $server then .country = $country else . end' <<< "$records") || return 1
+    done < <(jq -sr --arg host "$host" '[.[] | select(.host != $host) | .host] | unique[]' <<< "$records")
+    external=$(_share_external_links)
+    while IFS= read -r link || [[ -n "$link" ]]; do
+        [[ -n "$link" && "$link" == *://* ]] || continue
+        node=$(parse_share_link "$link") || continue
+        [[ -n "$node" ]] || continue
+        server=$(jq -r '.server // ""' <<< "$node") || continue
+        if [[ -n "$server" ]] && [[ -n "${countries[$server]+present}" ]]; then
+            country="${countries[$server]}"
+        else
+            country=$(_share_country "$server")
+            [[ -z "$server" ]] || countries["$server"]="$country"
+        fi
+        node=$(jq -c --arg link "$link" --arg country "$country" '
+            {key:(["external",$link] | tojson),core:"",protocol:.type,host:.server,country:$country,
+             port,user_name:"",transport,security,encryption}
+        ' <<< "$node") || return 1
+        records+=$'\n'"$node"
+    done <<< "$external"
+    jq -sc "$_SHARE_NAME_JQ"'
+        unique_by(.key) | map(. + {base:basename(.country; .protocol; .)}) |
+        group_by(.base) | map(
+            ([.[].core | select(. != "")] | unique | length > 1) as $implementations |
+            map(. + {candidate:(.base +
+                (if $implementations and .core != "" then "-" +
+                    ({singbox:"SB",xray:"XR",snell:"OFFICIAL"}[.core] // (.core | ascii_upcase))
+                 else "" end))})) | add // [] |
+        sort_by(.candidate, .host, .protocol, .core, .user_name, .key) |
+        reduce .[] as $node ({used:{},nodes:[]};
+            . as $state |
+            ([$node.candidate,0] | until($state.used[.[0]] != true;
+                [($node.candidate + "-" + (.[1] + 1 | tostring)), .[1] + 1]))[0] as $name |
+            .used[$name] = true | .nodes += [$node + {name:$name}]) | .nodes
+    ' <<< "$records"
+}
+
+# 同一链接可能同时出现在手动导入和订阅缓存中，导出时只保留一次。
+_share_external_links() {
+    get_all_external_links | awk 'NF && !seen[$0]++'
+}
+
+_local_share_name() {
+    local protocol="$1" host="$2" record="$3" core="${4:-}" name country
+    [[ -n "$core" ]] || core=$(protocol_db_core "$protocol") || return 1
+    name=$(jq -r --arg core "$core" --arg p "$protocol" --argjson r "$record" '
+        (["local",$core,$p,($r.port | tostring),($r.user_name // "")] | tojson) as $key |
+        .[] | select(.key == $key) | .name
+    ' <<< "${_SHARE_CATALOG:-[]}") || return 1
+    if [[ -n "$name" ]]; then
+        printf '%s\n' "$name"
+    else
+        country=$(_share_country "$host")
+        _share_base_name "$country" "$protocol" "$record"
+    fi
+}
+
+_external_share_name() {
+    local link="$1" node="$2" name country
+    name=$(jq -r --arg link "$link" '.[] | select(.key == (["external",$link] | tojson)) | .name' \
+        <<< "${_SHARE_CATALOG:-[]}") || return 1
+    if [[ -n "$name" ]]; then
+        printf '%s\n' "$name"
+    else
+        country=$(_share_country "$(jq -r .server <<< "$node")")
+        _share_base_name "$country" "$(jq -r .type <<< "$node")" "$node"
+    fi
+}
+
+_simple_share_name() {
+    local country="$1" protocol="$2" port="$3" host="$4" record
+    [[ -n "$country" ]] || country=$(_share_country "$host")
+    record=$(jq -nc --arg port "$port" '{port:$port}') || return 1
+    _share_base_name "$country" "$protocol" "$record"
+}
+
 gen_vless_link() {
     local ip="$1" port="$2" uuid="$3" pbk="$4" sid="$5" sni="$6" country="${7:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}VLESS+Reality${ip_suffix:+-${ip_suffix}}-${port}" cfg
+    local name cfg
+    name=$(_simple_share_name "$country" vless-singbox "$port" "$ip") || return 1
     cfg=$(jq -nc --arg port "$port" --arg uuid "$uuid" --arg public_key "$pbk" \
         --arg short_id "$sid" --arg sni "$sni" \
         '{port:$port,uuid:$uuid,public_key:$public_key,short_id:$short_id,sni:$sni}') || return 1
@@ -3630,12 +3800,12 @@ gen_vless_link() {
 
 # 仅导出客户端字段；Encryption 的 decryption 和 REALITY 私钥始终留在服务端。
 gen_xray_vless_link() {
-    local host="$1" record="$2" remark="${3:-}" suffix
+    local host="$1" record="$2" remark="${3:-}"
     host="${host#[}"; host="${host%]}"
     [[ -n "$host" ]] || return 1
-    suffix=$(get_ip_suffix "$host")
+    [[ -n "$remark" ]] || remark=$(_share_base_name "$(_share_country "$host")" vless "$record") || return 1
     [[ "$host" != *:* ]] || host="[$host]"
-    jq -er --arg host "$host" --arg remark "$remark" --arg suffix "$suffix" '
+    jq -er --arg host "$host" --arg remark "$remark" '
         (.transport // "raw") as $transport |
         (.security_mode // "reality") as $security |
         (.encryption // "none") as $encryption |
@@ -3655,39 +3825,60 @@ gen_xray_vless_link() {
              [["path", (.xhttp_path // "/")], ["mode", (.xhttp_mode // "auto")]]
           else [] end) |
          map(.[0] + "=" + (.[1] | tostring | @uri)) | join("&")) as $query |
-        (if $remark != "" then $remark else
-             "VLESS-" + (if $type == "xhttp" then "XHTTP-" else "" end) +
-             (if $tls == "reality" then "REALITY" else "Encryption" end) +
-             "-" + $suffix + "-" + (.port | tostring)
-         end) as $name |
+        $remark as $name |
         "vless://" + (.uuid | @uri) + "@" + $host + ":" + (.port | tostring) +
         "?" + $query + "#" + ($name | @uri)
     ' <<< "$record"
 }
 
-# Surge 的 RAW REALITY 以公钥启用 TLS，不使用服务端私钥或 VLESS Encryption。
+# 按 Surge 官方字段导出 RAW / XHTTP、REALITY / Encryption 组合。
+# 仅包含客户端参数，不能将服务端私钥或 decryption 写入分享文件。
 gen_vless_surge_line() {
     local name="$1" host="$2" record="$3"
     host="${host#[}"; host="${host%]}"
     [[ -n "$host" ]] || return 1
     [[ "$host" != *:* ]] || host="[$host]"
     jq -er --arg name "$name" --arg host "$host" '
-        select((.transport // "raw") == "raw" or .transport == "tcp") |
-        select((.security_mode // "reality") == "reality" and (.encryption // "none") == "none") |
-        select((.public_key // "") != "" and (.sni // "") != "") |
-        select((.flow // "xtls-rprx-vision") as $flow |
-            $flow == "" or $flow == "xtls-rprx-vision" or $flow == "xtls-rprx-vision-udp443") |
-        def safe: tostring | if test("[,\\r\\n]") then error("Invalid Surge field") else . end;
-        ($name | safe) + " = vless, " + ($host | safe) + ", " + (.port | safe) +
-        ", username=" + (.uuid | safe) +
-        (if (.flow // "xtls-rprx-vision") == "" then "" else ", flow=" + ((.flow // "xtls-rprx-vision") | safe) end) +
-        ", sni=" + (.sni | safe) +
-        ", reality-public-key=" + (.public_key | safe) + ", reality-short-id=" + ((.short_id // "") | safe)
+        def require($ok; $reason): if $ok then . else error($reason) end;
+        def safe:
+            tostring | require((explode | all(. >= 32 and . != 127)); "Invalid Surge field") |
+            if contains(",") or contains("\"") or contains("\\") or startswith(" ") or endswith(" ") then tojson else . end;
+        (.transport // "raw") as $t |
+        (.security_mode // "reality") as $security |
+        (if (.encryption // "") == "" then "none" else .encryption end) as $enc |
+        (.flow // (if ($t == "raw" or $t == "tcp") and $security == "reality"
+                   then "xtls-rprx-vision" else "" end)) as $flow |
+        require((["raw", "tcp", "xhttp"] | index($t)) != null; "Unsupported VLESS transport") |
+        require($security == "reality" or (($security == "encryption" or $security == "none") and $enc != "none");
+                "Unsupported VLESS security") |
+        require((.uuid // "") != "" and (.port | tonumber) >= 1 and (.port | tonumber) <= 65535;
+                "Missing VLESS user/port") |
+        require(.extra == null or .extra == "" or .extra == {}; "Advanced XHTTP extra is not supported") |
+        require((.downloadSettings // null) == null; "XHTTP downloadSettings is not supported") |
+        require($flow == "" or $flow == "xtls-rprx-vision" or $flow == "xtls-rprx-vision-udp443";
+                "Unsupported VLESS flow") |
+        require($flow == "" or $t != "xhttp" or $enc != "none"; "XHTTP Vision requires Encryption") |
+        require($security != "reality" or ((.public_key // "") != "" and (.sni // "") != "");
+                "REALITY requires public key and SNI") |
+        (.xhttp_mode // "auto") as $mode |
+        require($t != "xhttp" or (["auto", "packet-up", "stream-up", "stream-one"] | index($mode)) != null;
+                "Invalid XHTTP mode") |
+        ($name | require((contains(",") or contains("=") or (explode | any(. < 32 or . == 127))) | not;
+                         "Invalid Surge name")) +
+        " = vless, " + ($host | safe) + ", " + (.port | safe) + ", username=" + (.uuid | safe) +
+        (if $flow == "" then "" else ", flow=" + ($flow | safe) end) +
+        (if $security == "reality" then
+            ", sni=" + (.sni | safe) + ", reality-public-key=" + (.public_key | safe) +
+            ", reality-short-id=" + ((.short_id // "") | safe)
+         else "" end) +
+        (if $enc == "none" then "" else ", encryption=" + ($enc | safe) end) +
+        (if $t == "xhttp" then
+            ", xhttp=true, xhttp-path=" + ((.xhttp_path // "/") | safe) +
+            ", xhttp-mode=" + ($mode | safe) +
+            (if (.xhttp_host // "") == "" then "" else ", xhttp-host=" + (.xhttp_host | safe) end)
+         else "" end)
     ' <<< "$record"
 }
-
-
-
 
 
 # 生成二维码 (使用 qrencode 生成终端二维码)
@@ -3714,8 +3905,96 @@ _can_gen_qr() {
 
 # 二维码仅辅助展示，缺少工具或编码失败不能中断分享菜单。
 _show_link_qr() {
-    printf '  二维码:\n'
+    printf '\n'
+    _share_ui_line '二维码 · 扫码导入' "$D"
     gen_qr "$1" || :
+}
+
+# 分享页只为标题着色；链接、配置与二维码保持原始内容，方便复制和扫描。
+_share_ui_color() {
+    if [[ -t 1 && "${TERM:-dumb}" != dumb && -z "${NO_COLOR+x}" ]]; then
+        printf '%b' "$1"
+    fi
+    return 0
+}
+
+_share_ui_line() {
+    local text="$1" color="${2:-$W}"
+    printf '  '
+    _share_ui_color "$color"
+    printf '%s' "$text"
+    _share_ui_color "$NC"
+    printf '\n'
+}
+
+_share_ui_rule() {
+    local width="${COLUMNS:-64}" i
+    [[ "$width" =~ ^[0-9]{1,3}$ ]] || width=64
+    width=$((10#$width))
+    (( width <= 64 )) || width=64
+    (( width >= 20 )) || width=20
+    printf '  '
+    _share_ui_color "$D"
+    for ((i=0; i<width-4; i++)); do printf '─'; done
+    _share_ui_color "$NC"
+    printf '\n'
+}
+
+_share_ui_heading() {
+    printf '\n'
+    _share_ui_line "$1" "$W"
+    [[ -z "${2:-}" ]] || _share_ui_line "$2" "$D"
+    printf '\n'
+}
+
+_share_node_card() {
+    local index="$1" protocol="$2" core="$3" link="$4" surge_line="${5:-}" show_qr="${6:-true}"
+    local name address implementation
+    name=$(get_link_name "$link")
+    address="${link#*://}"; address="${address%%#*}"; address="${address%%\?*}"
+    address="${address##*@}"; address="${address%%/*}"
+    case "$core" in
+        singbox) implementation=SING-BOX ;;
+        xray) implementation=XRAY ;;
+        snell) implementation='SNELL 官方' ;;
+        *) implementation="${core^^}" ;;
+    esac
+    _share_ui_rule
+    _share_ui_line "$(printf '%02d  %s' "$index" "$name")" "$C"
+    _share_ui_line "$implementation  ·  $address" "$D"
+    printf '\n'
+    _share_ui_line '分享链接 · 复制导入' "$G"
+    printf '%s\n' "$link"
+    if [[ "$protocol" == snell-* ]]; then
+        _share_ui_line 'Snell 为自定义 URI；Surge 请使用配置或订阅链接。' "$D"
+    fi
+    if [[ -n "$surge_line" ]]; then
+        printf '\n'
+        _share_ui_line 'Surge 节点配置 · 粘贴到 [Proxy]' "$G"
+        printf '%s\n' "$surge_line"
+    fi
+    [[ "$show_qr" != true ]] || _show_link_qr "$link"
+    printf '\n'
+}
+
+_share_user_card() {
+    local index="$1" core="$2" protocol="$3" uuid="$4" user="$5" port="$6" show_qr="${7:-true}"
+    local links link name surge_lines row surge_line
+    links=$(_gen_user_share_link "$core" "$protocol" "$uuid" "$user" "$port") || return 1
+    if [[ -z "$links" ]]; then
+        _share_ui_line "$user（端口 $port）：暂无可分享的已启用节点。" "$D"
+        return 0
+    fi
+    surge_lines=$(gen_surge_sub "$protocol" "$port" | awk '/^\[Proxy\]$/ {printing=1; next} /^\[/ {printing=0} printing && NF') || return 1
+    while IFS= read -r link; do
+        [[ -n "$link" ]] || continue
+        name=$(get_link_name "$link")
+        surge_line=""
+        while IFS= read -r row; do
+            if [[ "$row" == "$name = "* ]]; then surge_line="$row"; break; fi
+        done <<< "$surge_lines"
+        _share_node_card "$index" "$protocol" "$core" "$link" "$surge_line" "$show_qr"
+    done <<< "$links"
 }
 
 
@@ -3723,48 +4002,42 @@ _show_link_qr() {
 # 生成各协议分享链接
 gen_hy2_link() {
     local ip="$1" port="$2" password="$3" sni="$4" country="${5:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}Hysteria2${ip_suffix:+-${ip_suffix}}"
+    local name
+    name=$(_simple_share_name "$country" hy2 "$port" "$ip") || return 1
     # 链接始终使用实际端口，端口跳跃需要客户端手动配置
-    printf '%s\n' "hysteria2://${password}@${ip}:${port}?sni=${sni}&insecure=1#${name}"
+    printf '%s\n' "hysteria2://${password}@${ip}:${port}?sni=${sni}&insecure=1#$(urlencode "$name")"
 }
 
 
 
 gen_ss2022_link() {
     local ip="$1" port="$2" method="$3" password="$4" country="${5:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}SS2022${ip_suffix:+-${ip_suffix}}"
+    local name
+    name=$(_simple_share_name "$country" ss2022 "$port" "$ip") || return 1
     local userinfo=$(printf '%s:%s' "$method" "$password" | base64 -w 0 2>/dev/null || printf '%s:%s' "$method" "$password" | base64)
-    printf '%s\n' "ss://${userinfo}@${ip}:${port}#${name}"
+    printf '%s\n' "ss://${userinfo}@${ip}:${port}#$(urlencode "$name")"
 }
 
 gen_ss_legacy_link() {
     local ip="$1" port="$2" method="$3" password="$4" country="${5:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}SS${ip_suffix:+-${ip_suffix}}"
+    local name
+    name=$(_simple_share_name "$country" ss-legacy "$port" "$ip") || return 1
     local userinfo=$(printf '%s:%s' "$method" "$password" | base64 -w 0 2>/dev/null || printf '%s:%s' "$method" "$password" | base64)
-    printf '%s\n' "ss://${userinfo}@${ip}:${port}#${name}"
+    printf '%s\n' "ss://${userinfo}@${ip}:${port}#$(urlencode "$name")"
 }
 
 gen_snell_link() {
     local ip="$1" port="$2" psk="$3" version="${4:-4}" country="${5:-}"
-    local mode="${6:-}" implementation="${7:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}Snell-v${version}${ip_suffix:+-${ip_suffix}}"
-    # Mihomo 可同时承载多个 v4/v5 入站，分享名称必须包含端口。
-    if [[ "$version" != 6 ]]; then
-        name+="-${port}"
-    elif [[ -n "$implementation" ]]; then
-        name+="-${implementation}-${port}"
-    fi
+    local mode="${6:-}"
+    local name
+    name=$(_simple_share_name "$country" "snell-v${version}" "$port" "$ip") || return 1
     # Snell 没有标准URI格式，使用自定义格式
     local query="version=${version}"
     if [[ "$version" == "6" ]]; then
         mode="${mode:-default}"
         query+="&mode=${mode}"
     fi
-    printf '%s\n' "snell://${psk}@${ip}:${port}?${query}#${name}"
+    printf '%s\n' "snell://${psk}@${ip}:${port}?${query}#$(urlencode "$name")"
 }
 
 # 生成 Surge Snell 节点行。name 由调用者包含端口后缀，保证多入站节点唯一。
@@ -3782,32 +4055,33 @@ gen_snell_surge_line() {
 
 gen_tuic_link() {
     local ip="$1" port="$2" uuid="$3" password="$4" sni="$5" country="${6:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}TUIC${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "tuic://${uuid}:${password}@${ip}:${port}?congestion_control=bbr&alpn=h3&sni=${sni}&udp_relay_mode=native&allow_insecure=1#${name}"
+    local name
+    name=$(_simple_share_name "$country" tuic "$port" "$ip") || return 1
+    printf '%s\n' "tuic://${uuid}:${password}@${ip}:${port}?congestion_control=bbr&alpn=h3&sni=${sni}&udp_relay_mode=native&allow_insecure=1#$(urlencode "$name")"
 }
 
 gen_anytls_link() {
     local ip="$1" port="$2" password="$3" sni="$4" country="${5:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}AnyTLS${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "anytls://${password}@${ip}:${port}?sni=${sni}&allowInsecure=1#${name}"
+    local name
+    name=$(_simple_share_name "$country" anytls "$port" "$ip") || return 1
+    printf '%s\n' "anytls://${password}@${ip}:${port}?sni=${sni}&allowInsecure=1#$(urlencode "$name")"
 }
 
 gen_naive_link() {
     local host="$1" port="$2" username="$3" password="$4" country="${5:-}"
-    local name="${country:+${country}-}Naive"
+    local name
+    name=$(_simple_share_name "$country" naive "$port" "$host") || return 1
     # Shadowrocket HTTP/2 格式，使用域名
-    printf '%s\n' "http2://${username}:${password}@${host}:${port}#${name}"
+    printf '%s\n' "http2://${username}:${password}@${host}:${port}#$(urlencode "$name")"
 }
 
 gen_shadowtls_link() {
     local ip="$1" port="$2" password="$3" method="$4" sni="$5" stls_password="$6" country="${7:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}ShadowTLS${ip_suffix:+-${ip_suffix}}"
+    local name
+    name=$(_simple_share_name "$country" ss2022-shadowtls "$port" "$ip") || return 1
     # ShadowTLS链接格式：ss://method:password@server:port#name + ShadowTLS参数
     local ss_link=$(echo -n "${method}:${password}" | base64 -w 0)
-    printf '%s\n' "ss://${ss_link}@${ip}:${port}?plugin=shadow-tls;host=${sni};password=${stls_password}#${name}"
+    printf '%s\n' "ss://${ss_link}@${ip}:${port}?plugin=shadow-tls;host=${sni};password=${stls_password}#$(urlencode "$name")"
 }
 
 # gen_snell_v5_link 已合并到 gen_snell_link，通过 version 参数区分
@@ -3815,13 +4089,13 @@ gen_snell_v5_link() { gen_snell_link "$1" "$2" "$3" "${4:-5}" "${5:-}"; }
 
 gen_socks_link() {
     local ip="$1" port="$2" username="$3" password="$4" country="${5:-}"
-    local ip_suffix=$(get_ip_suffix "$ip")
-    local name="${country:+${country}-}SOCKS5${ip_suffix:+-${ip_suffix}}"
-    if [[ -n "$username" && -n "$password" ]]; then
-        printf '%s\n' "https://t.me/socks?server=${ip}&port=${port}&user=${username}&pass=${password}"
-    else
-        printf '%s\n' "socks5://${ip}:${port}#${name}"
+    local name
+    name=$(_simple_share_name "$country" socks "$port" "$ip") || return 1
+    local auth=""
+    if [[ -n "$username" ]]; then
+        auth="$(urlencode "$username"):$(urlencode "$password")@"
     fi
+    printf '%s\n' "socks5://${auth}${ip}:${port}#$(urlencode "$name")"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -4066,10 +4340,10 @@ _issue_cert_dns() {
     _line >&2
     echo ""
     echo -e "  ${Y}支持的 DNS 服务商：${NC}"
-    echo -e "  1) Cloudflare"
-    echo -e "  2) Aliyun (阿里云)"
-    echo -e "  3) DNSPod (腾讯云)"
-    echo -e "  4) 手动 DNS 验证"
+    echo -e "  $(_menu_badge "1") Cloudflare"
+    echo -e "  $(_menu_badge "2") Aliyun (阿里云)"
+    echo -e "  $(_menu_badge "3") DNSPod (腾讯云)"
+    echo -e "  $(_menu_badge "4") 手动 DNS 验证"
     echo ""
     read -rp "  请选择 DNS 服务商 [1-4]: " dns_choice
 
@@ -4282,9 +4556,9 @@ get_acme_cert() {
         _err "域名解析检查失败，无法申请 Let's Encrypt 证书"
         echo ""
         echo -e "  ${Y}选项：${NC}"
-        echo -e "  1) 使用自签证书 (安全性较低，易被识别)"
-        echo -e "  2) 重新输入域名"
-        echo -e "  3) 退出安装"
+        echo -e "  $(_menu_badge "1") 使用自签证书 (安全性较低，易被识别)"
+        echo -e "  $(_menu_badge "2") 重新输入域名"
+        echo -e "  $(_menu_badge "3") 退出安装"
         echo ""
         read -rp "  请选择 [1-3]: " choice
 
@@ -4316,9 +4590,9 @@ get_acme_cert() {
     echo -e "  • 证书有效期: 90天 (自动续期)"
     echo ""
     echo -e "  ${Y}请选择验证方式：${NC}"
-    echo -e "  1) HTTP 验证 (需要80端口，推荐)"
-    echo -e "  2) DNS 验证 (无需80端口，适合NAT/无公网IP)"
-    echo -e "  3) 取消"
+    echo -e "  $(_menu_badge "1") HTTP 验证 (需要80端口，推荐)"
+    echo -e "  $(_menu_badge "2") DNS 验证 (无需80端口，适合NAT/无公网IP)"
+    echo -e "  $(_menu_badge "3") 取消"
     echo ""
     read -rp "  请选择 [1-3]: " verify_method
 
@@ -4433,10 +4707,10 @@ get_acme_cert() {
 
         # 给用户选择而不是自动回退
         echo -e "  ${W}请选择操作：${NC}"
-        echo -e "  ${G}1${NC}) 重试证书申请"
-        echo -e "  ${G}2${NC}) 使用 DNS 验证模式 (需要 DNS API)"
-        echo -e "  ${G}3${NC}) 使用自签名证书 (不推荐)"
-        echo -e "  ${G}0${NC}) 取消安装"
+        echo -e "  ${G}$(_menu_badge "1")${NC} 重试证书申请"
+        echo -e "  ${G}$(_menu_badge "2")${NC} 使用 DNS 验证模式 (需要 DNS API)"
+        echo -e "  ${G}$(_menu_badge "3")${NC} 使用自签名证书 (不推荐)"
+        echo -e "  ${G}$(_menu_badge "0")${NC} 取消安装"
         echo ""
         read -rp "  请选择 [0]: " cert_choice
         cert_choice="${cert_choice:-0}"
@@ -4499,8 +4773,8 @@ ask_sni_config() {
     # 如果有证书域名（自签名证书），询问是否使用
     # 注意：自签名证书的域名没有实际意义，推荐使用随机 SNI
     if [[ -n "$cert_domain" ]]; then
-        echo -e "  ${G}1${NC}) 使用随机SNI (${G}$random_sni${NC}) - 推荐" >&2
-        echo -e "  ${G}2${NC}) 自定义SNI" >&2
+        echo -e "  ${G}$(_menu_badge "1")${NC} 使用随机SNI (${G}$random_sni${NC}) - 推荐" >&2
+        echo -e "  ${G}$(_menu_badge "2")${NC} 自定义SNI" >&2
         echo "" >&2
 
         local sni_choice=""
@@ -4523,8 +4797,8 @@ ask_sni_config() {
         done
     else
         # 没有证书域名时（如Reality协议），提供随机SNI和自定义选项
-        echo -e "  ${G}1${NC}) 使用随机SNI (${G}$default_sni${NC}) - 推荐" >&2
-        echo -e "  ${G}2${NC}) 自定义SNI" >&2
+        echo -e "  ${G}$(_menu_badge "1")${NC} 使用随机SNI (${G}$default_sni${NC}) - 推荐" >&2
+        echo -e "  ${G}$(_menu_badge "2")${NC} 自定义SNI" >&2
         echo "" >&2
 
         local sni_choice=""
@@ -4593,8 +4867,8 @@ ask_cert_config() {
     echo "" >&2
     _line >&2
     echo -e "  ${W}证书配置模式${NC}" >&2
-    echo -e "  ${G}1${NC}) 使用真实域名 (推荐 - 自动申请 Let's Encrypt 证书)" >&2
-    echo -e "  ${Y}2${NC}) 无域名 (使用自签证书 - 安全性较低，易被识别)" >&2
+    echo -e "  ${G}$(_menu_badge "1")${NC} 使用真实域名 (推荐 - 自动申请 Let's Encrypt 证书)" >&2
+    echo -e "  ${Y}$(_menu_badge "2")${NC} 无域名 (使用自签证书 - 安全性较低，易被识别)" >&2
     echo "" >&2
 
     local cert_mode=""
@@ -6871,7 +7145,7 @@ configure_xray_vless() {
         _is_valid_domain_or_ip "$target_host" && _is_valid_port "$target_port" || { _err '回落目标格式应为 host:port'; return 1; }
         record=$(jq --argjson keys "$keys" --arg sni "$sni" --arg sid "$(gen_sid)" --arg dest "$dest" \
             '. + $keys + {sni:$sni,short_id:$sid,dest:$dest}' <<<"$record") || return 1
-        read -rp '  启用 VLESS Encryption? (Surge 暂不支持) [y/N]: ' choice || return 1
+        read -rp '  启用 VLESS Encryption? (支持 Surge 导出) [y/N]: ' choice || return 1
     else
         choice=y
     fi
@@ -7063,9 +7337,9 @@ configure_anytls_certificate() {
         _line
         echo -e "  ${W}AnyTLS TLS 证书配置${NC}"
         _line
-        echo -e "  ${G}1)${NC} 使用已有证书 (${CFG}/certs/server.crt)"
-        echo -e "  ${G}2)${NC} 使用域名申请 Let's Encrypt 证书"
-        echo -e "  ${G}3)${NC} 使用自签证书"
+        echo -e "  ${G}$(_menu_badge "1")${NC} 使用已有证书 (${CFG}/certs/server.crt)"
+        echo -e "  ${G}$(_menu_badge "2")${NC} 使用域名申请 Let's Encrypt 证书"
+        echo -e "  ${G}$(_menu_badge "3")${NC} 使用自签证书"
         echo ""
         read -rp "  请选择 [1-3，默认 3.自签证书]: " cert_choice
         cert_choice="${cert_choice:-3}"
@@ -7208,8 +7482,10 @@ _lite_build_config() {
 
 # Rebuild every enabled account and every port into a candidate JOIN file.
 regenerate_singbox_protocol_join_info() {
+    local _SHARE_CATALOG="${_SHARE_CATALOG:-}"
+    [[ -n "$_SHARE_CATALOG" ]] || _SHARE_CATALOG=$(_build_share_catalog) || return 1
     local protocol="$1" records record output tmp aggregate join ipv4 ipv6 ip host label
-    local port uuid password username sni method psk public sid data link prefix mode country
+    local port uuid password username sni method psk public sid data link prefix mode country name_record name
     output="$CFG/$protocol.join"
     tmp=$(mktemp "$CFG/.protocol-join.XXXXXX") || return 1
     records=$(jq -c --arg p "$protocol" '
@@ -7230,23 +7506,25 @@ regenerate_singbox_protocol_join_info() {
         method=$(jq -r '.method // empty' <<<"$record"); psk=$(jq -r '.psk // empty' <<<"$record")
         public=$(jq -r '.public_key // empty' <<<"$record"); sid=$(jq -r '.short_id // empty' <<<"$record")
         prefix=$(tr '[:lower:]-' '[:upper:]_' <<<"$protocol")
+        name_record=$(jq -c '. + {user_name:(.name // "")}' <<< "$record") || { rm -f "$tmp"; return 1; }
+        name=$(_local_share_name "$protocol" "${ipv4:-$ipv6}" "$name_record" singbox) || { rm -f "$tmp"; return 1; }
+        country=XX
         for label in V4 V6; do
             ip="$ipv4"; [[ "$label" != V6 ]] || ip="$ipv6"
             [[ -n "$ip" ]] || continue
             host="$ip"; [[ "$label" != V6 ]] || host="[$ip]"
             case "$protocol" in
-                vless-singbox) data="REALITY|$host|$port|$uuid|$public|$sid|$sni"; link=$(gen_vless_link "$host" "$port" "$uuid" "$public" "$sid" "$sni") ;;
-                hy2) data="HY2|$host|$port|$password|$sni"; link=$(gen_hy2_link "$host" "$port" "$password" "$sni") ;;
-                tuic) data="TUIC|$host|$port|$uuid|$password|$sni"; link=$(gen_tuic_link "$host" "$port" "$uuid" "$password" "$sni") ;;
-                anytls) data="ANYTLS|$host|$port|$password|$sni"; link=$(gen_anytls_link "$host" "$port" "$password" "$sni") ;;
-                naive) data="NAIVE|$sni|$port|$username|$password"; link=$(gen_naive_link "$sni" "$port" "$username" "$password") ;;
-                socks) data="SOCKS|$host|$port|$username|$password"; link="socks5://$username:$password@$host:$port" ;;
-                ss2022|ss2022-shadowtls) data="SS2022|$host|$port|$method|$password"; link=$(gen_ss2022_link "$host" "$port" "$method" "$password") ;;
-                ss-legacy) data="SS|$host|$port|$method|$password"; link=$(gen_ss_legacy_link "$host" "$port" "$method" "$password") ;;
-                snell-v5) data="SNELL-V5|$host|$port|$psk|5"; link=$(gen_snell_link "$host" "$port" "$psk" 5) ;;
+                vless-singbox) data="REALITY|$host|$port|$uuid|$public|$sid|$sni"; link=$(gen_vless_link "$host" "$port" "$uuid" "$public" "$sid" "$sni" "$country") ;;
+                hy2) data="HY2|$host|$port|$password|$sni"; link=$(gen_hy2_link "$host" "$port" "$password" "$sni" "$country") ;;
+                tuic) data="TUIC|$host|$port|$uuid|$password|$sni"; link=$(gen_tuic_link "$host" "$port" "$uuid" "$password" "$sni" "$country") ;;
+                anytls) data="ANYTLS|$host|$port|$password|$sni"; link=$(gen_anytls_link "$host" "$port" "$password" "$sni" "$country") ;;
+                naive) data="NAIVE|$sni|$port|$username|$password"; link=$(gen_naive_link "$sni" "$port" "$username" "$password" "$country") ;;
+                socks) data="SOCKS|$host|$port|$username|$password"; link=$(gen_socks_link "$host" "$port" "$username" "$password" "$country") ;;
+                ss2022|ss2022-shadowtls) data="SS2022|$host|$port|$method|$password"; link=$(gen_ss2022_link "$host" "$port" "$method" "$password" "$country") ;;
+                ss-legacy) data="SS|$host|$port|$method|$password"; link=$(gen_ss_legacy_link "$host" "$port" "$method" "$password" "$country") ;;
+                snell-v5) data="SNELL-V5|$host|$port|$psk|5"; link=$(gen_snell_link "$host" "$port" "$psk" 5 "$country") ;;
                 snell-v6-singbox)
                     mode=$(jq -r '.mode // "default"' <<<"$record")
-                    country=$(get_ip_country "$ip")
                     data="SNELL-V6|$host|$port|$psk|6|$mode"
                     link=$(gen_snell_link "$host" "$port" "$psk" 6 "$country" "$mode" singbox) ;;
                 *) rm -f "$tmp"; return 1 ;;
@@ -7254,6 +7532,7 @@ regenerate_singbox_protocol_join_info() {
             if [[ "$protocol" == ss2022-shadowtls ]]; then
                 data="SS2022-SHADOWTLS|$host|$port|$method|$password|$(jq -r '.stls_password' <<<"$record")|$sni"
             fi
+            link=$(set_link_name "$link" "$name") || { rm -f "$tmp"; return 1; }
             printf '# %s PORT=%s\nJOIN_%s=%s\n%s_%s=%s\n' "$protocol" "$port" "$label" "$(printf '%s' "$data" | base64 -w 0)" "$prefix" "$label" "$link" >>"$tmp" || { rm -f "$tmp"; return 1; }
         done
     done <<<"$records"
@@ -7789,6 +8068,8 @@ generate_xray_config() {
 
 # Only client fields reach the public link generator and JOIN files.
 regenerate_xray_protocol_join_info() {
+    local _SHARE_CATALOG="${_SHARE_CATALOG:-}"
+    [[ -n "$_SHARE_CATALOG" ]] || _SHARE_CATALOG=$(_build_share_catalog) || return 1
     local protocol="$1" records record output tmp aggregate join addresses ipv4 ipv6 host label link code prefix remark port
     case "$protocol" in vless|vless-xhttp|vless-enc) ;; *) return 1 ;; esac
     output="$CFG/$protocol.join"
@@ -7805,7 +8086,8 @@ regenerate_xray_protocol_join_info() {
     prefix=$(tr '[:lower:]-' '[:upper:]_' <<<"$protocol") || { rm -f "$tmp"; return 1; }
     while IFS= read -r record; do
         [[ -n "$record" ]] || continue
-        remark=$(jq -r '.name' <<<"$record") || { rm -f "$tmp"; return 1; }
+        record=$(jq -c '. + {user_name:.name}' <<< "$record") || { rm -f "$tmp"; return 1; }
+        remark=$(_local_share_name "$protocol" "${ipv4:-$ipv6}" "$record" xray) || { rm -f "$tmp"; return 1; }
         port=$(jq -r '.port' <<<"$record") || { rm -f "$tmp"; return 1; }
         for label in V4 V6; do
             host="$ipv4"; [[ "$label" != V6 ]] || host="$ipv6"
@@ -10297,22 +10579,22 @@ _select_outbound() {
         local display_addr=$(_format_server_port "$server" "$port")
 
         if [[ "$name" == "直连 (本机出口)" ]]; then
-            echo -e "  ${G}${display_idx}${NC}) ${C}直连${NC} ${D}(本机 IP 出口)${NC}" >&2
+            echo -e "  ${G}$(_menu_badge "${display_idx}")${NC} ${C}直连${NC} ${D}(本机 IP 出口)${NC}" >&2
         elif [[ "$name" == "WARP" ]]; then
-            echo -e "  ${G}${display_idx}${NC}) WARP" >&2
+            echo -e "  ${G}$(_menu_badge "${display_idx}")${NC} WARP" >&2
         elif [[ "$type" == "balancer" ]]; then
             # server 字段存储的是策略，port 字段存储的是节点数量
-            echo -e "  ${G}${display_idx}${NC}) ${name} ${D}(负载均衡: ${server}, ${port})${NC}" >&2
+            echo -e "  ${G}$(_menu_badge "${display_idx}")${NC} ${name} ${D}(负载均衡: ${server}, ${port})${NC}" >&2
         elif [[ -n "$latency_badge" ]]; then
-            echo -e "  ${G}${display_idx}${NC}) ${latency_badge} ${name} ${D}(${type})${NC} ${D}${display_addr}${NC}" >&2
+            echo -e "  ${G}$(_menu_badge "${display_idx}")${NC} ${latency_badge} ${name} ${D}(${type})${NC} ${D}${display_addr}${NC}" >&2
         else
-            echo -e "  ${G}${display_idx}${NC}) ${name} ${D}(${type})${NC}" >&2
+            echo -e "  ${G}$(_menu_badge "${display_idx}")${NC} ${name} ${D}(${type})${NC}" >&2
         fi
         ((display_idx++))
     done < <(printf '%s\n' "${sort_data[@]}" | sort -t'|' -k1 -n)
 
     # 返回选项
-    echo -e "  ${G}0${NC}) 返回" >&2
+    echo -e "  ${G}$(_menu_badge "0")${NC} 返回" >&2
 
     _line >&2
     read -rp "  $prompt [1]: " choice
@@ -11035,9 +11317,9 @@ _add_routing_rule() {
     local ip_version="as_is"  # 默认值
     echo ""
     echo -e "  ${Y}匹配的 IP 版本:${NC}"
-    echo -e "  ${G}1)${NC} 仅 IPv4（只匹配 IPv4 流量）"
-    echo -e "  ${G}2)${NC} 仅 IPv6（只匹配 IPv6 流量）"
-    echo -e "  ${G}3)${NC} ALL（不限制，匹配全部）"
+    echo -e "  ${G}$(_menu_badge "1")${NC} 仅 IPv4（只匹配 IPv4 流量）"
+    echo -e "  ${G}$(_menu_badge "2")${NC} 仅 IPv6（只匹配 IPv6 流量）"
+    echo -e "  ${G}$(_menu_badge "3")${NC} ALL（不限制，匹配全部）"
     read -rp "  请选择 [1-3，默认 3]: " ip_version_choice
 
     case "$ip_version_choice" in
@@ -11170,7 +11452,7 @@ _del_routing_rule() {
             esac
         fi
 
-        echo -e "  ${G}${idx})${NC} ${rule_name} → ${outbound_name}${ip_mark}"
+        echo -e "  ${G}$(_menu_badge "${idx}")${NC} ${rule_name} → ${outbound_name}${ip_mark}"
         rule_ids+=("$rule_id")
         ((idx++))
     done < <(echo "$rules" | jq -c '.[]')
@@ -11293,7 +11575,7 @@ _reorder_routing_rules() {
                 prefer_ipv6) ip_mark=优先IPv6 ;;
                 *) ip_mark=ALL ;;
             esac
-            printf '  %s) %s → %s [%s]\n' "$idx" "$rule_name" "$outbound" "$ip_mark"
+            printf '  %s %s → %s [%s]\n' "$(_menu_badge "$idx")" "$rule_name" "$outbound" "$ip_mark"
             idx=$((idx+1))
         done < <(jq -c '.[]' <<<"$rules")
         if (( count < 2 )); then
@@ -12752,9 +13034,9 @@ _import_alice_nodes() {
             echo -e "  策略: ${D}$strategy${NC}, 节点数: ${D}$node_count${NC}"
             echo ""
             echo -e "  ${W}选择操作:${NC}"
-            echo -e "    ${C}1.${NC} 保持现有配置 ${D}(不修改)${NC}"
-            echo -e "    ${C}2.${NC} 删除负载均衡组 ${D}(清除配置)${NC}"
-            echo -e "    ${C}3.${NC} 重新创建负载均衡组 ${D}(覆盖现有)${NC}"
+            echo -e "    ${C}$(_menu_badge "1")${NC} 保持现有配置 ${D}(不修改)${NC}"
+            echo -e "    ${C}$(_menu_badge "2")${NC} 删除负载均衡组 ${D}(清除配置)${NC}"
+            echo -e "    ${C}$(_menu_badge "3")${NC} 重新创建负载均衡组 ${D}(覆盖现有)${NC}"
             echo ""
 
             local choice
@@ -12779,8 +13061,8 @@ _import_alice_nodes() {
         else
             echo -e "  是否创建负载均衡组? ${D}(方便自动分配流量)${NC}"
             echo ""
-            echo -e "    ${C}Y${NC} - 创建负载均衡组 ${D}(推荐)${NC}"
-            echo -e "    ${C}N${NC} - 稍后手动配置"
+            echo -e "    ${C}$(_menu_badge "Y")${NC} 创建负载均衡组 ${D}(推荐)${NC}"
+            echo -e "    ${C}$(_menu_badge "N")${NC} 稍后手动配置"
             echo ""
 
             local create_lb
@@ -12805,8 +13087,8 @@ _create_alice_balancer_inline() {
 
     echo ""
     echo -e "  ${W}配置负载均衡策略:${NC}"
-    echo -e "    ${C}1.${NC} leastPing   ${D}(最低延迟 - 推荐)${NC}"
-    echo -e "    ${C}2.${NC} selector    ${D}(固定首节点)${NC}"
+    echo -e "    ${C}$(_menu_badge "1")${NC} leastPing   ${D}(最低延迟 - 推荐)${NC}"
+    echo -e "    ${C}$(_menu_badge "2")${NC} selector    ${D}(固定首节点)${NC}"
     echo ""
     echo -e "  ${Y}说明:${NC} leastPing会自动选择延迟最低的节点"
     echo ""
@@ -12942,9 +13224,9 @@ _import_akile_nodes() {
             echo -e "  策略: ${D}$strategy${NC}, 节点数: ${D}$node_count${NC}"
             echo ""
             echo -e "  ${W}选择操作:${NC}"
-            echo -e "    ${C}1.${NC} 保持现有配置 ${D}(不修改)${NC}"
-            echo -e "    ${C}2.${NC} 删除负载均衡组 ${D}(清除配置)${NC}"
-            echo -e "    ${C}3.${NC} 重新创建负载均衡组 ${D}(覆盖现有)${NC}"
+            echo -e "    ${C}$(_menu_badge "1")${NC} 保持现有配置 ${D}(不修改)${NC}"
+            echo -e "    ${C}$(_menu_badge "2")${NC} 删除负载均衡组 ${D}(清除配置)${NC}"
+            echo -e "    ${C}$(_menu_badge "3")${NC} 重新创建负载均衡组 ${D}(覆盖现有)${NC}"
             echo ""
 
             local choice
@@ -12969,8 +13251,8 @@ _import_akile_nodes() {
         else
             echo -e "  是否创建负载均衡组? ${D}(方便自动分配流量)${NC}"
             echo ""
-            echo -e "    ${C}Y${NC} - 创建负载均衡组 ${D}(推荐)${NC}"
-            echo -e "    ${C}N${NC} - 稍后手动配置"
+            echo -e "    ${C}$(_menu_badge "Y")${NC} 创建负载均衡组 ${D}(推荐)${NC}"
+            echo -e "    ${C}$(_menu_badge "N")${NC} 稍后手动配置"
             echo ""
 
             local create_lb
@@ -12995,8 +13277,8 @@ _create_akile_balancer_inline() {
 
     echo ""
     echo -e "  ${W}配置负载均衡策略:${NC}"
-    echo -e "    ${C}1.${NC} leastPing   ${D}(最低延迟 - 推荐)${NC}"
-    echo -e "    ${C}2.${NC} selector    ${D}(固定首节点)${NC}"
+    echo -e "    ${C}$(_menu_badge "1")${NC} leastPing   ${D}(最低延迟 - 推荐)${NC}"
+    echo -e "    ${C}$(_menu_badge "2")${NC} selector    ${D}(固定首节点)${NC}"
     echo ""
     echo -e "  ${Y}说明:${NC} leastPing会自动选择延迟最低的节点"
     echo ""
@@ -13055,9 +13337,9 @@ create_load_balance_group() {
     echo -e "  ${G}找到 $node_count 个节点${NC}"
     echo ""
     echo -e "  ${Y}负载均衡策略:${NC}"
-    echo -e "  ${G}1.${NC} leastPing   ${D}(最低延迟 - 推荐)${NC}"
-    echo -e "  ${G}2.${NC} selector    ${D}(固定首节点)${NC}"
-    echo -e "  ${G}0.${NC} 返回"
+    echo -e "  ${G}$(_menu_badge "1")${NC} leastPing   ${D}(最低延迟 - 推荐)${NC}"
+    echo -e "  ${G}$(_menu_badge "2")${NC} selector    ${D}(固定首节点)${NC}"
+    echo -e "  ${G}$(_menu_badge "0")${NC} 返回"
     _line
 
     read -rp "  请选择策略: " strategy_choice
@@ -13089,9 +13371,9 @@ create_load_balance_group() {
 
     echo ""
     echo -e "  ${Y}选择节点:${NC}"
-    echo -e "  ${G}1.${NC} 使用所有节点 (推荐)"
-    echo -e "  ${G}2.${NC} 手动选择节点"
-    echo -e "  ${G}0.${NC} 返回"
+    echo -e "  ${G}$(_menu_badge "1")${NC} 使用所有节点 (推荐)"
+    echo -e "  ${G}$(_menu_badge "2")${NC} 手动选择节点"
+    echo -e "  ${G}$(_menu_badge "0")${NC} 返回"
     _line
 
     read -rp "  请选择: " node_choice
@@ -13373,7 +13655,7 @@ manage_chain_proxy() {
 
                 local i=1
                 echo "$nodes" | jq -r '.[] | .name' | while read -r name; do
-                    echo -e "  ${C}$i)${NC} $name"
+                    echo -e "  ${C}$(_menu_badge "$i")${NC} $name"
                     ((i++))
                 done
 
@@ -13432,7 +13714,7 @@ manage_chain_proxy() {
                         *) strategy_name="$strategy" ;;
                     esac
 
-                    echo -e "  ${C}$idx)${NC} ${G}$name${NC} ${D}($strategy_name, $nodes 节点)${NC}"
+                    echo -e "  ${C}$(_menu_badge "$idx")${NC} ${G}$name${NC} ${D}($strategy_name, $nodes 节点)${NC}"
                     ((idx++))
                 done
 
@@ -13739,6 +14021,8 @@ show_all_protocols_info() {
 
 # 一键展示所有分享链接
 show_all_share_links() {
+    local _SHARE_CATALOG="${_SHARE_CATALOG:-}"
+    [[ -n "$_SHARE_CATALOG" ]] || _SHARE_CATALOG=$(_build_share_catalog) || return 1
     local protocol
     while IFS= read -r protocol; do
         [[ -n "$protocol" ]] || continue
@@ -13749,48 +14033,52 @@ show_all_share_links() {
 # 显示单个协议的详细配置信息（包含链接和二维码）
 # 参数: $1=协议名, $2=是否清屏(可选，默认true), $3=指定端口(可选)
 show_single_protocol_info() {
-    local protocol="$1" clear_screen="${2:-true}" selected_port="${3:-}" core records cfg port link links surge_lines
+    local _SHARE_CATALOG="${_SHARE_CATALOG:-}"
+    [[ -n "$_SHARE_CATALOG" ]] || _SHARE_CATALOG=$(_build_share_catalog) || return 1
+    local protocol="$1" clear_screen="${2:-true}" selected_port="${3:-}" core records cfg port link links surge_lines surge_line row name index=0
     core=$(protocol_db_core "$protocol") || return 1
     records=$(db_protocol_configs "$core" "$protocol") || return 1
     [[ "$clear_screen" != true ]] || _header
-    printf '  %s\n' "$(get_protocol_name "$protocol")"
+    _share_ui_heading "节点分享 · $(get_protocol_name "$protocol")" '复制链接导入，或使用对应的 Surge 配置与二维码。'
     while IFS= read -r cfg; do
         [[ -n "$cfg" ]] || continue
         port=$(jq -r .port <<< "$cfg")
         [[ -z "$selected_port" || "$selected_port" == "$port" ]] || continue
-        printf '  端口: %s\n' "$port"
         links=$(
-            get_installed_protocols() { printf '%s\n' "$protocol"; }
-            get_all_external_links() { :; }
-            db_protocol_configs() { printf '%s\n' "$cfg"; }
-            gen_v2ray_sub | base64 -d
+            gen_v2ray_sub "$protocol" "$port" | base64 -d
+        ) || return 1
+        surge_lines=$(
+            gen_surge_sub "$protocol" "$port" | awk '/^\[Proxy\]$/ {printing=1; next} /^\[/ {printing=0} printing && NF'
         ) || return 1
         while IFS= read -r link; do
             [[ -n "$link" ]] || continue
-            printf '  分享链接:\n%s\n' "$link"
-            [[ "$protocol" != snell-* ]] || printf '  Snell 为自定义 URI；Surge 请使用下方配置或订阅链接。\n'
-            _show_link_qr "$link"
+            name=$(get_link_name "$link")
+            surge_line=""
+            while IFS= read -r row; do
+                if [[ "$row" == "$name = "* ]]; then surge_line="$row"; break; fi
+            done <<< "$surge_lines"
+            index=$((index+1))
+            _share_node_card "$index" "$protocol" "$core" "$link" "$surge_line"
         done <<< "$links"
-        surge_lines=$(
-            get_installed_protocols() { printf '%s\n' "$protocol"; }
-            get_all_external_links() { :; }
-            db_protocol_configs() { printf '%s\n' "$cfg"; }
-            gen_surge_sub | awk '/^\[Proxy\]$/ {printing=1; next} /^\[/ {printing=0} printing && NF'
-        ) || return 1
-        if [[ -n "$surge_lines" ]]; then
-            printf '  Surge 节点配置（粘贴到 [Proxy]）：\n%s\n' "$surge_lines"
-        fi
         case "$protocol" in
             vless-singbox|vless|vless-xhttp|vless-enc)
                 if ! jq -e '(.transport // "raw") as $t |
                     ($t == "raw" or $t == "tcp") and
                     (.security_mode // "reality") == "reality" and (.encryption // "none") == "none"' \
                     <<< "$cfg" >/dev/null; then
-                    printf '  兼容性：Surge 不支持此节点的 XHTTP / VLESS Encryption；当前 Clash 订阅也跳过，请使用兼容的 Xray 客户端导入通用链接。\n'
+                    if [[ -n "$surge_lines" ]]; then
+                        _share_ui_line '兼容性：Surge 支持此节点的 XHTTP / VLESS Encryption 配置导出；Clash 订阅仍跳过此组合。' "$D"
+                    else
+                        _share_ui_line '兼容性：Surge 未导出此节点，请检查传输、加密及高级参数；Clash 订阅仍跳过此组合。' "$Y"
+                    fi
                 fi
                 ;;
         esac
     done <<< "$records"
+    if (( index == 0 )); then
+        _share_ui_line '暂无可分享的已启用节点。' "$D"
+    fi
+    _share_ui_rule
     [[ "$clear_screen" != true ]] || _pause
     return 0
 }
@@ -13901,11 +14189,11 @@ select_port_to_uninstall() {
 
     local i=1
     for port in "${port_array[@]}"; do
-        echo -e "  ${G}$i${NC}) 端口 ${G}$port${NC}"
+        echo -e "  ${G}$(_menu_badge "$i")${NC} 端口 ${G}$port${NC}"
         ((i++))
     done
-    echo -e "  ${G}$i${NC}) 卸载所有端口"
-    echo "  0) 返回"
+    echo -e "  ${G}$(_menu_badge "$i")${NC} 卸载所有端口"
+    echo "  $(_menu_badge "0") 返回"
     echo ""
 
     local choice
@@ -14046,14 +14334,14 @@ select_vless_mode() {
 # 两个 REALITY 实现使用独立协议键，在检查已有端口前完成选择。
 select_vless_reality_implementation() {
     local choice
-    _item 1 "Sing-box (统一分流)"
-    _item 2 "Xray (独立直连出口)"
+    _item 1 "Xray (默认，独立直连出口)"
+    _item 2 "Sing-box (统一分流)"
     _item 0 "返回"
     while true; do
         read -rp '  请选择 [1]: ' choice || return 1
         case "${choice:-1}" in
-            1) SELECTED_PROTOCOL=vless-singbox; return 0 ;;
-            2) SELECTED_PROTOCOL=vless; return 0 ;;
+            1) SELECTED_PROTOCOL=vless; return 0 ;;
+            2) SELECTED_PROTOCOL=vless-singbox; return 0 ;;
             0) SELECTED_PROTOCOL=''; return 1 ;;
             *) _err '无效选择' ;;
         esac
@@ -14334,7 +14622,7 @@ EXTERNAL_CACHE_DIR="$CFG/external_nodes_cache"
 # 解析 vless:// 链接
 parse_vless_link() {
     local link="$1"
-    parse_proxy_link "$link" >/dev/null || return 1
+    [[ "$link" == vless://* && "$link" == *@* ]] || return 1
     # vless://uuid@server:port?params#name
     local content="${link#vless://}"
     local name=""
@@ -14356,7 +14644,8 @@ parse_vless_link() {
     [[ "$content" != *\?* ]] || params="${content#*\?}"
 
     # 解析参数
-    local security="" type="" sni="" pbk="" sid="" flow="" path="" host="" fp="" encryption=""
+    local security=none type=tcp sni="" pbk="" sid="" flow="" path="/" host="" fp="" encryption=none
+    local mode=auto extra="" download=""
     local param
     local -a vless_params=()
     IFS='&' read -ra vless_params <<< "$params"
@@ -14375,6 +14664,9 @@ parse_vless_link() {
             host) host="$value" ;;
             fp) fp="$value" ;;
             encryption) encryption="$value" ;;
+            mode) mode="$value" ;;
+            extra) extra="$value" ;;
+            downloadSettings) download="$value" ;;
             headerType) ;; # 忽略
         esac
     done
@@ -14385,6 +14677,8 @@ parse_vless_link() {
         echo "错误: 无法解析端口号 '$port'" >&2
         return 1
     fi
+    _is_valid_domain_or_ip "$server" && _is_valid_port "$port" && [[ -n "$server" && -n "$uuid" ]] || return 1
+    [[ "$type" != splithttp ]] || type=xhttp
     [[ -n "$name" ]] || name="VLESS-${server}-${port}"
 
     # 输出 JSON 格式 (使用 jq 确保正确转义，port 使用 argjson 存储为数字)
@@ -14405,7 +14699,8 @@ parse_vless_link() {
         --arg host "$host" \
         --arg fingerprint "${fp:-chrome}" \
         --arg encryption "$encryption" \
-        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,security:$security,transport:$transport,sni:$sni,publicKey:$publicKey,shortId:$shortId,flow:$flow,path:$path,host:$host,fingerprint:$fingerprint,encryption:$encryption}'
+        --arg mode "$mode" --arg extra "$extra" --arg download "$download" \
+        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,security:$security,transport:$transport,sni:$sni,publicKey:$publicKey,shortId:$shortId,flow:$flow,path:$path,host:$host,fingerprint:$fingerprint,encryption:$encryption,mode:$mode,extra:$extra,downloadSettings:(if $download == "" then null else $download end)}'
 }
 
 # 解析 vmess:// 链接
@@ -14658,6 +14953,29 @@ parse_anytls_link() {
         '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni}'
 }
 
+# 其余 URI 仅解析命名所需的地址元数据；不据此宣称客户端支持该协议。
+_parse_share_authority() {
+    local link="$1" protocol authority parsed server port params version
+    protocol="${link%%://*}"
+    [[ "$protocol" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*$ ]] || return 1
+    authority="${link#*://}"
+    authority="${authority%%#*}"; authority="${authority%%\?*}"; authority="${authority%%/*}"
+    authority="${authority##*@}"
+    parsed=$(_parse_hostport "$authority") || return 1
+    IFS='|' read -r server port <<< "$parsed"
+    [[ -n "$server" ]] && _is_valid_domain_or_ip "$server" && _is_valid_port "$port" || return 1
+    case "$protocol" in
+        http2|naive+https|naiveproxy) protocol=naive ;;
+        snell)
+            params="${link#*\?}"; params="${params%%#*}"
+            version=$(_get_query_param "$params" version)
+            protocol="snell-v${version:-5}"
+            ;;
+    esac
+    jq -nc --arg type "$protocol" --arg server "$server" --argjson port "$port" \
+        '{type:$type,server:$server,port:$port,name:""}'
+}
+
 # 解析任意分享链接
 parse_share_link() {
     local link="$1"
@@ -14668,7 +14986,7 @@ parse_share_link() {
         ss://*) parse_ss_link "$link" ;;
         hysteria2://*|hy2://*) parse_hy2_link "$link" ;;
         anytls://*) parse_anytls_link "$link" ;;
-        *) echo "" ;;
+        *) _parse_share_authority "$link" ;;
     esac
 }
 
@@ -14899,18 +15217,17 @@ external_link_to_clash() {
     local server=$(echo "$json" | jq -r '.server')
     local port=$(echo "$json" | jq -r '.port')
 
-    # 给外部节点名称加上服务器标识，避免与本地节点重复
-    local server_suffix=$(get_ip_suffix "$server")
-    [[ -n "$server_suffix" && "$name" != *"-${server_suffix}"* && "$name" != *"-${server_suffix}" ]] && name="${name}-${server_suffix}"
+    name=$(_external_share_name "$link" "$json") || return 1
 
     case "$type" in
         vless)
             local uuid=$(echo "$json" | jq -r '.uuid')
             local security=$(echo "$json" | jq -r '.security')
             local transport=$(echo "$json" | jq -r '.transport')
+            [[ "$transport" != raw ]] || transport=tcp
             local sni=$(echo "$json" | jq -r '.sni')
-            local pbk=$(echo "$json" | jq -r '.pbk')
-            local sid=$(echo "$json" | jq -r '.sid')
+            local pbk=$(echo "$json" | jq -r '.publicKey')
+            local sid=$(echo "$json" | jq -r '.shortId')
             local flow=$(echo "$json" | jq -r '.flow')
             local path=$(echo "$json" | jq -r '.path')
 
@@ -15060,21 +15377,20 @@ external_link_to_surge() {
     local server=$(echo "$json" | jq -r '.server')
     local port=$(echo "$json" | jq -r '.port')
 
-    # 给外部节点名称加上服务器标识，避免与本地节点重复
-    local server_suffix=$(get_ip_suffix "$server")
-    [[ -n "$server_suffix" && "$name" != *"-${server_suffix}"* && "$name" != *"-${server_suffix}" ]] && name="${name}-${server_suffix}"
+    name=$(_external_share_name "$link" "$json") || return 1
 
     case "$type" in
         vless)
             local record proxy
-            name="${name}-${port}"
             record=$(jq -c '{port,uuid,transport,security_mode:.security,
                 encryption:(if .encryption == "" then "none" else (.encryption // "none") end),
-                sni,public_key:.publicKey,short_id:.shortId,flow}' <<< "$json") || return 1
+                sni,public_key:.publicKey,short_id:.shortId,flow,
+                xhttp_path:.path,xhttp_host:.host,xhttp_mode:.mode,
+                extra:(.extra as $e | if $e == "" then "" else try ($e | fromjson) catch $e end),downloadSettings}' <<< "$json") || return 1
             if proxy=$(gen_vless_surge_line "$name" "$server" "$record"); then
                 printf '%s\n' "$proxy"
             else
-                printf 'Surge 跳过外部 VLESS 节点 %s：当前仅转换 RAW REALITY 且 encryption=none；不支持此传输或加密方式。\n' "$name" >&2
+                printf 'Surge 跳过外部 VLESS 节点 %s：仅支持 RAW / XHTTP 与 REALITY / Encryption 组合；请检查必需字段及高级参数。\n' "$name" >&2
             fi
             ;;
         vmess)
@@ -15114,14 +15430,14 @@ external_link_to_surge() {
 
 # 设置/替换分享链接名称
 set_link_name() {
-    local link="$1" new_name="$2"
-    local base="${link%%#*}"
-    [[ -z "$new_name" ]] && { echo "$base"; return 0; }
-    python3 - "$base" "$new_name" <<'PYEOF'
-import sys, urllib.parse
-base, name = sys.argv[1], sys.argv[2]
-print(base + '#' + urllib.parse.quote(name, safe=''))
-PYEOF
+    local link="$1" new_name="$2" content
+    if [[ "$link" == vmess://* ]]; then
+        content=$(printf '%s' "${link#vmess://}" | base64 -d 2>/dev/null) || return 1
+        content=$(jq -c --arg name "$new_name" '.ps = $name' <<< "$content") || return 1
+        printf 'vmess://%s\n' "$(printf '%s' "$content" | base64 -w 0)"
+    else
+        printf '%s\n' "${link%%#*}${new_name:+#$(urlencode "$new_name")}"
+    fi
 }
 
 # 添加分享链接
@@ -15236,7 +15552,7 @@ show_external_nodes() {
             ((count++))
             local name=$(get_link_name "$link")
             local proto="${link%%://*}"
-            echo -e "  ${G}$idx)${NC} [$proto] $name"
+            echo -e "  ${G}$(_menu_badge "$idx")${NC} [$proto] $name"
         done < "$EXTERNAL_LINKS_FILE"
         [[ $idx -eq 0 ]] && echo -e "  ${D}(无)${NC}"
     fi
@@ -15252,7 +15568,7 @@ show_external_nodes() {
             local node_count=0
             [[ -f "$cache_file" ]] && node_count=$(grep -c '://' "$cache_file" 2>/dev/null || echo 0)
             ((count+=node_count))
-            echo -e "  ${G}$idx)${NC} $url ${D}($node_count 个节点)${NC}"
+            echo -e "  ${G}$(_menu_badge "$idx")${NC} $url ${D}($node_count 个节点)${NC}"
         done < "$EXTERNAL_SUBS_FILE"
         [[ $idx -eq 0 ]] && echo -e "  ${D}(无)${NC}"
     fi
@@ -15278,7 +15594,7 @@ rename_external_node() {
     local i=0
     for link in "${links[@]}"; do
         ((i++))
-        echo -e "  ${G}$i)${NC} [${link%%://*}] $(get_link_name "$link")"
+        echo -e "  ${G}$(_menu_badge "$i")${NC} [${link%%://*}] $(get_link_name "$link")"
     done
 
     echo ""
@@ -15325,10 +15641,10 @@ delete_external_node() {
     _line
     echo -e "  ${W}删除外部节点${NC}"
     _line
-    echo -e "  ${G}1)${NC} 删除分享链接"
-    echo -e "  ${G}2)${NC} 删除订阅链接"
-    echo -e "  ${G}3)${NC} 清空所有外部节点"
-    echo -e "  ${G}0)${NC} 返回"
+    echo -e "  ${G}$(_menu_badge "1")${NC} 删除分享链接"
+    echo -e "  ${G}$(_menu_badge "2")${NC} 删除订阅链接"
+    echo -e "  ${G}$(_menu_badge "3")${NC} 清空所有外部节点"
+    echo -e "  ${G}$(_menu_badge "0")${NC} 返回"
     _line
 
     read -rp "  请选择: " choice
@@ -15342,7 +15658,7 @@ delete_external_node() {
                 [[ -z "$link" || "$link" == \#* ]] && continue
                 ((idx++))
                 local name=$(get_link_name "$link")
-                echo -e "  ${G}$idx)${NC} $name"
+                echo -e "  ${G}$(_menu_badge "$idx")${NC} $name"
             done < "$EXTERNAL_LINKS_FILE"
             echo ""
             read -rp "  输入序号删除 (0 取消): " del_idx
@@ -15359,7 +15675,7 @@ delete_external_node() {
             while IFS= read -r url || [[ -n "$url" ]]; do
                 [[ -z "$url" || "$url" == \#* ]] && continue
                 ((idx++))
-                echo -e "  ${G}$idx)${NC} $url"
+                echo -e "  ${G}$(_menu_badge "$idx")${NC} $url"
             done < "$EXTERNAL_SUBS_FILE"
             echo ""
             read -rp "  输入序号删除 (0 取消): " del_idx
@@ -15581,21 +15897,24 @@ db_subscription_configs() {
                      then ($user.uuid // $cfg.password) else $cfg.password end)),
                 username: ($user.username //
                     (if $proto == "socks" or $proto == "naive" then $user.name else $cfg.username end)),
-                user_name: $user.name
+                user_name: $user.name,
+                share_multi: ([$cfg.users[]? | select(.enabled != false)] | length > 1)
             } | del(.users)
         else . end
     '
 }
 
 gen_v2ray_sub() {
+    local selected_protocol="${1:-}" selected_port="${2:-}" selected_user="${3:-}"
+    local _SHARE_CATALOG="${_SHARE_CATALOG:-}"
+    [[ -n "$_SHARE_CATALOG" ]] || _SHARE_CATALOG=$(_build_share_catalog) || return 1
     local installed=$(get_installed_protocols)
     local links=""
     local ipv4 ipv6
     IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
 
     # 获取地区代码
-    local country_code=$(get_ip_country "$ipv4")
-    [[ -z "$country_code" ]] && country_code=$(get_ip_country "$ipv6")
+    local country_code=XX
 
     # 确定使用的 IP 地址：优先 IPv4，纯 IPv6 环境使用 IPv6（带方括号）
     local server_ip="$ipv4"
@@ -15604,6 +15923,7 @@ gen_v2ray_sub() {
     fi
 
     for protocol in $installed; do
+        [[ -z "$selected_protocol" || "$protocol" == "$selected_protocol" ]] || continue
         local core cfg_stream
         core=$(protocol_subscription_db_core "$protocol")
         cfg_stream=$(db_subscription_configs "$core" "$protocol") || continue
@@ -15611,6 +15931,9 @@ gen_v2ray_sub() {
 
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
+            [[ -z "$selected_port" || "$(jq -r .port <<< "$cfg")" == "$selected_port" ]] || continue
+
+            [[ -z "$selected_user" || "$(jq -r '.user_name // "default"' <<< "$cfg")" == "$selected_user" ]] || continue
 
             # 提取字段
             local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
@@ -15634,7 +15957,7 @@ gen_v2ray_sub() {
                         _err "Sing-box 不支持 VLESS encryption 模式" >&2; return 1
                     else
                         local user_name=$(jq -r '.user_name // ""' <<< "$cfg")
-                        local remark="${country_code:+${country_code}-}$(get_protocol_name "$protocol")-$(get_ip_suffix "$server_ip")-${port}${user_name:+-${user_name}}"
+                        local remark=$(_local_share_name "$protocol" "$server_ip" "$cfg" "$core")
                         [[ -n "$server_ip" ]] && link=$(gen_xray_vless_link "$server_ip" "$cfg" "$remark")
                     fi
                     ;;
@@ -15647,6 +15970,10 @@ gen_v2ray_sub() {
                     ;;
                 snell-v6-singbox)
                     link=$(gen_snell_link "$server_ip" "$actual_port" "$psk" 6 "$country_code" "$(jq -r '.mode // "default"' <<< "$cfg")" singbox)
+                    ;;
+                ss2022-shadowtls)
+                    link=$(gen_shadowtls_link "$server_ip" "$actual_port" "$password" "$method" "$sni" \
+                        "$(jq -r .stls_password <<< "$cfg")" "$country_code")
                     ;;
                 ss2022)
                     [[ -n "$server_ip" ]] && link=$(gen_ss2022_link "$server_ip" "$actual_port" "$method" "$password" "$country_code")
@@ -15671,13 +15998,25 @@ gen_v2ray_sub() {
                     ;;
             esac
 
+            if [[ -n "$link" ]]; then
+                link=$(set_link_name "$link" "$(_local_share_name "$protocol" "$server_ip" "$cfg" "$core")") || return 1
+            fi
             [[ -n "$link" ]] && links+="$link"$'\n'
         done <<< "$cfg_stream"
     done
 
     # 合并外部节点
-    local external_links=$(get_all_external_links)
-    [[ -n "$external_links" ]] && links+="$external_links"
+    local external_links=""
+    [[ -n "$selected_protocol" ]] || external_links=$(_share_external_links)
+    local external_link external_node external_name
+    while IFS= read -r external_link || [[ -n "$external_link" ]]; do
+        [[ -n "$external_link" ]] || continue
+        external_node=$(parse_share_link "$external_link") || continue
+        [[ -n "$external_node" ]] || continue
+        external_name=$(_external_share_name "$external_link" "$external_node") || return 1
+        link=$(set_link_name "$external_link" "$external_name") || return 1
+        links+="$link"$'\n'
+    done <<< "$external_links"
 
     # Base64 编码
     printf '%s' "$links" | base64 -w 0 2>/dev/null || printf '%s' "$links" | base64
@@ -15685,25 +16024,23 @@ gen_v2ray_sub() {
 
 # 生成 Clash 订阅内容
 gen_clash_sub() {
+    local selected_protocol="${1:-}" selected_port="${2:-}"
+    local _SHARE_CATALOG="${_SHARE_CATALOG:-}"
+    [[ -n "$_SHARE_CATALOG" ]] || _SHARE_CATALOG=$(_build_share_catalog) || return 1
     local installed=$(get_installed_protocols)
     local ipv4 ipv6
     IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     local proxies=""
     local proxy_names=""
 
-    # 获取地区代码和IP后缀
-    local country_code=$(get_ip_country "$ipv4")
-    [[ -z "$country_code" ]] && country_code=$(get_ip_country "$ipv6")
-
     # 确定使用的 IP 地址：优先 IPv4，纯 IPv6 环境使用 IPv6
     local server_ip="$ipv4"
-    local ip_suffix="${ipv4##*.}"
     if [[ -z "$server_ip" && -n "$ipv6" ]]; then
         server_ip="$ipv6"
-        ip_suffix=$(get_ip_suffix "$ipv6")
     fi
 
     for protocol in $installed; do
+        [[ -z "$selected_protocol" || "$protocol" == "$selected_protocol" ]] || continue
         local core cfg_stream
         core=$(protocol_subscription_db_core "$protocol")
         cfg_stream=$(db_subscription_configs "$core" "$protocol") || continue
@@ -15711,6 +16048,7 @@ gen_clash_sub() {
 
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
+            [[ -z "$selected_port" || "$(jq -r .port <<< "$cfg")" == "$selected_port" ]] || continue
 
             # 提取字段
             local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
@@ -15726,12 +16064,8 @@ gen_clash_sub() {
             # 分享配置使用实例端口。
             local actual_port="$port"
 
-            local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
-            local user_name=$(jq -r '.user_name // ""' <<< "$cfg")
-            case "$protocol" in
-                vless-singbox|vless|vless-xhttp|vless-enc) name="${name}-${port}${user_name:+-${user_name}}" ;;
-                *) [[ -z "$user_name" ]] || name="${name}-${port}-${user_name}" ;;
-            esac
+            local name
+            name=$(_local_share_name "$protocol" "$server_ip" "$cfg" "$core") || return 1
             local proxy=""
             local yaml_name=$(jq -rn --arg name "$name" '$name | tojson')
 
@@ -15818,7 +16152,8 @@ gen_clash_sub() {
     done
 
     # 合并外部节点
-    local external_links=$(get_all_external_links)
+    local external_links=""
+    [[ -n "$selected_protocol" ]] || external_links=$(_share_external_links)
     while IFS= read -r link || [[ -n "$link" ]]; do
         [[ -z "$link" || "$link" != *"://"* ]] && continue
         if [[ "$link" == vless://* ]]; then
@@ -15867,25 +16202,23 @@ EOF
 
 # 生成 Surge 订阅内容
 gen_surge_sub() {
+    local selected_protocol="${1:-}" selected_port="${2:-}"
+    local _SHARE_CATALOG="${_SHARE_CATALOG:-}"
+    [[ -n "$_SHARE_CATALOG" ]] || _SHARE_CATALOG=$(_build_share_catalog) || return 1
     local installed=$(get_installed_protocols)
     local ipv4 ipv6
     IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     local proxies=""
     local proxy_names=""
 
-    # 获取地区代码
-    local country_code=$(get_ip_country "$ipv4")
-    [[ -z "$country_code" ]] && country_code=$(get_ip_country "$ipv6")
-
     # 确定使用的 IP 地址：优先 IPv4，纯 IPv6 环境使用 IPv6
     local server_ip="$ipv4"
-    local ip_suffix="${ipv4##*.}"
     if [[ -z "$server_ip" && -n "$ipv6" ]]; then
         server_ip="[$ipv6]"
-        ip_suffix=$(get_ip_suffix "$ipv6")
     fi
 
     for protocol in $installed; do
+        [[ -z "$selected_protocol" || "$protocol" == "$selected_protocol" ]] || continue
         # 使用统一记录流读取单端口和多端口配置。
         local core cfg_stream
         core=$(protocol_subscription_db_core "$protocol")
@@ -15894,6 +16227,7 @@ gen_surge_sub() {
 
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
+            [[ -z "$selected_port" || "$(jq -r .port <<< "$cfg")" == "$selected_port" ]] || continue
 
             # 提取字段
             local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
@@ -15906,26 +16240,14 @@ gen_surge_sub() {
             local snell_mode=$(echo "$cfg" | jq -r '.mode // "default"')
             local snell_tfo=$(echo "$cfg" | jq -r 'if .tfo == null then "true" else .tfo | tostring end')
             local stls_password=$(echo "$cfg" | jq -r '.stls_password // empty')
-            local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
-            case "$protocol" in
-                vless-singbox|vless|vless-xhttp|vless-enc) name="${name}-${port}" ;;
-                snell-v5|snell-v5-official) name="${country_code}-Snell-v5-${port}" ;;
-                snell-v6) name="${country_code}-Snell-v6-official-${port}" ;;
-                snell-v6-singbox) name="${country_code}-Snell-v6-singbox-${port}" ;;
-            esac
-            local user_name=$(jq -r '.user_name // ""' <<< "$cfg")
-            if [[ -n "$user_name" ]]; then
-                case "$protocol" in
-                    vless-singbox|vless|vless-xhttp|vless-enc) name="${name}-${user_name}" ;;
-                    *) name="${name}-${port}-${user_name}" ;;
-                esac
-            fi
+            local name
+            name=$(_local_share_name "$protocol" "$server_ip" "$cfg" "$core") || return 1
             local proxy=""
 
             case "$protocol" in
                 vless-singbox|vless|vless-xhttp|vless-enc)
                     if ! proxy=$(gen_vless_surge_line "$name" "$server_ip" "$cfg"); then
-                        printf 'Surge 跳过 VLESS 节点 %s：仅支持 RAW REALITY 且 encryption=none（需要公钥与 SNI）；不支持 XHTTP / VLESS Encryption。\n' "$name" >&2
+                        printf 'Surge 跳过 VLESS 节点 %s：仅支持 RAW / XHTTP 与 REALITY / Encryption 组合；请检查必需字段及高级参数。\n' "$name" >&2
                         continue
                     fi
                     ;;
@@ -15968,7 +16290,8 @@ gen_surge_sub() {
     done
 
     # 合并支持的外部节点。
-    local external_links=$(get_all_external_links)
+    local external_links=""
+    [[ -n "$selected_protocol" ]] || external_links=$(_share_external_links)
     while IFS= read -r link || [[ -n "$link" ]]; do
         [[ -z "$link" || "$link" != *"://"* ]] && continue
         local ext_proxy=$(external_link_to_surge "$link")
@@ -15999,6 +16322,8 @@ EOF
 
 # 生成订阅文件
 generate_sub_files() {
+    local _SHARE_CATALOG="${_SHARE_CATALOG:-}"
+    [[ -n "$_SHARE_CATALOG" ]] || _SHARE_CATALOG=$(_build_share_catalog) || return 1
     local sub_uuid=$(get_sub_uuid)
     local sub_dir="$CFG/subscription/$sub_uuid"
     mkdir -p "$sub_dir"
@@ -16144,27 +16469,29 @@ show_sub_links() {
     [[ -z "$sub_host" ]] && sub_host="请填写服务器地址"
     local base_url="${protocol}://${sub_host}:${sub_port}/sub/${sub_uuid}"
 
-    _line
-    echo -e "  ${W}订阅链接${NC}"
-    _line
-    echo -e "  ${Y}Clash/Clash Verge (推荐):${NC}"
-    echo -e "  ${G}${base_url}/clash${NC}"
-    _show_link_qr "${base_url}/clash"
-    echo ""
-    echo -e "  ${Y}Surge:${NC}"
-    echo -e "  ${G}${base_url}/surge${NC}"
-    _show_link_qr "${base_url}/surge"
-    echo ""
-    echo -e "  ${Y}V2Ray/Loon/通用:${NC}"
-    echo -e "  ${G}${base_url}/v2ray${NC}"
-    _show_link_qr "${base_url}/v2ray"
-    _line
-    echo -e "  ${D}订阅路径包含随机UUID，请妥善保管${NC}"
+    local index=0 format title
+    _share_ui_heading '订阅分享' "${protocol^^}  ·  $sub_host:$sub_port  ·  3 种格式"
+    for format in clash surge v2ray; do
+        case "$format" in
+            clash) title='CLASH / CLASH VERGE' ;;
+            surge) title=SURGE ;;
+            v2ray) title='V2RAY / LOON / 通用' ;;
+        esac
+        index=$((index+1))
+        _share_ui_rule
+        _share_ui_line "$(printf '%02d  %s' "$index" "$title")" "$C"
+        _share_ui_line '订阅链接 · 复制到客户端添加订阅' "$D"
+        printf '\n%s\n' "${base_url}/$format"
+        _show_link_qr "${base_url}/$format"
+        printf '\n'
+    done
+    _share_ui_rule
+    _share_ui_line '订阅路径包含随机 UUID，请妥善保管。' "$D"
 
     # HTTPS 自签名证书提示
     if [[ "$sub_https" == "true" && -z "$sub_domain" ]]; then
-        echo -e "  ${Y}提示: 使用自签名证书，部分客户端可能无法解析订阅${NC}"
-        echo -e "  ${D}建议使用 HTTP 或绑定真实域名申请证书${NC}"
+        _share_ui_line '提示：使用自签名证书，部分客户端可能无法解析订阅。' "$Y"
+        _share_ui_line '建议使用 HTTP 或绑定真实域名申请证书。' "$D"
     fi
 }
 
@@ -16511,11 +16838,11 @@ show_logs() {
     echo -e "  ${W}运行日志${NC}"
     _line
 
-    echo -e "  ${G}1${NC}) 查看脚本日志 (最近 50 行)"
-    echo -e "  ${G}2${NC}) 查看 Watchdog 日志 (最近 50 行)"
-    echo -e "  ${G}3${NC}) 查看服务日志 (按协议选择)"
-    echo -e "  ${G}4${NC}) 实时跟踪脚本日志"
-    echo -e "  ${G}0${NC}) 返回"
+    echo -e "  ${G}$(_menu_badge "1")${NC} 查看脚本日志 (最近 50 行)"
+    echo -e "  ${G}$(_menu_badge "2")${NC} 查看 Watchdog 日志 (最近 50 行)"
+    echo -e "  ${G}$(_menu_badge "3")${NC} 查看服务日志 (按协议选择)"
+    echo -e "  ${G}$(_menu_badge "4")${NC} 实时跟踪脚本日志"
+    echo -e "  ${G}$(_menu_badge "0")${NC} 返回"
     _line
 
     read -rp "  请选择: " log_choice
@@ -16643,8 +16970,9 @@ _show_users_list() {
 
 # 生成用户的分享链接（根据协议类型）
 _gen_user_share_link() {
-    local core="$1" proto="$2" uuid="$3" user_name="$4"
-    local selected_port="${5:-}" records cfg
+    local core="$1" proto="$2" uuid="$3" user_name="$4" selected_port="${5:-}" records cfg port
+    local _SHARE_CATALOG="${_SHARE_CATALOG:-}"
+    [[ -n "$_SHARE_CATALOG" ]] || _SHARE_CATALOG=$(_build_share_catalog) || return 1
     records=$(db_protocol_configs "$core" "$proto" | jq -c --arg name "$user_name" --arg uuid "$uuid" \
         --arg port "$selected_port" '
         select($port == "" or (.port | tostring) == $port) |
@@ -16652,46 +16980,11 @@ _gen_user_share_link() {
             any((.users // [])[]; .name == $name and (.uuid // .password // "") == $uuid and .enabled != false)
         else (.uuid // .password // .username // "") == $uuid end)
     ') || return 1
-
-    # 获取 IP 地址
-    local ipv4 ipv6
-    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
-    local country_code=$(get_ip_country "$ipv4")
-    [[ -z "$country_code" ]] && country_code=$(get_ip_country "$ipv6")
-
-    if [[ -z "$ipv4" && -n "$ipv6" ]]; then
-        ipv4="[$ipv6]"
-    fi
-    [[ -n "$ipv4" ]] || return 0
-
     while IFS= read -r cfg; do
         [[ -n "$cfg" ]] || continue
-        local display_port=$(jq -r '.port // empty' <<< "$cfg")
-        local sni=$(jq -r '.sni // empty' <<< "$cfg")
-        local method=$(jq -r '.method // empty' <<< "$cfg")
-        local remark="${country_code:+${country_code}-}${user_name}" link=""
-        case "$proto" in
-            vless-singbox|vless|vless-xhttp|vless-enc)
-                local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
-                if [[ "$proto" == vless-singbox && "$security_mode" == "encryption" ]]; then
-                    _err "Sing-box 不支持 VLESS encryption 模式" >&2; return 1
-                else
-                    local record=$(jq -c --arg uuid "$uuid" '.uuid = $uuid' <<< "$cfg")
-                    remark="${remark}-$(get_protocol_name "$proto")-$(get_ip_suffix "$ipv4")-${display_port}"
-                    link=$(gen_xray_vless_link "$ipv4" "$record" "$remark") || return 1
-                fi
-                ;;
-            ss2022) link=$(gen_ss2022_link "$ipv4" "$display_port" "$method" "$uuid" "$remark") ;;
-            hy2) link=$(gen_hy2_link "$ipv4" "$display_port" "$uuid" "$sni" "$remark") ;;
-            tuic)
-                local password=$(echo "$cfg" | jq -r '.password // empty')
-                link=$(gen_tuic_link "$ipv4" "$display_port" "$uuid" "$password" "$sni" "$remark")
-                ;;
-            socks) link=$(gen_socks_link "$ipv4" "$display_port" "$user_name" "$uuid" "$remark") ;;
-        esac
-        [[ -z "$link" ]] || printf '%s\n' "$link"
+        port=$(jq -r .port <<< "$cfg") || return 1
+        gen_v2ray_sub "$proto" "$port" "$user_name" | base64 -d || return 1
     done <<< "$records"
-    return 0
 }
 
 # 显示用户分享链接菜单
@@ -16706,94 +16999,62 @@ db_user_share_records() {
 }
 
 _show_user_share_links() {
-    local core="$1" proto="$2"
-    local proto_name=$(get_protocol_name "$proto")
+    local core="$1" proto="$2" proto_name
+    local _SHARE_CATALOG="${_SHARE_CATALOG:-}"
+    [[ -n "$_SHARE_CATALOG" ]] || _SHARE_CATALOG=$(_build_share_catalog) || return 1
+    proto_name=$(get_protocol_name "$proto")
 
     while true; do
         _header
-        echo -e "  ${W}$proto_name 用户分享链接${NC}"
-        _dline
-
-        local stats=$(db_user_share_records "$core" "$proto")
+        _share_ui_heading "用户分享 · $proto_name" '选择用户查看链接、Surge 配置与二维码。'
+        local stats
+        stats=$(db_user_share_records "$core" "$proto") || return 1
         if [[ -z "$stats" ]]; then
-            echo -e "  ${D}暂无用户${NC}"
-            _line
+            _share_ui_line '暂无用户。' "$D"
+            _share_ui_rule
             _pause
             return
         fi
 
-        # 显示用户列表
-        local users=()
-        local uuids=()
-        local ports=()
-        local idx=1
-
+        local -a users=() uuids=() ports=()
+        local idx=1 name uuid enabled port routing state choice i
+        _share_ui_rule
         while IFS='|' read -r name uuid enabled port routing; do
-            [[ -z "$name" ]] && continue
-            users+=("$name")
-            uuids+=("$uuid")
-            ports+=("$port")
-            echo -e "  ${G}$idx${NC}) $name ${D}(端口 $port)${NC}"
-            ((idx++))
+            [[ -n "$name" ]] || continue
+            users+=("$name"); uuids+=("$uuid"); ports+=("$port")
+            state=""
+            [[ "$enabled" != false ]] || state=' · 已禁用'
+            _share_ui_line "$(printf '%s %s  (端口 %s)%s' "$(_menu_badge "$idx")" "$name" "$port" "$state")" "$W"
+            idx=$((idx+1))
         done <<< "$stats"
+        _share_ui_rule
+        _share_ui_line '[A]  展示全部用户链接与配置    [0]  返回' "$D"
+        printf '
+'
+        read -rp "  请选择 [1-$((idx-1))/A/0]: " choice || return
 
-        _line
-        echo -e "  ${D}输入序号查看详细配置/链接${NC}"
-        _item "a" "一键展示所有用户分享链接"
-        _item "0" "返回"
-        _line
-
-        read -rp "  请选择 [0-$((idx-1))/a]: " choice
-
-        if [[ "$choice" == "0" ]]; then
-            return
-        elif [[ "$choice" == "a" || "$choice" == "A" ]]; then
-            # 展示所有用户分享链接
-            echo ""
-            _dline
-            echo -e "  ${W}$proto_name 所有用户分享链接${NC}"
-            _dline
-
-            for i in "${!users[@]}"; do
-                local user="${users[$i]}"
-                local uuid="${uuids[$i]}"
-                echo -e "  ${Y}$user:${NC}"
-                local link=$(_gen_user_share_link "$core" "$proto" "$uuid" "$user" "${ports[$i]}")
-                [[ -n "$link" ]] && echo -e "  ${C}$link${NC}"
-                echo ""
-            done
-
-            _line
-            _pause
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "${#users[@]}" ]]; then
-            # 显示单个用户链接
-            local user="${users[$((choice-1))]}"
-            local uuid="${uuids[$((choice-1))]}"
-
-            echo ""
-            _dline
-            echo -e "  ${W}$user 分享链接${NC}"
-            _dline
-
-            local link=$(_gen_user_share_link "$core" "$proto" "$uuid" "$user" "${ports[$((choice-1))]}")
-            if [[ -n "$link" ]]; then
-                echo -e "  ${C}$link${NC}"
-                echo ""
-
-                # 生成二维码（如果可用）
-                if command -v qrencode &>/dev/null; then
-                    echo -e "  ${D}二维码:${NC}"
-                    qrencode -t ANSIUTF8 "$link" 2>/dev/null
+        case "$choice" in
+            0) return ;;
+            a|A)
+                _share_ui_heading "所有用户 · $proto_name" '按用户分别展示；选择单个用户可查看二维码。'
+                for i in "${!users[@]}"; do
+                    _share_user_card "$((i+1))" "$core" "$proto" "${uuids[$i]}" "${users[$i]}" "${ports[$i]}" false || return 1
+                done
+                _share_ui_rule
+                _pause
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#users[@]} )); then
+                    i=$((choice-1))
+                    _share_ui_heading "用户分享 · ${users[$i]}" "$proto_name"
+                    _share_user_card "$choice" "$core" "$proto" "${uuids[$i]}" "${users[$i]}" "${ports[$i]}" || return 1
+                    _share_ui_rule
+                    _pause
+                else
+                    _err '无效选择'
                 fi
-            else
-                echo -e "  ${D}无法生成链接${NC}"
-            fi
-
-            _line
-            _pause
-        else
-            _err "无效选择"
-        fi
+                ;;
+        esac
     done
 }
 
@@ -16814,18 +17075,18 @@ _select_user_routing() {
     local options=()
 
     # 选项1: 使用全局规则
-    echo -e "  ${G}1${NC}) 使用全局规则 (默认)"
+    echo -e "  ${G}$(_menu_badge "1")${NC} 使用全局规则 (默认)"
     options+=("")
     ((idx++))
 
     # 选项2: 直连
-    echo -e "  ${G}$idx${NC}) 直连"
+    echo -e "  ${G}$(_menu_badge "$idx")${NC} 直连"
     options+=("direct")
     ((idx++))
 
     # 选项3: WARP (仅当已安装时显示)
     if warp_status &>/dev/null || [[ -f "/usr/local/bin/warp-go" ]] || command -v warp-cli &>/dev/null; then
-        echo -e "  ${G}$idx${NC}) WARP 代理"
+        echo -e "  ${G}$(_menu_badge "$idx")${NC} WARP 代理"
         options+=("warp")
         ((idx++))
     fi
@@ -16837,7 +17098,7 @@ _select_user_routing() {
             echo -e "  ${D}──链式代理节点──${NC}"
             while IFS= read -r node; do
                 [[ -z "$node" ]] && continue
-                echo -e "  ${G}$idx${NC}) 链路→$node"
+                echo -e "  ${G}$(_menu_badge "$idx")${NC} 链路→$node"
                 options+=("chain:$node")
                 ((idx++))
             done <<< "$chain_nodes"
@@ -16851,14 +17112,14 @@ _select_user_routing() {
             echo -e "  ${D}──负载均衡组──${NC}"
             while IFS= read -r group; do
                 [[ -z "$group" ]] && continue
-                echo -e "  ${G}$idx${NC}) 负载→$group"
+                echo -e "  ${G}$(_menu_badge "$idx")${NC} 负载→$group"
                 options+=("balancer:$group")
                 ((idx++))
             done <<< "$balancers"
         fi
     fi
 
-    echo -e "  ${G}0${NC}) 取消"
+    echo -e "  ${G}$(_menu_badge "0")${NC} 取消"
     _line
 
     local max=$((idx-1))
@@ -17389,7 +17650,7 @@ _tg_show_user_bindings() {
     local core proto name chat_id username bound_at index=1
     while IFS='|' read -r core proto name chat_id username bound_at; do
         [[ -z "$name" ]] && continue
-        printf "  ${G}%d)${NC} %s / %s / %s\n" "$index" "$(get_protocol_name "$proto")" "$name" "$chat_id"
+        printf "  ${G}%s${NC} %s / %s / %s\n" "$(_menu_badge "$index")" "$(get_protocol_name "$proto")" "$name" "$chat_id"
         [[ -n "$username" ]] && echo -e "     ${D}@${username}，绑定时间: ${bound_at:-未知}${NC}"
         ((index++))
     done <<< "$bindings"

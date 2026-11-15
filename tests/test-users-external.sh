@@ -26,7 +26,8 @@ for link in \
     'vless://test@example.com:443?type=tcp&encryption=mlkem-test#bad'; do
     if parse_proxy_link "$link" > "$TEST_TMP/node" 2> "$TEST_TMP/error"; then fail 'unsupported VLESS imported'; fi
     [[ -s "$TEST_TMP/error" ]] || fail 'unsupported parameter was rejected silently'
-    if parse_vless_link "$link" >/dev/null 2>&1; then fail 'external parser accepted unsupported VLESS'; fi
+    parse_vless_link "$link" >"$TEST_TMP/share-node" || fail 'generic share parser rejected VLESS'
+    if gen_singbox_chain_outbound "$(cat "$TEST_TMP/share-node")" >/dev/null 2>&1; then fail 'chain accepted unsupported VLESS'; fi
 done
 node=$(parse_proxy_link 'trojan://test-password@example.com:443?type=ws&path=%2Ftest&host=cdn.example.com&sni=tls.example.com#test')
 gen_singbox_chain_outbound "$node" proxy ipv4_only > "$TEST_TMP/outbound"

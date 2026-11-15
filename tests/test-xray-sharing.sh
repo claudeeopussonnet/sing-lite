@@ -76,14 +76,25 @@ for link in links:
 
 surge = (root/'surge').read_text()
 rows = [line for line in surge.splitlines() if ' = vless,' in line]
-assert len(rows) == 5, rows
+assert len(rows) == 9, rows
 assert len({row.split(' = ')[0] for row in rows}) == len(rows), rows
 assert len([row for row in rows if ', 45101,' in row]) == 2
 for row in rows:
-    assert 'username=00000000-' in row and 'flow=xtls-rprx-vision' in row, row
-    assert 'reality-public-key=test-public-key' in row and 'reality-short-id=00123456' in row, row
-    assert 'sni=www.example.com' in row and 'skip-cert-verify' not in row, row
-assert any('alice' in row for row in rows) and any('bob' in row for row in rows), rows
+    assert 'username=00000000-' in row and 'skip-cert-verify' not in row, row
+    port = int(row.split(', ')[2])
+    if port == 45121:
+        assert 'reality-' not in row and 'flow=' not in row and 'sni=' not in row, row
+    else:
+        assert 'reality-public-key=test-public-key' in row and 'reality-short-id=00123456' in row, row
+        assert 'sni=www.example.com' in row, row
+        assert ('flow=xtls-rprx-vision' in row) == (port not in (45111,45112)), row
+    assert ('encryption=mlkem768x25519plus.native.0rtt.public+/=&?# %' in row) == (port in (45103,45112,45121)), row
+    assert ('xhttp=true' in row) == (port in (45111,45112)), row
+    if port in (45111,45112):
+        assert 'xhttp-path=/x http/路径?arg=a&b=#' in row, row
+        assert ('xhttp-mode=packet-up' if port == 45111 else 'xhttp-mode=stream-up') in row, row
+assert any('ALICE' in row for row in rows) and any('BOB' in row for row in rows), rows
+assert all(row.split(' = ')[0].startswith('🌐 ') and row.split(' = ')[0] == row.split(' = ')[0].upper() for row in rows)
 
 clash = (root/'clash').read_text()
 assert clash.count('    type: vless') == 5, clash
@@ -92,11 +103,12 @@ names = [json.loads(line.split('name: ', 1)[1]) for line in clash.split('proxy-g
          if line.startswith('  - name: ')]
 assert len(names) == len(set(names)) == 5, names
 for port in (45103, 45111, 45112, 45121):
-    assert not re.search(rf', {port},|port: {port}\b', surge + clash), port
-    assert str(port) in (root/'surge-skipped').read_text(), port
+    assert not re.search(rf'port: {port}\b', clash), port
+    assert re.search(rf', {port},', surge), port
     assert str(port) in (root/'clash-skipped').read_text(), port
 details = (root/'details').read_text()
-assert details.count('兼容性：Surge 不支持') == 4, details
+assert details.count('兼容性：Surge 支持此节点') == 4, details
+assert 'TODO' not in details and not (root/'surge-skipped').read_text(), details
 for filename, port, user in [('user-first',45101,2), ('user-second',45102,5), ('user-encryption',45121,9)]:
     link, = [urlsplit(line) for line in (root/filename).read_text().splitlines()]
     assert link.port == port and link.username.endswith(f'{user:012d}'), link
@@ -141,7 +153,7 @@ for line, mode in zip((root/'modes').read_text().splitlines(), ('auto','packet-u
     assert query['mode'] == [mode] and 'flow' not in query, query
 link = urlsplit((root/'legacy-helper').read_text().strip())
 assert link.hostname == '2001:db8::3' and parse_qs(link.query)['pbk'] == ['public+/='], link
-assert '地区 #+' in unquote(link.fragment) and '45443' in unquote(link.fragment), link
+assert unquote(link.fragment) == '🌐 REALITY-45443', link
 PY
 printf 'ok - IPv6 URI/Surge output, all XHTTP modes and Unicode/reserved URI values\n'
 
@@ -156,17 +168,16 @@ external_link_to_surge "${external/]:443/]:8443}" >"$TEST_TMP/external-other-por
 external_link_to_surge "${external/&flow=xtls-rprx-vision/}" >"$TEST_TMP/external-no-flow"
 if grep -q 'flow=' "$TEST_TMP/external-no-flow"; then fail 'external no-flow node changed to Vision'; fi
 for unsupported in \
-    "${external/type=tcp/type=xhttp}" \
-    "${external/encryption=none/encryption=mlkem-test}" \
     "${external/type=tcp/type=httpupgrade}"; do
     external_link_to_surge "$unsupported" >"$TEST_TMP/unsupported" 2>"$TEST_TMP/unsupported-error"
     [[ ! -s "$TEST_TMP/unsupported" && -s "$TEST_TMP/unsupported-error" ]] || fail 'unsupported external VLESS exported or skipped silently'
 done
 printf 'ok - external REALITY converts to Surge; unsupported transports/encryption skip explicitly\n'
 
-# Unsupported local nodes still need an importable subscription with a usable group.
+# Unsupported combinations still need an importable subscription with a usable group.
 rewrite_db '.singbox = {} | .snell = {} |
-    .xray.vless = [.xray.vless[] | select(.encryption != "none")]'
+    .xray.vless = [.xray.vless[] | select(.encryption != "none")] |
+    .xray |= with_entries(.value |= (if type == "array" then map(.transport = "unsupported") else .transport = "unsupported" end))'
 gen_surge_sub >"$TEST_TMP/empty-surge" 2>"$TEST_TMP/empty-surge-skipped"
 gen_clash_sub >"$TEST_TMP/empty-clash" 2>"$TEST_TMP/empty-clash-skipped"
 (
@@ -191,7 +202,7 @@ for filename in ('empty-surge-skipped', 'empty-clash-skipped'):
     skipped = (root/filename).read_text()
     for port in (45103, 45111, 45112, 45121):
         assert str(port) in skipped, (filename, port, skipped)
-    assert 'XHTTP / VLESS Encryption' in skipped, skipped
+    assert ('RAW / XHTTP' if filename == 'empty-surge-skipped' else 'RAW REALITY') in skipped, skipped
 surge = (root/'external-only-surge').read_text()
 assert surge.count(' = vless,') == 1 and 'Proxy = select, DIRECT' not in surge, surge
 group = surge.split('Proxy = select, ', 1)[1].splitlines()[0]
@@ -203,10 +214,10 @@ PY
 printf 'ok - empty Surge/Clash exports fall back to DIRECT; supported external nodes populate groups\n'
 
 # One account can use the same UUID on several ports; selection must keep its port.
-rewrite_db '(.xray.vless[0] | .encryption = "none" | .users = [
+rewrite_db '(.xray.vless[0] | .transport = "raw" | .encryption = "none" | .users = [
         {name:"shared",uuid:"00000000-0000-4000-8000-000000000015",enabled:true}]) as $base |
     .xray = {vless:[($base | .port = 45301), ($base | .port = 45302)]}'
-qrencode() { printf '%s\n' "${@: -1}" >>"$TEST_TMP/menu-qr"; }
+qrencode() { cat >>"$TEST_TMP/menu-qr"; printf '\n' >>"$TEST_TMP/menu-qr"; }
 _show_user_share_links xray vless >"$TEST_TMP/menu-single" 2>"$TEST_TMP/menu-single-stderr" <<'INPUT'
 2
 0

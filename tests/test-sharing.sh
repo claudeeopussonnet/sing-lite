@@ -45,7 +45,8 @@ for port, mode, impl in [(44006,'unsafe-raw','singbox'),(44016,'unshaped','offic
              if line.startswith('snell://') and urlsplit(line).port == port]
     query = parse_qs(link.query)
     assert query['version'] == ['6'] and query['mode'] == [mode], link
-    assert impl in link.fragment, link
+    from urllib.parse import unquote
+    assert unquote(link.fragment) == f"🌐 SNELL6-{port}", link
     assert str(port) in (root/'share').read_text()
 PY
 printf 'ok - multiport REALITY shares and official/shared Snell subscription namespaces\n'

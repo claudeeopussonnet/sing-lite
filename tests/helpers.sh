@@ -32,6 +32,7 @@ ip6tables() { forbidden ip6tables "$@"; }
 nft() { forbidden nft "$@"; }
 crontab() { forbidden crontab "$@"; }
 curl() { forbidden curl "$@"; }
+dig() { forbidden dig "$@"; }
 sing-box() {
     if [[ -n "${SING_TEST_SINGBOX_BIN:-}" ]]; then
         "$SING_TEST_SINGBOX_BIN" "$@"

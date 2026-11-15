@@ -10,15 +10,52 @@ for protocol in $XRAY_PROTOCOLS; do
     [[ "${PROTO_SVC[$protocol]}" == sing-xray && "${PROTO_BIN[$protocol]}" == xray ]] || fail 'Xray service identity'
 done
 select_vless_mode <<< $'1\n1' >/dev/null
-[[ "$SELECTED_PROTOCOL" == vless-singbox ]] || fail 'native reality selection'
-select_vless_mode <<< $'1\n2' >/dev/null
 [[ "$SELECTED_PROTOCOL" == vless ]] || fail 'Xray reality selection'
+select_vless_mode <<< $'1\n2' >/dev/null
+[[ "$SELECTED_PROTOCOL" == vless-singbox ]] || fail 'native reality selection'
+select_vless_mode <<< $'\n\n' >/dev/null
+[[ "$SELECTED_PROTOCOL" == vless ]] || fail 'default Xray reality selection'
+if select_vless_mode <<< $'1\n0' >/dev/null; then fail 'REALITY cancel'; fi
+if select_vless_mode <<< 1 >/dev/null; then fail 'REALITY EOF'; fi
 select_vless_mode <<< 2 >/dev/null
 [[ "$SELECTED_PROTOCOL" == vless-xhttp ]] || fail 'XHTTP selection'
 select_vless_mode <<< 3 >/dev/null
 [[ "$SELECTED_PROTOCOL" == vless-enc ]] || fail 'Encryption selection'
 if select_vless_mode <<< 0 >/dev/null; then fail 'VLESS cancel'; fi
 if select_vless_mode </dev/null; then fail 'VLESS EOF'; fi
+
+# Exercise both install/add entry points with every host operation mocked.
+(
+    check_dependencies() { :; }
+    install_deps() { :; }
+    ensure_dual_stack_listen() { :; }
+    install_xray() { printf 'install:xray\n' >>"$TEST_TMP/wizard-events"; }
+    install_singbox() { printf 'install:singbox\n' >>"$TEST_TMP/wizard-events"; }
+    handle_existing_protocol() { printf 'existing:%s:%s\n' "$1" "$2" >>"$TEST_TMP/wizard-events"; }
+    ask_port() { printf '42044\n'; }
+    configure_xray_vless() { printf 'configure:%s:%s\n' "$1" "$2" >>"$TEST_TMP/wizard-events"; }
+    gen_singbox_reality_keys() { printf '{"public_key":"test-public","private_key":"test-private"}\n'; }
+    ask_sni_config() { printf 'www.example.com\n'; }
+    gen_vless_singbox_server_config() { printf 'configure:vless-singbox:%s\n' "$2" >>"$TEST_TMP/wizard-events"; }
+    create_server_scripts() { :; }
+    create_watchdog_service() { :; }
+    create_shortcut() { :; }
+    svc() { [[ "$*" == 'enable sing-watchdog' || "$*" == 'start sing-watchdog' ]] || forbidden svc "$@"; }
+    show_single_protocol_info() { printf 'show:%s:%s\n' "$1" "$3" >>"$TEST_TMP/wizard-events"; }
+    for choice in xray singbox; do
+        : >"$TEST_TMP/wizard-events"
+        if [[ "$choice" == xray ]]; then
+            do_install_server <<< $'1\n\n\n' >/dev/null
+            expected=vless
+        else
+            do_install_server <<< $'1\n1\n2' >/dev/null
+            expected=vless-singbox
+        fi
+        expected_events=$(printf 'install:%s\nexisting:%s:%s\nconfigure:%s:42044\nshow:%s:42044' \
+            "$choice" "$expected" "$choice" "$expected" "$expected")
+        [[ "$(cat "$TEST_TMP/wizard-events")" == "$expected_events" ]] || fail 'REALITY wizard core dispatch/order'
+    done
+)
 
 # Migration preserves native records and Xray credentials, including leading zeroes.
 db_add singbox socks '{"port":42001,"username":"native","password":"native-password"}'
