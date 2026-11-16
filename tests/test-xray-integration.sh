@@ -69,14 +69,17 @@ if check_port_conflict 42001 vless xray >/dev/null; then fail 'native collision 
 # Service files use owned paths and validate the config before launch.
 systemctl() { [[ "$*" == daemon-reload ]] || forbidden systemctl "$@"; }
 create_xray_service
+grep -F "Environment=\"XRAY_LOCATION_ASSET=$CFG/xray-rules\"" "$SYSTEMD_DIR/sing-xray.service" >/dev/null || fail 'systemd asset environment'
 grep -F "ExecStartPre=\"$CFG/bin/xray\" run -test -c \"$CFG/xray.json\"" "$SYSTEMD_DIR/sing-xray.service" >/dev/null || fail 'systemd validation'
 DISTRO=alpine
 create_xray_service
+grep -F "export XRAY_LOCATION_ASSET=\"$CFG/xray-rules\"" "$OPENRC_DIR/sing-xray" >/dev/null || fail 'OpenRC asset environment'
 grep -F "start_pre() { \"$CFG/bin/xray\" run -test -c \"$CFG/xray.json\"; }" "$OPENRC_DIR/sing-xray" >/dev/null || fail 'OpenRC validation'
 [[ -x "$OPENRC_DIR/sing-xray" ]] || fail 'OpenRC executable'
 DISTRO=debian
 create_server_scripts
 bash -n "$CFG/watchdog.sh"
+grep -F 'export XRAY_LOCATION_ASSET="$CFG/xray-rules"' "$CFG/watchdog.sh" >/dev/null || fail 'watchdog asset environment'
 grep -F 'sing-xray:xray' "$CFG/watchdog.sh" >/dev/null || fail 'watchdog identity'
 grep -F 'xray run -test -c "$CFG/xray.json"' "$CFG/watchdog.sh" >/dev/null || fail 'watchdog validation'
 [[ "$(owned_services)" == *sing-xray* ]] || fail 'stop/uninstall ownership'

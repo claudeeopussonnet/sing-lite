@@ -22,9 +22,9 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.1.2 [服务端]
+#  sing-lite v1.1.3 [服务端]
 #  官方 sing-box、Xray 与 Surge 原厂 Snell v5/v6。
-#  配置目录 /etc/sing-lite，快捷命令 sing。
+#  配置目录 /etc/sing-lite，快捷命令 vless。
 #  适配: Alpine/Debian/Ubuntu/CentOS
 #
 #
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.1.2"
+readonly VERSION="1.1.3"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/claudeeopussonnet/sing-lite"
 readonly SCRIPT_REPO="claudeeopussonnet/sing-lite"
@@ -191,7 +191,7 @@ init_db() {
     now=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
     tmp=$(mktemp "${DB_FILE}.init.XXXXXX") || { _db_lock_release; return 1; }
     if jq -n --arg v "4.0.0" --arg t "$now" \
-      '{version:$v,snell:{},singbox:{},xray:{},meta:{created:$t,updated:$t}}' >"$tmp" 2>/dev/null; then
+      '{version:$v,snell:{},singbox:{},xray:{},xray_routing_rules:[],meta:{created:$t,updated:$t}}' >"$tmp" 2>/dev/null; then
         if chmod 600 "$tmp" && mv "$tmp" "$DB_FILE"; then
             _db_lock_release
             return 0
@@ -201,7 +201,7 @@ init_db() {
         return 1
     fi
     # jq 失败时使用简单方式创建
-    if printf '%s\n' '{"version":"4.0.0","snell":{},"singbox":{},"xray":{},"meta":{}}' >"$tmp" &&
+    if printf '%s\n' '{"version":"4.0.0","snell":{},"singbox":{},"xray":{},"xray_routing_rules":[],"meta":{}}' >"$tmp" &&
        chmod 600 "$tmp" && mv "$tmp" "$DB_FILE"; then
         _db_lock_release
         return 0
@@ -2528,7 +2528,7 @@ _header() {
     _dline
     _logo
     echo -e "      ${W}sing-lite${NC} ${C}v${VERSION}${NC} ${Y}[服务端]${NC}" >&2
-    echo -e "      ${D}作者: ${AUTHOR}  快捷命令: sing${NC}" >&2
+    echo -e "      ${D}作者: ${AUTHOR}  快捷命令: vless${NC}" >&2
     echo -e "      ${D}${REPO_URL}${NC}" >&2
     _dline
 }
@@ -5475,6 +5475,7 @@ _replace_xray_file() {
 
 _restore_xray_core_snapshot() {
     local snapshot="$1" binary="$2"
+    _restore_xray_rules "$snapshot" || return 1
     if [[ -f "$snapshot/binary" ]]; then
         _replace_xray_file "$snapshot/binary" "$binary" || return 1
     else
@@ -5488,8 +5489,8 @@ _restore_xray_core_snapshot() {
 }
 
 _install_checked_xray_binary() {
-    local binary="$1" version="$2" target output candidate="" snapshot protocols
-    local XRAY_CONFIG_BINARY="$binary"
+    local binary="$1" version="$2" target output candidate="" snapshot protocols success=false
+    local XRAY_CONFIG_BINARY="$binary" XRAY_RULES_DEFER=true XRAY_RULES_PREPARED=''
     target=$(_core_binary_path xray) || return 1
     [[ -f "$binary" && ! -L "$binary" ]] && chmod 755 "$binary" || return 1
     output=$("$binary" version 2>/dev/null) || return 1
@@ -5497,31 +5498,29 @@ _install_checked_xray_binary() {
         _err "Xray 核心版本校验失败"; return 1
     }
     mkdir -p "$CFG/bin" || return 1
+    snapshot=$(mktemp -d "$CFG/.xray-upgrade.XXXXXX") || return 1
+    if ! _snapshot_xray_rules "$snapshot" ||
+       { [[ -f "$target" ]] && ! cp -p "$target" "$snapshot/binary"; } ||
+       { [[ -f "$CFG/xray.json" ]] && ! cp -p "$CFG/xray.json" "$snapshot/config"; }; then
+        rm -rf "$snapshot"; return 1
+    fi
     protocols=$(get_xray_protocols) || :
     if [[ -n "$protocols" ]]; then
-        candidate=$(mktemp "$CFG/.xray-upgrade.XXXXXX") || return 1
+        candidate="$snapshot/candidate.json"
         if ! generate_xray_config "$candidate" || [[ ! -s "$candidate" ]] || ! chmod 600 "$candidate"; then
-            rm -f "$candidate"
-            return 1
+            _discard_xray_rules "$XRAY_RULES_PREPARED"; rm -rf "$snapshot"; return 1
         fi
     fi
-    snapshot=$(mktemp -d "$CFG/.xray-install.XXXXXX") || { rm -f "$candidate"; return 1; }
-    if { [[ -f "$target" ]] && ! cp -p "$target" "$snapshot/binary"; } ||
-       { [[ -f "$CFG/xray.json" ]] && ! cp -p "$CFG/xray.json" "$snapshot/config"; }; then
-        rm -f "$candidate"; rm -rf "$snapshot"; return 1
+    if _replace_singbox_binary "$binary" "$target" &&
+       _xray_commit_rules "$XRAY_RULES_PREPARED" &&
+       { [[ -z "$candidate" ]] || mv -f "$candidate" "$CFG/xray.json"; }; then success=true; fi
+    if [[ "$success" == true ]]; then rm -rf "$snapshot"; return 0; fi
+    if ! _restore_xray_core_snapshot "$snapshot" "$target"; then
+        _err "Xray 恢复失败，快照保留: $snapshot"; return 1
     fi
-    if ! _replace_singbox_binary "$binary" "$target"; then
-        rm -f "$candidate"; rm -rf "$snapshot"; return 1
-    fi
-    if [[ -n "$candidate" ]] && ! mv -f "$candidate" "$CFG/xray.json"; then
-        rm -f "$candidate"
-        if ! _restore_xray_core_snapshot "$snapshot" "$target"; then
-            _err "Xray 恢复失败，快照保留: $snapshot"; return 1
-        fi
-        rm -rf "$snapshot"
-        return 1
-    fi
+    _discard_xray_rules "$XRAY_RULES_PREPARED"
     rm -rf "$snapshot"
+    return 1
 }
 
 _verify_xray_release_asset() {
@@ -5784,7 +5783,8 @@ _update_xray_core_to_version() {
     mkdir -p "$CFG" || return 1
     binary=$(_core_binary_path xray) || return 1
     snapshot=$(mktemp -d "$CFG/.xray-core.XXXXXX") || return 1
-    if { [[ -f "$binary" ]] && ! cp -p "$binary" "$snapshot/binary"; } ||
+    if ! _snapshot_xray_rules "$snapshot" ||
+       { [[ -f "$binary" ]] && ! cp -p "$binary" "$snapshot/binary"; } ||
        { [[ -f "$CFG/xray.json" ]] && ! cp -p "$CFG/xray.json" "$snapshot/config"; }; then
         rm -rf "$snapshot"; return 1
     fi
@@ -5794,7 +5794,7 @@ _update_xray_core_to_version() {
         if [[ "$was_running" != true ]] || { svc restart sing-xray && _wait_for_owned_service sing-xray; }; then success=true; fi
     fi
     if [[ "$success" == true ]]; then rm -rf "$snapshot"; _ok "Xray 已更新至 v$version"; return 0; fi
-    if [[ "$installed" == false ]] &&
+    if [[ "$installed" == false ]] && _xray_rules_match_snapshot "$snapshot" &&
        { [[ -f "$snapshot/binary" ]] && cmp -s "$snapshot/binary" "$binary" || [[ ! -f "$snapshot/binary" && ! -e "$binary" ]]; } &&
        { [[ -f "$snapshot/config" ]] && cmp -s "$snapshot/config" "$CFG/xray.json" || [[ ! -f "$snapshot/config" && ! -e "$CFG/xray.json" ]]; }; then
         rm -rf "$snapshot"; _err "更新失败，原 Xray 核心与配置未变化"; return 1
@@ -6887,6 +6887,7 @@ create_xray_service() {
 #!/sbin/openrc-run
 name="Xray Proxy Server"
 command="$binary"
+export XRAY_LOCATION_ASSET="$CFG/xray-rules"
 command_args="run -c \"$config\""
 command_background="yes"
 pidfile="/run/$service.pid"
@@ -6903,6 +6904,7 @@ Description=Xray Proxy Server
 After=network.target
 [Service]
 Type=simple
+Environment="XRAY_LOCATION_ASSET=$CFG/xray-rules"
 ExecStartPre="$binary" run -test -c "$config"
 ExecStart="$binary" run -c "$config"
 Restart=always
@@ -7986,7 +7988,276 @@ _lite_xray_binary() {
     fi
 }
 
-# Xray owns its listeners and direct outbound independently of Sing-box routing.
+# Xray 仅使用发布方成品 DAT；资源版本与内核版本查询均不缓存。
+_snapshot_xray_rules() {
+    local snapshot="$1"
+    if [[ -L "$CFG/xray-rules" ]]; then
+        readlink "$CFG/xray-rules" >"$snapshot/rules-link" || return 1
+    elif [[ -e "$CFG/xray-rules" ]]; then
+        _err "Xray 规则路径应为受管理的资源链接: $CFG/xray-rules"
+        return 1
+    fi
+}
+
+_xray_commit_rules() {
+    local target="$1" staged
+    [[ -n "$target" ]] || return 0
+    [[ "$target" != "$CFG/xray-rules" ]] || return 0
+    staged=$(mktemp -d "$CFG/.xray-link.XXXXXX") || return 1
+    if ! ln -s "$target" "$staged/link" || ! mv -Tf "$staged/link" "$CFG/xray-rules"; then
+        rm -rf "$staged"; return 1
+    fi
+    rmdir "$staged"
+}
+
+_restore_xray_rules() {
+    local snapshot="$1" target
+    if [[ -f "$snapshot/rules-link" ]]; then
+        target=$(cat "$snapshot/rules-link") || return 1
+        _xray_commit_rules "$target"
+    else
+        rm -f "$CFG/xray-rules"
+    fi
+}
+
+_xray_rules_match_snapshot() {
+    local snapshot="$1"
+    if [[ -f "$snapshot/rules-link" ]]; then
+        [[ -L "$CFG/xray-rules" && "$(readlink "$CFG/xray-rules")" == "$(cat "$snapshot/rules-link")" ]]
+    else
+        [[ ! -e "$CFG/xray-rules" && ! -L "$CFG/xray-rules" ]]
+    fi
+}
+
+_discard_xray_rules() {
+    local target="${1:-}"
+    # 只删除本次未提交的暂存版本；既有版本仍供外层事务回滚。
+    if [[ "$target" == "$CFG"/.xray-rules.* &&
+          "$(readlink "$CFG/xray-rules" 2>/dev/null)" != "$target" ]]; then
+        rm -rf "$target"
+    fi
+    return 0
+}
+
+_validate_xray_rules() {
+    local directory="$1" binary="$2" file expected probe
+    for file in geosite.dat geoip.dat; do
+        [[ -s "$directory/$file" && -s "$directory/$file.sha256sum" ]] || return 1
+        expected=$(awk 'NR == 1 {print $1}' "$directory/$file.sha256sum") || return 1
+        [[ "$expected" =~ ^[a-fA-F0-9]{64}$ &&
+           "${expected,,}" == "$(_sha256_file "$directory/$file")" ]] || return 1
+    done
+    probe=$(mktemp -d "$CFG/.xray-dat-check.XXXXXX") || return 1
+    # 官方核心同时检查 DAT 格式及全部五类标签，不仅检查当前启用分类。
+    if ! printf '%s\n' '{"outbounds":[{"protocol":"freedom","tag":"direct"}],"routing":{"rules":[{"type":"field","domain":["geosite:category-ai-!cn","geosite:youtube","geosite:google","geosite:twitter","geosite:cn"],"outboundTag":"direct"},{"type":"field","ip":["geoip:twitter","geoip:cn"],"outboundTag":"direct"}]}}' >"$probe/config.json" ||
+       ! XRAY_LOCATION_ASSET="$directory" "$binary" run -test -format json -c "$probe/config.json" >"$probe/check.log" 2>&1; then
+        [[ ! -f "$probe/check.log" ]] || cat "$probe/check.log" >&2
+        rm -rf "$probe"; return 1
+    fi
+    rm -rf "$probe"
+}
+
+_download_xray_rules() {
+    local directory="$1" binary="$2" version file url
+    version=$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 \
+        https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest |
+        jq -er '.tag_name | select(type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))') || return 1
+    for file in geosite.dat geoip.dat geosite.dat.sha256sum geoip.dat.sha256sum; do
+        url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/$version/$file"
+        curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 \
+            --max-filesize 67108864 --retry 2 -o "$directory/$file" -- "$url" || return 1
+        chmod 600 "$directory/$file" || return 1
+    done
+    _validate_xray_rules "$directory" "$binary" || return 1
+    jq -n --arg version "$version" --argjson now "$(date +%s)" \
+        '{version:$version,installed_at:$now}' >"$directory/release.json" && chmod 600 "$directory/release.json"
+}
+
+# 通过动态作用域返回暂存目录，生成候选配置时不切换运行中资源。
+_prepare_xray_rules() {
+    local binary="$1" old_valid=false installed=0 now staged
+    XRAY_RULES_PREPARED=''
+    if [[ -L "$CFG/xray-rules" ]] && _validate_xray_rules "$CFG/xray-rules" "$binary"; then
+        old_valid=true
+        installed=$(jq -er '.installed_at | select(type == "number" and . >= 0 and . <= 9999999999 and floor == .)' "$CFG/xray-rules/release.json" 2>/dev/null) || installed=0
+    fi
+    now=$(date +%s) || return 1
+    if [[ "$old_valid" == true && "${XRAY_RULES_FORCE_UPDATE:-false}" != true ]] &&
+       (( now >= installed && now - installed < 86400 )); then
+        XRAY_RULES_PREPARED="$CFG/xray-rules"
+        return 0
+    fi
+    staged=$(mktemp -d "$CFG/.xray-rules.XXXXXX") || return 1
+    if _download_xray_rules "$staged" "$binary"; then
+        XRAY_RULES_PREPARED="$staged"
+        return 0
+    fi
+    rm -rf "$staged"
+    if [[ "$old_valid" == true && "${XRAY_RULES_FORCE_UPDATE:-false}" != true ]]; then
+        _warn "Xray 规则自动更新失败，继续使用已校验的旧规则" >&2
+        XRAY_RULES_PREPARED="$CFG/xray-rules"
+        return 0
+    fi
+    _err "Xray 规则下载或校验失败，拒绝应用"
+    return 1
+}
+
+db_get_xray_routing_rules() {
+    jq -e '
+        (if has("xray_routing_rules") then .xray_routing_rules else [] end) |
+        if type != "array" then error("Xray 规则必须为数组") else . end |
+        sort_by(.order // (.type as $t | ["ai","youtube","twitter","google","cn"] | index($t)))
+    ' "${1:-$DB_FILE}"
+}
+
+_validate_xray_routing_rules() {
+    jq -e '
+        . as $rules | type == "array" and
+        all(.[]; type == "object" and
+            (.type as $t | ["ai","youtube","twitter","google","cn"] | index($t) != null) and
+            (.outbound | type == "string" and test("^(direct|block|warp|chain:[^\\x00-\\x1f\\x7f]+)$")) and
+            ((has("order") | not) or (.order | type == "number" and . >= 0 and floor == .))) and
+        ([.[].type] | length == (unique | length)) and
+        ([.[].type] as $types |
+            all(["ai","youtube"][]; . as $t |
+                ($types | index("google")) == null or ($types | index($t)) == null or
+                ($types | index($t)) < ($types | index("google"))))
+    ' >/dev/null || { _err "Xray 分流规则无效：分类不可重复，AI、YouTube 必须排在 Google 前面"; return 1; }
+}
+
+gen_xray_warp_outbound() {
+    local db_file="${1:-$DB_FILE}" mode
+    mode=$(jq -r '.routing.warp_mode // "wgcf"' "$db_file") || return 1
+    if [[ "$mode" == official ]]; then
+        check_cmd warp-cli && [[ "$WARP_OFFICIAL_PORT" =~ ^[0-9]+$ ]] &&
+            (( WARP_OFFICIAL_PORT >= 1 && WARP_OFFICIAL_PORT <= 65535 )) || {
+            _err "Xray WARP 官方客户端出口不可用"; return 1;
+        }
+        jq -n --argjson port "$WARP_OFFICIAL_PORT" \
+            '{tag:"warp",protocol:"socks",settings:{servers:[{address:"127.0.0.1",port:$port}]}}'
+    elif [[ "$mode" == wgcf && -s "$WARP_CONF_FILE" ]]; then
+        jq -e '
+            def key: type == "string" and test("^[A-Za-z0-9+/]{43}=$");
+            if (.private_key | key) and (.public_key | key) and
+               (.endpoint | type == "string" and test("^(\\[[0-9a-fA-F:]+\\]|[^: ]+):[0-9]+$")) and
+               ([.address_v4,.address_v6] | all(.[]; . == "" or (type == "string" and contains("/")))) and
+               ([.address_v4,.address_v6] | any(.[]; . != "")) and
+               ((.reserved // [0,0,0]) | type == "array" and length == 3 and all(.[]; type == "number" and . >= 0 and . <= 255 and floor == .))
+            then {tag:"warp",protocol:"wireguard",settings:{secretKey:.private_key,
+                address:([.address_v4,.address_v6] | map(select(. != ""))),
+                peers:[{publicKey:.public_key,endpoint:.endpoint,allowedIPs:["0.0.0.0/0","::/0"]}],
+                reserved:(.reserved // [0,0,0]),mtu:1280,noKernelTun:true}}
+            else error("Xray WARP WireGuard 参数无效") end
+        ' "$WARP_CONF_FILE"
+    else
+        _err "Xray WARP 未配置或已禁用"; return 1
+    fi
+}
+
+# 节点池可包含其他核心的节点；任何不能完整表达的字段都必须拒绝。
+gen_xray_chain_outbound() {
+    local name="$1" db_file="${2:-$DB_FILE}" node
+    node=$(jq -ce --arg name "$name" '[.chain_proxy.nodes[]? | select(.name == $name)] |
+        if length == 1 then .[0] else error("链式节点不存在或重名") end' "$db_file") || return 1
+    jq -e --arg tag "chain-$name" '
+        def need($ok; $message): if $ok then . else error($message) end;
+        def text: type == "string";
+        . as $n |
+        need(["socks","http","shadowsocks","vmess","vless","trojan"] | index($n.type) != null; "Xray 不支持该节点协议") |
+        need((keys - ["name","type","server","port","username","password","method","uuid","alterId","cipher",
+            "security","tls","sni","fingerprint","publicKey","shortId","flow","encryption","transport","network",
+            "path","wsPath","host","wsHost","serviceName","insecure","alpn"]) | length == 0; "Xray 无法完整表达节点附加参数") |
+        need((.server | text and length > 0) and (.port | type == "number" and . >= 1 and . <= 65535 and floor == .); "节点地址或端口无效") |
+        need(all([.username?,.password?,.method?,.uuid?,.cipher?,.security?,.sni?,.fingerprint?,.publicKey?,.shortId?,.flow?,.encryption?,.transport?,.network?,.path?,.wsPath?,.host?,.wsHost?,.serviceName?][]; . == null or text); "节点参数类型无效") |
+        need((has("transport") | not) or (has("network") | not) or .transport == .network; "节点传输参数冲突") |
+        need((has("path") | not) or (has("wsPath") | not) or .path == .wsPath; "节点路径参数冲突") |
+        need((has("host") | not) or (has("wsHost") | not) or .host == .wsHost; "节点 Host 参数冲突") |
+        (.transport // .network // "tcp") as $network |
+        (.security // (if .type == "trojan" or .tls == true or .tls == "tls" then "tls" else "none" end)) as $security |
+        (.path // .wsPath // "/") as $path | (.host // .wsHost // "") as $host |
+        need(["tcp","raw","ws","grpc","httpupgrade","http"] | index($network) != null; "Xray 不支持该传输") |
+        need(["none","tls","reality"] | index($security) != null; "Xray 不支持该安全模式") |
+        need((.tls == null or .tls == "" or .tls == false or .tls == true or .tls == "tls") and
+            ((.tls != true and .tls != "tls") or $security == "tls"); "TLS 参数冲突或无法表达") |
+        need((.type == "vless" or (.flow // "") == "" and (.encryption // "none") == "none") and
+            (.type == "vmess" or (.alterId // 0) == 0 and (.cipher // "auto") == "auto") and
+            (.type == "shadowsocks" or (.method // "") == ""); "节点包含不适用于该协议的参数") |
+        need(($security == "reality" or (.publicKey // "") == "" and (.shortId // "") == "") and
+            ($security != "none" or (.sni // "") == "" and (.fingerprint // "") == "" and (.alpn // []) == [] and (.insecure // false) == false); "节点安全参数无法完整表达") |
+        need((.insecure == null or .insecure == false or .insecure == true or .insecure == "0" or .insecure == "1") and
+            (.alpn == null or (.alpn | type == "array" and all(.[]; text))); "TLS 参数无效") |
+        need($security != "reality" or ((.type == "vless" or .type == "trojan") and
+            (.publicKey | text and test("^[A-Za-z0-9_-]{43}$")) and
+            (.shortId // "" | test("^([0-9a-fA-F]{2}){0,8}$"))); "REALITY 参数无效") |
+        need((.type != "trojan" or $security != "none") and
+            ((.type != "socks" and .type != "http" and .type != "shadowsocks") or $network == "tcp" or $network == "raw"); "协议无法表达该传输或安全模式") |
+        need(.type != "shadowsocks" or $security == "none"; "Shadowsocks 不支持该安全封装") |
+        need((.type == "socks" or .type == "http") or (.username // "") == ""; "协议不支持用户名") |
+        need((.type == "vmess" or .type == "vless") or (.uuid // "") == ""; "协议不支持 UUID") |
+        need($security != "reality" or ((.insecure // false) == false and (.alpn // []) == []); "REALITY 无法表达节点的 TLS 附加参数") |
+        need($network != "grpc" or (.serviceName // "") == "" or $path == "/" or $path == "" or
+            $path == .serviceName; "gRPC 路径与服务名冲突") |
+        need((.type != "vmess" and .type != "vless") or ((.uuid | text and length > 0) and (.password // "") == ""); "节点 UUID 或认证参数无效") |
+        need((.type != "trojan" and .type != "shadowsocks") or (.password | text and length > 0); "节点缺少密码") |
+        need(.type != "shadowsocks" or (.method | text and length > 0); "节点缺少加密方法") |
+        need(.type != "vmess" or (.alterId // 0 | tonumber) == 0; "Xray 不支持旧版 VMess alterId") |
+        need((.flow // "") == "" or (.flow == "xtls-rprx-vision" and ($network == "tcp" or $network == "raw")); "Xray 不支持该流控组合") |
+        need(($network == "ws" or $network == "httpupgrade" or $network == "http" or $network == "grpc") or
+            (($path == "" or $path == "/") and $host == "" and (.serviceName // "") == ""); "节点含无法表达的传输参数") |
+        need($network == "grpc" or (.serviceName // "") == ""; "非 gRPC 节点包含服务名") |
+        need($network != "grpc" or $host == ""; "gRPC 节点包含无法表达的 Host") |
+        {tag:$tag,protocol:.type,settings:
+            (if .type == "socks" or .type == "http" then {servers:[{address:.server,port:.port} +
+                (if (.username // "") != "" or (.password // "") != "" then {users:[{user:(.username // ""),pass:(.password // "") }]} else {} end)]}
+             elif .type == "shadowsocks" then {servers:[{address:.server,port:.port,method:.method,password:.password}]}
+             elif .type == "trojan" then {servers:[{address:.server,port:.port,password:.password}]}
+             else {vnext:[{address:.server,port:.port,users:[{id:.uuid} +
+                (if .type == "vmess" then {alterId:0,security:(.cipher // "auto")}
+                 else {encryption:(.encryption // "none"),flow:(.flow // "")} end)]}]} end),
+         streamSettings:({network:(if $network == "tcp" then "raw" elif $network == "http" then "h2" else $network end),security:$security} +
+            (if $security == "tls" then {tlsSettings:({serverName:(if (.sni // "") == "" then .server else .sni end),
+                allowInsecure:(.insecure == true or .insecure == "1")} +
+                (if .fingerprint then {fingerprint:.fingerprint} else {} end) + (if .alpn then {alpn:.alpn} else {} end))}
+             elif $security == "reality" then {realitySettings:{serverName:(.sni // ""),fingerprint:(.fingerprint // "chrome"),
+                publicKey:.publicKey,shortId:(.shortId // "")}} else {} end) +
+            (if $network == "ws" then {wsSettings:{path:$path,headers:{Host:$host}}}
+             elif $network == "grpc" then {grpcSettings:{serviceName:(if (.serviceName // "") != "" then .serviceName elif $path == "/" then "" else $path end)}}
+             elif $network == "httpupgrade" then {httpupgradeSettings:{path:$path,host:$host}}
+             elif $network == "http" then {httpSettings:{path:$path,host:(if $host == "" then [] else [$host] end)}} else {} end))}
+    ' <<<"$node" || { _err "Xray 无法完整表达链式节点: $name"; return 1; }
+}
+
+_add_xray_routing_config() {
+    local candidate="$1" db_file="$2" rules outbounds='[]' outbound generated tmp
+    rules=$(db_get_xray_routing_rules "$db_file") || return 1
+    _validate_xray_routing_rules <<<"$rules" || return 1
+    [[ "$rules" != '[]' ]] || return 0
+    while IFS= read -r outbound; do
+        case "$outbound" in
+            direct) continue ;;
+            block) generated='{"protocol":"blackhole","tag":"block"}' ;;
+            warp) generated=$(gen_xray_warp_outbound "$db_file") || return 1 ;;
+            chain:*) generated=$(gen_xray_chain_outbound "${outbound#chain:}" "$db_file") || return 1 ;;
+            *) return 1 ;;
+        esac
+        outbounds=$(jq --argjson outbound "$generated" '. + [$outbound]' <<<"$outbounds") || return 1
+    done < <(jq -r '[.[].outbound] | unique[]' <<<"$rules")
+    tmp="${candidate}.routing"
+    if ! jq --argjson rules "$rules" --argjson outbounds "$outbounds" '
+        def tag: if startswith("chain:") then "chain-" + ltrimstr("chain:") else . end;
+        .outbounds += $outbounds |
+        .inbounds |= map(. + {sniffing:{enabled:true,destOverride:["http","tls","quic"],routeOnly:true}}) |
+        .dns = {servers:["localhost"]} |
+        .routing = {domainStrategy:"IPOnDemand",rules:
+            ([$rules[] | {type:"field",domain:["geosite:" +
+                ({ai:"category-ai-!cn",youtube:"youtube",twitter:"twitter",google:"google",cn:"cn"}[.type])],
+                outboundTag:(.outbound | tag)}] +
+             [$rules[] | select(.type == "twitter" or .type == "cn") |
+                {type:"field",ip:["geoip:" + (if .type == "twitter" then "twitter" else "cn" end)],outboundTag:(.outbound | tag)}])}
+    ' "$candidate" >"$tmp" || ! mv -f "$tmp" "$candidate"; then rm -f "$tmp"; return 1; fi
+}
+
+# Xray 独立保存分流，首个 outbound 始终是未匹配流量的直连出口。
 generate_xray_config() {
     local output_file="${1:-$CFG/xray.json}" db_file="${2:-$DB_FILE}" candidate_dir candidate check_log binary listen
     binary=$(_lite_xray_binary) || return 1
@@ -8070,14 +8341,29 @@ generate_xray_config() {
         rm -rf "$candidate_dir"
         return 1
     fi
-    check_log=$(mktemp "$candidate_dir/.xray-check.XXXXXX") || { rm -rf "$candidate_dir"; return 1; }
-    if ! "$binary" run -test -format json -c "$candidate" >"$check_log" 2>&1; then
+    local rules_directory="$CFG/xray-rules" XRAY_RULES_PREPARED_LOCAL=''
+    if ! _add_xray_routing_config "$candidate" "$db_file"; then rm -rf "$candidate_dir"; return 1; fi
+    if jq -e 'has("routing")' "$candidate" >/dev/null; then
+        if ! _prepare_xray_rules "$binary"; then rm -rf "$candidate_dir"; return 1; fi
+        rules_directory="$XRAY_RULES_PREPARED"
+        XRAY_RULES_PREPARED_LOCAL="$XRAY_RULES_PREPARED"
+    fi
+    check_log=$(mktemp "$candidate_dir/.xray-check.XXXXXX") || { _discard_xray_rules "$XRAY_RULES_PREPARED_LOCAL"; rm -rf "$candidate_dir"; return 1; }
+    if ! XRAY_LOCATION_ASSET="$rules_directory" "$binary" run -test -format json -c "$candidate" >"$check_log" 2>&1; then
         _err "Xray 配置校验失败"
         cat "$check_log" >&2 || true
+        _discard_xray_rules "$XRAY_RULES_PREPARED_LOCAL"
         rm -rf "$candidate_dir"
         return 1
     fi
+    if [[ "${XRAY_RULES_DEFER:-false}" != true ]]; then
+        if ! _snapshot_xray_rules "$candidate_dir" || ! _xray_commit_rules "$XRAY_RULES_PREPARED_LOCAL"; then
+            _discard_xray_rules "$XRAY_RULES_PREPARED_LOCAL"; rm -rf "$candidate_dir"; return 1
+        fi
+    fi
     if ! rm -f "$check_log" || ! mv -f "$candidate" "$output_file"; then
+        [[ "${XRAY_RULES_DEFER:-false}" == true ]] || _restore_xray_rules "$candidate_dir"
+        _discard_xray_rules "$XRAY_RULES_PREPARED_LOCAL"
         rm -rf "$candidate_dir"
         return 1
     fi
@@ -8140,6 +8426,7 @@ _restore_xray_config_transaction() {
             svc disable sing-xray || return 1
         fi
     fi
+    _restore_xray_rules "$snapshot" || return 1
     for file in "$@"; do
         if [[ -f "$snapshot/$index" ]]; then
             staged=$(mktemp "${file}.restore.XXXXXX") || return 1
@@ -8204,19 +8491,21 @@ _apply_xray_user_change() {
 _apply_xray_config_locked() {
     local record="$1" action="$2" old_port="$3" protocol="$4" snapshot file index=0 key remaining
     local runtime_changed=false activation_attempted=false success=false operation=start
+    local XRAY_RULES_DEFER=true XRAY_RULES_PREPARED=''
     case "$action" in
         add|replace|remove)
             case "$protocol" in vless|vless-xhttp|vless-enc) ;; *) return 1 ;; esac
             [[ "$action" == add || "$old_port" =~ ^[0-9]+$ || ( "$action" == remove && "$old_port" == all ) ]] || return 1 ;;
         user-add|user-remove|user-enabled)
             case "$protocol" in vless|vless-xhttp|vless-enc) ;; *) return 1 ;; esac ;;
-        rebuild) ;;
+        rebuild|routing) ;;
         *) return 1 ;;
     esac
     local -a files=("$DB_FILE" "$CFG/xray.json" "$CFG/join.txt" "$CFG/role"
         "$SYSTEMD_DIR/sing-xray.service" "$OPENRC_DIR/sing-xray"
         "$CFG/vless.join" "$CFG/vless-xhttp.join" "$CFG/vless-enc.join")
     snapshot=$(mktemp -d "$CFG/.xray-config.XXXXXX") || return 1
+    _snapshot_xray_rules "$snapshot" || { rm -rf "$snapshot"; return 1; }
     if [[ "$action" == user-* ]]; then
         # Restart rollback must preserve existing units and service enablement.
         touch "$snapshot/runtime-only" || { rm -rf "$snapshot"; return 1; }
@@ -8239,6 +8528,7 @@ _apply_xray_config_locked() {
         def accounts:
             if has("users") then . else .users=[{name:"default",uuid:.uuid,enabled:true}] end;
         if $action == "rebuild" then .
+        elif $action == "routing" then .xray_routing_rules = $record
         elif $action == "user-add" or $action == "user-remove" or $action == "user-enabled" then
             .xray[$protocol] as $original |
             [$original | records | accounts] as $current |
@@ -8278,12 +8568,14 @@ _apply_xray_config_locked() {
         end
     ' "$DB_FILE" >"$snapshot/next-db.json" ||
        ! generate_xray_config "$snapshot/candidate.json" "$snapshot/next-db.json"; then
+        _discard_xray_rules "$XRAY_RULES_PREPARED"
         rm -rf "$snapshot"
         return 1
     fi
     remaining=$(jq '[.xray | to_entries[] | select(.key == "vless" or .key == "vless-xhttp" or .key == "vless-enc") |
         .value | if type == "array" then .[] else . end] | length' "$snapshot/next-db.json") || { rm -rf "$snapshot"; return 1; }
     if { [[ "$action" == rebuild ]] || { chmod 600 "$snapshot/next-db.json" && mv -f "$snapshot/next-db.json" "$DB_FILE"; }; } &&
+       _xray_commit_rules "$XRAY_RULES_PREPARED" &&
        mv -f "$snapshot/candidate.json" "$CFG/xray.json"; then
         success=true
         for key in vless vless-xhttp vless-enc; do
@@ -8300,6 +8592,16 @@ _apply_xray_config_locked() {
                    rm -f "$CFG/xray.json" "$SYSTEMD_DIR/sing-xray.service" "$OPENRC_DIR/sing-xray" &&
                    { [[ "$DISTRO" == alpine ]] || systemctl daemon-reload; }; then
                     success=true
+                fi
+            elif [[ "$action" == routing ]]; then
+                runtime_changed=true
+                if create_xray_service; then
+                    if [[ -f "$snapshot/running" ]]; then
+                        activation_attempted=true
+                        svc restart sing-xray && _wait_for_owned_service sing-xray && success=true
+                    else
+                        success=true
+                    fi
                 fi
             elif [[ "$action" == user-* || ( "$action" == rebuild && "${XRAY_ACTIVATE_SERVICE:-false}" != true ) ]]; then
                 if [[ -f "$snapshot/running" ]]; then
@@ -8332,6 +8634,7 @@ _apply_xray_config_locked() {
         _err "Xray 恢复失败，快照保留: $snapshot"
         return 1
     fi
+    _discard_xray_rules "$XRAY_RULES_PREPARED"
     rm -rf "$snapshot"
     _err "Xray 配置变更失败，已恢复原配置"
     return 1
@@ -8349,6 +8652,124 @@ rebuild_and_reload_xray() {
     _apply_xray_config_locked '{}' rebuild '' '' || result=1
     _db_lock_release
     return "$result"
+}
+
+_apply_xray_routing_rules() {
+    local rules="$1" result=0
+    _validate_xray_routing_rules <<<"$rules" || return 1
+    _db_lock_acquire || return 1
+    _apply_xray_config_locked "$rules" routing '' '' || result=1
+    _db_lock_release
+    return "$result"
+}
+
+update_xray_rules() {
+    local XRAY_RULES_FORCE_UPDATE=true rules
+    rules=$(db_get_xray_routing_rules) || return 1
+    [[ "$rules" != '[]' ]] || { _err "请先配置 Xray 分流规则"; return 1; }
+    _apply_xray_routing_rules "$rules"
+}
+
+# 共享节点和 WARP 变更：两个核心均检查成功后提交；任一重启失败一起恢复。
+_apply_shared_routing_change() {
+    local result=0
+    _db_lock_acquire || return 1
+    _apply_shared_routing_change_locked "$@" || result=1
+    _db_lock_release
+    return "$result"
+}
+
+_apply_shared_routing_change_locked() {
+    local snapshot file staged index=0 core success=false restore_ok=true
+    local update_singbox=false update_xray=false
+    local XRAY_RULES_DEFER=true XRAY_RULES_PREPARED=''
+    local -a files=("$DB_FILE" "$CFG/singbox.json" "$CFG/xray.json" "$WARP_CONF_FILE"
+        "$SYSTEMD_DIR/sing-xray.service" "$OPENRC_DIR/sing-xray" "$CFG/.managed_warp")
+    snapshot=$(mktemp -d "$CFG/.shared-routing.XXXXXX") || return 1
+    _snapshot_xray_rules "$snapshot" || { rm -rf "$snapshot"; return 1; }
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]] && ! cp -p "$file" "$snapshot/$index"; then rm -rf "$snapshot"; return 1; fi
+        index=$((index + 1))
+    done
+    if ! jq "$@" "$DB_FILE" >"$snapshot/next-db.json"; then rm -rf "$snapshot"; return 1; fi
+    if [[ -n "$(get_singbox_protocols)" ]] &&
+       { [[ -f "$CFG/singbox.json" ]] || jq -e '(.routing_rules // []) | length > 0' "$DB_FILE" >/dev/null; }; then
+        update_singbox=true
+    fi
+    if [[ -n "$(get_xray_protocols)" ]] &&
+       { jq -e '(.xray_routing_rules // []) | length > 0' "$DB_FILE" >/dev/null ||
+         jq -e '(.xray_routing_rules // []) | length > 0' "$snapshot/next-db.json" >/dev/null; }; then
+        update_xray=true
+    fi
+    for core in singbox xray; do
+        if [[ "$core" == singbox && "$update_singbox" == true || "$core" == xray && "$update_xray" == true ]]; then
+            if svc status "sing-$core" >/dev/null 2>&1; then touch "$snapshot/$core-running" || { rm -rf "$snapshot"; return 1; }; fi
+        fi
+    done
+    # WGCF 文件与数据库在同一个锁下暂存，生成器只能看到本次候选账户。
+    if { [[ -z "${SHARED_WARP_CANDIDATE:-}" ]] || _replace_xray_file "$SHARED_WARP_CANDIDATE" "$WARP_CONF_FILE"; } &&
+       { [[ "$update_singbox" != true ]] || generate_singbox_config "$snapshot/singbox.json" "$snapshot/next-db.json"; } &&
+       { [[ "$update_xray" != true ]] || generate_xray_config "$snapshot/xray.json" "$snapshot/next-db.json"; } &&
+       _shared_routing_changed_candidates "$snapshot" &&
+       chmod 600 "$snapshot/next-db.json" && mv -f "$snapshot/next-db.json" "$DB_FILE" &&
+       _xray_commit_rules "$XRAY_RULES_PREPARED" &&
+       { [[ "$update_singbox" != true ]] || mv -f "$snapshot/singbox.json" "$CFG/singbox.json"; } &&
+       { [[ "$update_xray" != true ]] || { mv -f "$snapshot/xray.json" "$CFG/xray.json" && create_xray_service; }; }; then
+        success=true
+        for core in singbox xray; do
+            if [[ -f "$snapshot/$core-running" &&
+                  ( "$core" == singbox && "$update_singbox" == true || "$core" == xray && "$update_xray" == true ) ]]; then
+                touch "$snapshot/$core-attempted" || { success=false; break; }
+                if ! svc restart "sing-$core" || ! _shared_routing_ready "$core"; then success=false; break; fi
+            fi
+        done
+    fi
+    if [[ "$success" == true ]]; then rm -rf "$snapshot"; return 0; fi
+    for core in singbox xray; do
+        if [[ -f "$snapshot/$core-attempted" ]] && ! svc stop "sing-$core"; then
+            _err "共享出口服务停止失败，快照保留: $snapshot"
+            return 1
+        fi
+    done
+    _restore_xray_rules "$snapshot" || restore_ok=false
+    index=0
+    for file in "${files[@]}"; do
+        if [[ -f "$snapshot/$index" ]]; then
+            _replace_xray_file "$snapshot/$index" "$file" || restore_ok=false
+        else
+            rm -f "$file" || restore_ok=false
+        fi
+        index=$((index + 1))
+    done
+    if [[ "$update_xray" == true && "$DISTRO" != alpine ]]; then systemctl daemon-reload || restore_ok=false; fi
+    for core in singbox xray; do
+        if [[ -f "$snapshot/$core-attempted" ]]; then
+            svc start "sing-$core" && _shared_routing_ready "$core" || restore_ok=false
+        fi
+    done
+    if [[ "$restore_ok" != true ]]; then _err "共享出口恢复失败，快照保留: $snapshot"; return 1; fi
+    _discard_xray_rules "$XRAY_RULES_PREPARED"
+    rm -rf "$snapshot"
+    _err "共享出口变更失败，已恢复数据库、配置、规则资源和服务状态"
+    return 1
+}
+
+# 共享池内未被某核心引用的节点变化，不应重启该核心。
+_shared_routing_changed_candidates() {
+    local snapshot="$1"
+    if [[ "$update_singbox" == true ]] && cmp -s "$snapshot/singbox.json" "$CFG/singbox.json"; then
+        update_singbox=false
+    fi
+    if [[ "$update_xray" == true &&
+          ( -z "$XRAY_RULES_PREPARED" || "$XRAY_RULES_PREPARED" == "$CFG/xray-rules" ) ]] &&
+       cmp -s "$snapshot/xray.json" "$CFG/xray.json"; then
+        update_xray=false
+    fi
+    return 0
+}
+
+_shared_routing_ready() {
+    if [[ "$1" == singbox ]]; then _wait_for_singbox_ready; else _wait_for_owned_service sing-xray; fi
 }
 
 _apply_singbox_snell_change() {
@@ -8370,6 +8791,7 @@ create_server_scripts() {
 umask 077
 CFG="/etc/sing-lite"
 export PATH="$CFG/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export XRAY_LOCATION_ASSET="$CFG/xray-rules"
 LOG_FILE="/var/log/sing-watchdog.log"
 MAX_RESTARTS=5           # 冷却期内最大重启次数
 COOLDOWN_PERIOD=300      # 冷却期（秒）
@@ -8962,7 +9384,7 @@ ensure_xray_runtime_consistency() {
     is_paused && return 0
     [[ -x "$CFG/bin/xray" ]] || return 0
     if [[ ! -f "$CFG/xray.json" ]] ||
-       ! "$CFG/bin/xray" run -test -format json -c "$CFG/xray.json" >/dev/null 2>&1; then
+       ! XRAY_LOCATION_ASSET="$CFG/xray-rules" "$CFG/bin/xray" run -test -format json -c "$CFG/xray.json" >/dev/null 2>&1; then
         _info '检测到 Xray 配置缺失或无效，正在自动重建...'
         rebuild_and_reload_xray start || return 1
         _ok 'Xray 配置已自动修复'
@@ -9014,12 +9436,28 @@ _auto_update_system_script() {
                 _warn "系统脚本同步失败，保留现有快捷命令"
                 return 1
             fi
-            ln -sf "$system_script" /usr/local/bin/sing 2>/dev/null || return 1
-            ln -sf "$system_script" /usr/bin/sing 2>/dev/null || return 1
-            hash -r 2>/dev/null
             _ok "系统脚本已同步更新 (v$VERSION)"
         fi
     fi
+    [[ ! -f "$system_script" ]] || _sync_shortcut_links "$system_script"
+}
+
+_remove_legacy_shortcut_links() {
+    local system_script="$1" legacy
+    for legacy in /usr/local/bin/sing /usr/bin/sing; do
+        if [[ -L "$legacy" && "$(readlink "$legacy")" == "$system_script" ]]; then
+            rm -f "$legacy" || return 1
+        fi
+    done
+    return 0
+}
+
+_sync_shortcut_links() {
+    local system_script="$1"
+    ln -sf "$system_script" /usr/local/bin/vless 2>/dev/null || return 1
+    ln -sf "$system_script" /usr/bin/vless 2>/dev/null || return 1
+    _remove_legacy_shortcut_links "$system_script" || return 1
+    hash -r 2>/dev/null
 }
 
 create_shortcut() {
@@ -9065,16 +9503,14 @@ create_shortcut() {
 
     chmod 755 "$system_script" 2>/dev/null || return 1
 
-    # 创建软链接
-    ln -sf "$system_script" /usr/local/bin/sing 2>/dev/null || return 1
-    ln -sf "$system_script" /usr/bin/sing 2>/dev/null || return 1
-    hash -r 2>/dev/null
+    _sync_shortcut_links "$system_script" || return 1
 
-    _ok "快捷命令已创建: sing"
+    _ok "快捷命令已创建: vless"
 }
 
 remove_shortcut() {
-    rm -f /usr/local/bin/sing /usr/local/bin/sing-lite.sh /usr/bin/sing 2>/dev/null
+    _remove_legacy_shortcut_links /usr/local/bin/sing-lite.sh || return 1
+    rm -f /usr/local/bin/vless /usr/local/bin/sing-lite.sh /usr/bin/vless 2>/dev/null || return 1
     _ok "快捷命令已移除"
 }
 
@@ -9093,7 +9529,8 @@ WARP_OFFICIAL_PORT=40000  # 官方客户端 SOCKS5 端口
 db_set_warp_mode() {
     local mode="$1"
     [[ ! -f "$DB_FILE" ]] && init_db
-    _db_apply --arg m "$mode" '.routing.warp_mode = $m' || return 1
+    case "$mode" in wgcf|official|disabled) ;; *) return 1 ;; esac
+    _apply_shared_routing_change --arg m "$mode" '.routing.warp_mode = $m' || return 1
     : >"$CFG/.managed_warp"
 }
 
@@ -9322,7 +9759,11 @@ register_warp() {
 
     # 解析配置并保存到 JSON
     echo -ne "  ${C}▸${NC} 保存配置..."
-    parse_and_save_warp_config "$warp_tmp/wgcf-profile.conf"
+    if ! parse_and_save_warp_config "$warp_tmp/wgcf-profile.conf"; then
+        cd "$old_pwd" || true
+        rm -rf "$warp_tmp"
+        return 1
+    fi
     cd "$old_pwd" || true
     rm -rf "$warp_tmp"
     echo -e " ${G}✓${NC}"
@@ -9432,8 +9873,10 @@ parse_and_save_warp_config() {
         fi
     done
 
-    mkdir -p "$CFG"
-    jq -n \
+    mkdir -p "$CFG" || return 1
+    local candidate result=0
+    candidate=$(mktemp "$CFG/.warp-account.XXXXXX") || return 1
+    if ! jq -n \
         --arg pk "$private_key" \
         --arg pub "$public_key" \
         --arg v4 "$address_v4" \
@@ -9446,7 +9889,11 @@ parse_and_save_warp_config() {
         address_v6: $v6,
         endpoint: $ep,
         reserved: [0, 0, 0]
-    }' > "$WARP_CONF_FILE"
+    }' >"$candidate" || ! chmod 600 "$candidate"; then rm -f "$candidate"; return 1; fi
+    local SHARED_WARP_CANDIDATE="$candidate"
+    _apply_shared_routing_change '.routing.warp_mode="wgcf"' || result=1
+    rm -f "$candidate"
+    return "$result"
 }
 
 
@@ -9526,15 +9973,12 @@ test_warp_connection() {
 refresh_warp_wgcf() {
     _info "重新获取 WARP (WGCF) 配置..."
 
-    # 删除旧配置
-    rm -f "$WARP_CONF_FILE"
+    # 旧账户保留至候选配置通过检查并完成两个核心的事务。
     rm -f /usr/local/bin/wgcf
     rm -f ~/.wgcf-account.toml 2>/dev/null
 
     # 重新注册
     if register_warp; then
-        db_set_warp_mode "wgcf"
-        _regenerate_proxy_configs
         _ok "WARP (WGCF) 配置已更新"
         return 0
     fi
@@ -9893,12 +10337,9 @@ configure_warp_official() {
         return 1
     fi
 
-    # 保存模式到数据库
+    # 先完成交互验证，再将共享出口提交给两个核心。
+    _get_warp_official_ip || return 1
     db_set_warp_mode "official"
-
-    # 获取 WARP 出口 IP (带重试和多源)
-    _get_warp_official_ip
-    return $?
 }
 
 # 获取 WARP 官方客户端出口 IP (带重试机制)
@@ -9973,7 +10414,6 @@ _get_warp_official_ip() {
             *)
                 _err "配置已取消"
                 warp-cli disconnect 2>/dev/null
-                db_set_warp_mode "wgcf"
                 return 1
                 ;;
         esac
@@ -10062,26 +10502,24 @@ uninstall_warp_official() {
 
 # 卸载 WARP (支持双模式)
 uninstall_warp() {
-    local warp_mode=$(db_get_warp_mode)
+    local warp_mode
+    warp_mode=$(db_get_warp_mode) || return 1
     _info "卸载 WARP..."
-
-    if [[ "$warp_mode" == "official" ]]; then
-        uninstall_warp_official
+    _apply_shared_routing_change '
+        .routing.warp_mode="disabled" |
+        .routing_rules = [.routing_rules[]? | select(.outbound != "warp")] |
+        .xray_routing_rules = [.xray_routing_rules[]? | select(.outbound != "warp")] |
+        if .singbox then .singbox |= with_entries(.value |=
+            (if type == "array" then map(if .users then .users |= map(if (.routing // "" | startswith("warp")) then del(.routing) else . end) else . end)
+             elif .users then .users |= map(if (.routing // "" | startswith("warp")) then del(.routing) else . end) else . end)) else . end
+    ' || return 1
+    if [[ "$warp_mode" == official ]]; then
+        uninstall_warp_official || return 1
     else
-        # 卸载 WGCF
-        rm -f "$WARP_CONF_FILE"
-        rm -f /usr/local/bin/wgcf
-        rm -f ~/.wgcf-account.toml 2>/dev/null
-        _ok "WARP (WGCF) 已卸载"
+        rm -f "$WARP_CONF_FILE" /usr/local/bin/wgcf ~/.wgcf-account.toml
     fi
-
-    # 清除模式设置和分流配置
-    db_set_warp_mode "wgcf"
-    db_clear_routing_rules
-
-    # 重新生成配置 (移除 WARP outbound)
-    _regenerate_proxy_configs
-    _ok "WARP 已完全卸载"
+    : >"$CFG/.managed_warp"
+    _ok "WARP 已完全卸载，相关分类已恢复默认直连"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -10857,7 +11295,7 @@ show_routing_status() {
         # 兜底展示异常值，避免界面空白
         *) direct_display="${Y}未知 ($direct_ip_version)${NC}" ;;
     esac
-    echo -e "  直连: ${G}$direct_display${NC}"
+    echo -e "  Sing-box 直连: ${G}$direct_display${NC}"
 
     # WARP 状态
     case "$warp_st" in
@@ -10885,8 +11323,8 @@ show_routing_status() {
     fi
 
     _line
-    echo -e "  ${C}分流规则（汇总）${NC}"
-    echo -e "  ${D}各内核的匹配顺序可在“调整规则顺序”中查看${NC}"
+    echo -e "  ${C}Sing-box 分流规则${NC}"
+    echo -e "  ${D}两个内核分别在“配置分流规则”中管理顺序和出口${NC}"
     _line
 
     # 显示分流规则 (优化：一次性提取所有字段，避免多次调用 jq)
@@ -10939,6 +11377,15 @@ show_routing_status() {
         [[ $rule_count -eq 0 ]] && echo -e "  ${D}未配置分流规则${NC}"
     else
         echo -e "  ${D}未配置分流规则${NC}"
+    fi
+    _line
+    echo "  Xray 独立分流（未匹配直连）"
+    local xray_rules
+    xray_rules=$(db_get_xray_routing_rules) || return 1
+    if [[ "$xray_rules" == '[]' ]]; then
+        echo "  未配置分类，所有流量直连"
+    else
+        jq -r '.[] | "  " + ({ai:"AI",youtube:"YouTube",twitter:"X",google:"Google",cn:"国内流量"}[.type]) + " → " + .outbound' <<<"$xray_rules"
     fi
     _line
 }
@@ -11223,8 +11670,117 @@ manage_access_restrictions() {
     done
 }
 
-# 配置分流规则
+# 配置分流规则：仅装一个核心时不增加选择步骤。
 configure_routing_rules() {
+    local singbox_protocols xray_protocols choice
+    singbox_protocols=$(get_singbox_protocols) || :
+    xray_protocols=$(get_xray_protocols) || :
+    if [[ -n "$singbox_protocols" && -n "$xray_protocols" ]]; then
+        _item 1 "Sing-box 分流"
+        _item 2 "Xray 独立分流"
+        _item 0 "返回"
+        read -rp "  选择内核: " choice || return
+        case "$choice" in
+            1) configure_singbox_routing_rules ;;
+            2) configure_xray_routing_rules ;;
+            0) return ;;
+            *) _err "无效选择"; return 1 ;;
+        esac
+    elif [[ -n "$xray_protocols" ]]; then
+        configure_xray_routing_rules
+    elif [[ -n "$singbox_protocols" ]]; then
+        configure_singbox_routing_rules
+    else
+        _err "请先安装 Sing-box 或 Xray 协议"; return 1
+    fi
+}
+
+_select_xray_outbound() {
+    local choice name generated
+    _item 1 "直连"
+    _item 2 "拦截"
+    _item 3 "WARP（复用现有账户）"
+    _item 4 "链式节点（Xray 原生出口）"
+    _item 0 "返回"
+    read -rp "  选择出口: " choice || return 1
+    case "$choice" in
+        1) XRAY_SELECTED_OUTBOUND=direct ;;
+        2) XRAY_SELECTED_OUTBOUND=block ;;
+        3)
+            generated=$(gen_xray_warp_outbound) || return 1
+            XRAY_SELECTED_OUTBOUND=warp ;;
+        4)
+            jq -r '.chain_proxy.nodes[]? | "  " + .name + " (" + .type + ")"' "$DB_FILE"
+            read -rp "  输入节点名称: " name || return 1
+            generated=$(gen_xray_chain_outbound "$name") || return 1
+            XRAY_SELECTED_OUTBOUND="chain:$name" ;;
+        *) return 1 ;;
+    esac
+}
+
+_move_xray_routing_rule() {
+    local rules="$1" from="$2" to="$3" next count
+    [[ "$from" =~ ^[1-9][0-9]{0,8}$ && "$to" =~ ^[1-9][0-9]{0,8}$ ]] || { _err "无效规则序号"; return 1; }
+    count=$(jq 'length' <<<"$rules") || return 1
+    (( from <= count && to <= count )) || { _err "无效规则序号"; return 1; }
+    next=$(jq --argjson from "$((from-1))" --argjson to "$((to-1))" '
+        .[$from] as $selected | del(.[$from]) | .[:$to] + [$selected] + .[$to:] |
+        to_entries | map(.value + {order:.key})' <<<"$rules") || return 1
+    _validate_xray_routing_rules <<<"$next" || return 1
+    printf '%s\n' "$next"
+}
+
+configure_xray_routing_rules() {
+    local rules next choice category index from to XRAY_SELECTED_OUTBOUND=''
+    rules=$(db_get_xray_routing_rules) || return 1
+    while true; do
+        _header
+        echo "  Xray 独立分流（IPv4 + IPv6）"
+        echo "  来源: Loyalsoldier/v2ray-rules-dat 成品 DAT"
+        echo "  site → non_ip（空）→ ip → 未匹配直连"
+        echo "  AI、YouTube 必须在 Google 前面；修改后选择应用配置"
+        jq -r 'to_entries[] | "  " + ((.key+1)|tostring) + ". " +
+            ({ai:"AI",youtube:"YouTube",twitter:"X",google:"Google",cn:"国内流量"}[.value.type]) +
+            " → " + .value.outbound' <<<"$rules"
+        _item 1 "新增／修改分类出口"
+        _item 2 "删除分类"
+        _item 3 "调整顺序"
+        _item 4 "应用配置"
+        _item 5 "更新已应用的规则集"
+        _item 0 "返回（放弃未应用修改）"
+        read -rp "  请选择: " choice || return
+        case "$choice" in
+            1)
+                echo "  1. AI  2. YouTube  3. X  4. Google  5. 国内流量  0. 返回"
+                read -rp "  选择分类: " category || return
+                case "$category" in
+                    1) category=ai ;; 2) category=youtube ;; 3) category=twitter ;;
+                    4) category=google ;; 5) category=cn ;; *) continue ;;
+                esac
+                _select_xray_outbound || { _pause; continue; }
+                next=$(jq --arg type "$category" --arg outbound "$XRAY_SELECTED_OUTBOUND" '
+                    if any(.[]; .type == $type) then map(if .type == $type then .outbound=$outbound else . end)
+                    else . + [{type:$type,outbound:$outbound}] |
+                        sort_by(.type as $t | ["ai","youtube","twitter","google","cn"] | index($t)) end |
+                    to_entries | map(.value + {order:.key})' <<<"$rules") || return 1
+                rules="$next" ;;
+            2)
+                read -rp "  删除第几条规则（0 返回）: " index || return
+                [[ "$index" =~ ^[1-9][0-9]{0,8}$ ]] || continue
+                rules=$(jq --argjson index "$((index-1))" 'del(.[$index]) | to_entries | map(.value + {order:.key})' <<<"$rules") || return 1 ;;
+            3)
+                read -rp "  移动第几条规则: " from || return
+                read -rp "  移动到第几位: " to || return
+                if next=$(_move_xray_routing_rule "$rules" "$from" "$to"); then rules="$next"; fi ;;
+            4) _apply_xray_routing_rules "$rules" && _ok "Xray 分流已应用，未匹配流量直连"; _pause ;;
+            5) update_xray_rules && _ok "Xray 规则集已更新"; _pause ;;
+            0) return ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
+configure_singbox_routing_rules() {
     local choice
     while true; do
         _header
@@ -11239,7 +11795,7 @@ configure_routing_rules() {
             1) _add_routing_rule ;;
             2) _del_routing_rule ;;
             3) _reorder_routing_rules ;;
-            4) _regenerate_proxy_configs && _ok "Sing-box 分流配置已应用" ;;
+            4) _regenerate_singbox_routing_config && _ok "Sing-box 分流配置已应用" ;;
             0) return ;;
             *) _err "无效选择" ;;
         esac
@@ -11705,8 +12261,6 @@ manage_warp() {
             1)
                 # 配置 WGCF
                 if register_warp; then
-                    db_set_warp_mode "wgcf"
-                    _regenerate_proxy_configs
                     _ok "WGCF 模式配置完成"
                 fi
                 _pause
@@ -11721,7 +12275,6 @@ manage_warp() {
                 fi
                 if install_warp_official; then
                     if configure_warp_official; then
-                        _regenerate_proxy_configs
                         _ok "官方客户端模式配置完成"
                     fi
                 fi
@@ -11737,13 +12290,11 @@ manage_warp() {
                 if [[ "$current_mode" == "official" ]]; then
                     # 切换到 WGCF
                     _info "切换到 WGCF 模式..."
-                    warp-cli disconnect 2>/dev/null
-                    # 停止 warp-svc 服务，避免与 WGCF 冲突
-                    systemctl stop warp-svc 2>/dev/null
-                    systemctl disable warp-svc 2>/dev/null
                     if register_warp; then
-                        db_set_warp_mode "wgcf"
-                        _regenerate_proxy_configs
+                        # 新出口已提交后才停用旧客户端，失败时旧账户仍可用。
+                        warp-cli disconnect 2>/dev/null
+                        systemctl stop warp-svc 2>/dev/null
+                        systemctl disable warp-svc 2>/dev/null
                         _ok "已切换到 WGCF 模式"
                     fi
                 else
@@ -11756,7 +12307,6 @@ manage_warp() {
                     _info "切换到官方客户端模式..."
                     if install_warp_official; then
                         if configure_warp_official; then
-                            _regenerate_proxy_configs
                             _ok "已切换到官方客户端模式"
                         fi
                     fi
@@ -11849,9 +12399,9 @@ manage_routing() {
         _item "1" "WARP 管理"
         _item "2" "链式代理"
         _item "3" "配置分流规则"
-        _item "4" "直连出口设置"
-        _item "5" "多IP入出站配置"
-        _item "6" "访问限制"
+        _item "4" "直连出口设置 (Sing-box)"
+        _item "5" "多IP入出站配置 (Sing-box)"
+        _item "6" "访问限制 (Sing-box)"
         _item "7" "测试分流效果"
         _item "8" "查看当前配置"
         _item "0" "返回"
@@ -11876,6 +12426,9 @@ manage_routing() {
                 _header
                 echo -e "  ${W}当前分流配置${NC}"
                 _line
+                echo "  Xray 独立分流（未匹配直连）:"
+                db_get_xray_routing_rules
+                echo "  Sing-box 分流:"
                 local rules=$(db_get_routing_rules)
                 if [[ -n "$rules" && "$rules" != "[]" ]]; then
                     echo "$rules" | jq .
@@ -12140,13 +12693,26 @@ db_add_chain_node() {
     if ! echo "$node_json" | jq empty 2>/dev/null; then
         return 1
     fi
-    _db_apply --argjson node "$node_json" '.chain_proxy.nodes = ((.chain_proxy.nodes // []) + [$node])'
+    local name
+    name=$(jq -er '.name | select(type == "string" and length > 0)' <<<"$node_json") || return 1
+    if db_chain_node_exists "$name"; then
+        _apply_shared_routing_change --argjson node "$node_json" \
+            '.chain_proxy.nodes |= map(if .name == $node.name then $node else . end)'
+    else
+        _db_apply --argjson node "$node_json" '.chain_proxy.nodes = ((.chain_proxy.nodes // []) + [$node])'
+    fi
 }
 db_del_chain_node() {
     local name="$1"
-    _db_apply --arg name "$name" '
-        .chain_proxy.nodes = [(.chain_proxy.nodes // [])[] | select(.name != $name)]
-        | if .chain_proxy.active == $name then del(.chain_proxy.active) else . end
+    _apply_shared_routing_change --arg name "$name" '
+        .chain_proxy.nodes = [(.chain_proxy.nodes // [])[] | select(.name != $name)] |
+        if .chain_proxy.active == $name then del(.chain_proxy.active) else . end |
+        .routing_rules = [.routing_rules[]? | select(.outbound != ("chain:" + $name))] |
+        .xray_routing_rules = [.xray_routing_rules[]? | select(.outbound != ("chain:" + $name))] |
+        if .balancer_groups then .balancer_groups |= map(.nodes |= map(select(. != $name))) else . end |
+        if .singbox then .singbox |= with_entries(.value |=
+            (if type == "array" then map(if .users then .users |= map(if .routing == ("chain:" + $name) then del(.routing) else . end) else . end)
+             elif .users then .users |= map(if .routing == ("chain:" + $name) then del(.routing) else . end) else . end)) else . end
     '
 }
 
@@ -12167,12 +12733,20 @@ db_rename_chain_node() {
         return 1
     fi
 
-    if _db_apply --arg old "$old_name" --arg new "$new_name" '
+    if _apply_shared_routing_change --arg old "$old_name" --arg new "$new_name" '
+        if ([.chain_proxy.nodes[]? | select(.name == $old)] | length) != 1 or
+           any(.chain_proxy.nodes[]?; .name == $new) then error("节点名称已变化，请重试") else . end |
         .chain_proxy.nodes = [(.chain_proxy.nodes // [])[] | if .name == $old then .name = $new else . end]
         | if .chain_proxy.active == $old then .chain_proxy.active = $new else . end
         | if .routing_rules then
             .routing_rules = [.routing_rules[] | if .outbound == ("chain:" + $old) then .outbound = ("chain:" + $new) else . end]
           else . end
+        | if .xray_routing_rules then
+            .xray_routing_rules |= map(if .outbound == ("chain:" + $old) then .outbound = ("chain:" + $new) else . end)
+          else . end
+        | if .singbox then .singbox |= with_entries(.value |=
+            (if type == "array" then map(if .users then .users |= map(if .routing == ("chain:" + $old) then .routing=("chain:" + $new) else . end) else . end)
+             elif .users then .users |= map(if .routing == ("chain:" + $old) then .routing=("chain:" + $new) else . end) else . end)) else . end
         | if .balancer_groups then
             .balancer_groups = [.balancer_groups[] | if .nodes then .nodes = [.nodes[] | if . == $old then $new else . end] else . end]
           else . end
@@ -12800,7 +13374,6 @@ _add_chain_node_interactive() {
             _pause
             return
         fi
-        db_del_chain_node "$final_name"
     fi
 
     # 更新节点名称
@@ -13505,7 +14078,7 @@ manage_chain_proxy() {
         local node_count=$(echo "$nodes" | jq 'length' 2>/dev/null || echo 0)
 
         # 获取分流规则使用的节点
-        local routing_rules=$(db_get_routing_rules)
+        local routing_rules=$(jq '(.routing_rules // []) + [(.xray_routing_rules // [])[] | .type = ("Xray/" + .type)]' "$DB_FILE")
         local routing_count=0
         local routing_nodes=""
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
@@ -13626,7 +14199,7 @@ manage_chain_proxy() {
                 fi
 
                 # 获取分流规则使用的节点
-                local routing_rules=$(db_get_routing_rules)
+                local routing_rules=$(jq '(.routing_rules // []) + [(.xray_routing_rules // [])[] | .type = ("Xray/" + .type)]' "$DB_FILE")
                 declare -A routing_marks
                 if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
                     while IFS= read -r line; do
@@ -13684,21 +14257,19 @@ manage_chain_proxy() {
                 if [[ "$idx" == "0" ]]; then
                     continue
                 elif [[ "$idx" == "all" ]]; then
-                    _db_apply '
-                        del(.chain_proxy)
-                        | .routing_rules = [.routing_rules[]? | select(.outbound | startswith("chain:") | not)]
-                    '
-                    _ok "已删除所有节点"
-                    _ok "已清理相关分流规则"
-                    _regenerate_proxy_configs
+                    if _apply_shared_routing_change '
+                        del(.chain_proxy) |
+                        .routing_rules = [.routing_rules[]? | select(.outbound | startswith("chain:") | not)] |
+                        .xray_routing_rules = [.xray_routing_rules[]? | select(.outbound | startswith("chain:") | not)] |
+                        del(.balancer_groups) |
+                        if .singbox then .singbox |= with_entries(.value |=
+                            (if type == "array" then map(if .users then .users |= map(if (.routing // "" | startswith("chain:")) then del(.routing) else . end) else . end)
+                             elif .users then .users |= map(if (.routing // "" | startswith("chain:")) then del(.routing) else . end) else . end)) else . end
+                    '; then _ok "已删除所有节点及相关分流规则"; fi
                 elif [[ -n "$idx" && "$idx" =~ ^[0-9]+$ ]]; then
                     local name=$(echo "$nodes" | jq -r ".[$((idx-1))].name // empty")
                     if [[ -n "$name" ]]; then
-                        db_del_chain_node "$name"
-                        # 清理引用该节点的分流规则
-                        _db_apply --arg out "chain:$name" '.routing_rules = [.routing_rules[]? | select(.outbound != $out)]'
-                        _ok "已删除: $name"
-                        _regenerate_proxy_configs
+                        db_del_chain_node "$name" && _ok "已删除: $name"
                     fi
                 fi
                 _pause
@@ -14352,7 +14923,7 @@ select_vless_mode() {
 # 两个 REALITY 实现使用独立协议键，在检查已有端口前完成选择。
 select_vless_reality_implementation() {
     local choice
-    _item 1 "Xray (默认，独立直连出口)"
+    _item 1 "Xray (默认，独立分流，未匹配直连)"
     _item 2 "Sing-box (统一分流)"
     _item 0 "返回"
     while true; do
@@ -14584,7 +15155,7 @@ do_install_server() {
     create_watchdog_service && svc enable sing-watchdog && svc start sing-watchdog || return 1
     create_shortcut || return 1
     [[ ! -f "$CFG/sub.info" ]] || generate_sub_files || return 1
-    _ok "安装完成，快捷命令: sing"
+    _ok "安装完成，快捷命令: vless"
     [[ "$protocol" != hy2 && "$protocol" != tuic ]] || _warn "请放行 UDP 端口 $port"
     show_single_protocol_info "$protocol" false "$port"
     _pause
@@ -17175,7 +17746,7 @@ _select_user_routing() {
 # 修改用户路由
 _set_user_routing() {
     local core="$1" proto="$2"
-    [[ "$core" != xray ]] || { _warn 'Xray 暂使用独立直连出口'; return 1; }
+    [[ "$core" != xray ]] || { _warn 'Xray 支持独立分类分流，暂不支持用户级路由'; return 1; }
     local proto_name=$(get_protocol_name "$proto")
 
     local users=$(db_list_users "$core" "$proto")
@@ -18798,7 +19369,7 @@ main_menu() {
     ensure_singbox_runtime_consistency 2>/dev/null || true
     ensure_xray_runtime_consistency 2>/dev/null || true
 
-    # 自动更新系统脚本 (确保 sing 命令始终是最新版本)
+    # 自动更新系统脚本 (确保 vless 命令始终是最新版本)
     _auto_update_system_script
 
     # 兼容旧定时规则：补齐 cron PATH，并确认守护进程确实运行。

@@ -7,7 +7,7 @@ curl -fL https://raw.githubusercontent.com/claudeeopussonnet/sing-lite/main/vles
 bash sing-lite.sh
 ```
 
-安装后运行 `sing` 打开管理菜单，查看运行状态、彩色编号节点和端口。菜单使用 `[1]`、`[10]`、`[A]` 方括号选项，文字对齐，直接输入原序号或字母即可。分享页按节点分块展示名称、内核、地址、分享链接、Surge 配置和二维码；用户分享与订阅页采用相同排版，链接和配置独立成行，方便直接复制。
+安装后运行 `vless` 打开管理菜单，查看运行状态、彩色编号节点和端口。更新后会将本脚本创建的旧 `sing` 快捷入口切换为 `vless`。菜单使用 `[1]`、`[10]`、`[A]` 方括号选项，文字对齐，直接输入原序号或字母即可。分享页按节点分块展示名称、内核、地址、分享链接、Surge 配置和二维码；用户分享与订阅页采用相同排版，链接和配置独立成行，方便直接复制。
 
 ## 支持协议
 
@@ -17,7 +17,7 @@ bash sing-lite.sh
 | Xray 官方 | VLESS REALITY + Vision、VLESS Encryption、VLESS XHTTP + REALITY（可选 Encryption） |
 | Surge 原厂 | Snell v5/v6 |
 
-安装 VLESS 时可选择模式和内核；REALITY 默认使用 Xray，也可选择支持统一分流的 sing-box，已有实例保持原内核。Xray 使用独立的 `sing-xray` 服务与 `/etc/sing-lite/xray.json`，支持多端口、用户管理、分享链接和订阅；暂使用直连出口，不同步 sing-box 的分流、WARP、链式代理或用户路由。内核版本管理支持实时查询和安装 Xray 稳定版、测试版，下载校验或服务启动失败会回滚核心与配置。
+安装 VLESS 时可选择模式和内核；REALITY 默认使用 Xray，也可选择 sing-box，已有实例保持原内核。Xray 使用独立的 `sing-xray` 服务与 `/etc/sing-lite/xray.json`，支持多端口、用户管理、分享链接、订阅和独立分类分流，无需安装 sing-box。两个内核分别保存分流规则、选择出口和调整顺序，未配置 Xray 分流或流量未匹配时默认直连。内核版本管理支持实时查询和安装 Xray 稳定版、测试版，下载校验或服务启动失败会回滚核心、配置与规则资源指向。
 
 Xray 用户增删、启停与配置更新使用同一事务；验证或重启失败会恢复用户状态、配置和分享文件，到期禁用失败后仍可重试。已停止的服务在修改用户时保持停止。
 
@@ -28,6 +28,26 @@ Surge 自 iOS 6.0.0 / Mac 6.12.0 起支持 VLESS。脚本提供普通 REALITY、
 分享链接、二维码、用户分享和订阅统一使用地区 emoji 与大写简称，例如 `🇯🇵 REALITY-443`、`🇯🇵 ENC-8443`、`🇯🇵 XHTTP-2053`、`🇯🇵 SNELL6-443`。多用户附加大写用户名，重名时补实现标识或编号；名称中的大小写转换不影响实际账户名、密码、密钥和路径。地区按连接服务器地址查询，外部域名先解析 IPv4，再解析 IPv6；无法确定地区时使用 `🌐`。外部节点导出时重新命名，原始导入内容保留；SOCKS5 分享使用支持备注的 `socks5://` URI。
 
 ## 规则策略
+
+在 `vless` 的「分流管理 → 配置分流规则」选择内核；只安装一个内核时直接进入对应界面。Xray 界面支持新增／修改分类出口、删除、排序、应用和手动更新规则集，修改后选择「应用配置」生效，返回时放弃未应用修改。
+
+Xray 五类预设统一使用 [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat/releases) 发布的成品 `geosite.dat` 和 `geoip.dat`：
+
+| 分类（默认优先级） | 域名规则 | IP 规则 |
+| --- | --- | --- |
+| AI | `geosite:category-ai-!cn` | 无 |
+| YouTube | `geosite:youtube` | 无 |
+| X | `geosite:twitter` | `geoip:twitter` |
+| Google | `geosite:google` | 默认不使用 |
+| 国内流量 | `geosite:cn` | `geoip:cn` |
+
+Xray 全局先输出所有分类的域名规则（site 块），再输出 X 和国内的独立 IP 规则（ip 块），non_ip 块为空；各块内部遵循所选优先级。AI、YouTube 必须排在 Google 之前，无效排序会给出中文说明。五类规则同时覆盖 IPv4、IPv6。启用 HTTP、TLS、QUIC 域名嗅探，`routeOnly` 保留原始连接目标；`IPOnDemand` 在域名未命中且进入 IP 匹配阶段时解析域名，内置 DNS 使用系统解析器。
+
+每类出口可选择直连、拦截、WARP 或 `chain:节点名`。国内流量也由用户选择出口，只有选择拦截才阻断。WARP 复用现有账户：官方客户端使用本机 SOCKS5，WGCF 使用 Xray 原生 WireGuard 出站和用户态网络栈。共享节点池中的 SOCKS5、HTTP、Shadowsocks、VMess、VLESS、Trojan 可转换为原生 Xray 出站；认证、TLS、REALITY、流控和传输参数必须完整表达，否则拒绝选择或应用并说明原因。此功能沿用现有导入格式，不接入 Xray 负载均衡组或用户级路由。节点改名、覆盖、删除及 WARP 账户或模式变更会维护引用；涉及两个内核时，任何配置检查或重启失败均恢复原数据库、配置、资源指向和运行状态，原先停止的服务保持停止。
+
+首次应用 Xray 分流时，从同一发布版本下载两份 DAT 及 SHA-256 文件，在私有暂存目录完成校验并使用官方 Xray 检查全部五类标签，通过 `/etc/sing-lite/xray-rules` 原子切换资源目录。应用配置时，规则超过 24 小时会尝试刷新；也可在 Xray 分流界面手动更新，不新增后台任务。自动刷新失败时会提示并继续使用通过校验的旧规则；首次下载失败、旧规则无效或手动更新失败会拒绝应用。远程版本查询不使用持久缓存。
+
+sing-box 继续使用以下规则源，其规则和顺序不迁移到 Xray：
 
 | 分类 | 规则来源 |
 | --- | --- |
