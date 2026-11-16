@@ -7,8 +7,8 @@ _line() { printf '  ────────────────────
 _err() { printf '错误: %s\n' "$*"; }
 _warn() { printf '提示: %s\n' "$*"; }
 _ok() { printf '%s\n' "$*"; }
-assert_text() { rg -Fq -- "$1" "$2" || fail "missing '$1' in ${2##*/}"; }
-assert_absent() { if rg -Fq -- "$1" "$2"; then fail "unexpected '$1' in ${2##*/}"; fi; }
+assert_text() { grep -Fq -- "$1" "$2" || fail "missing '$1' in ${2##*/}"; }
+assert_absent() { if grep -Fq -- "$1" "$2"; then fail "unexpected '$1' in ${2##*/}"; fi; }
 
 cat >"$DB_FILE" <<'JSON'
 {
