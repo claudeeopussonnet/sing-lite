@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.1.4 [服务端]
+#  sing-lite v1.1.5 [服务端]
 #  官方 sing-box、Xray 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 vless。
 #  适配: Alpine/Debian/Ubuntu/CentOS
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.1.4"
+readonly VERSION="1.1.5"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/claudeeopussonnet/sing-lite"
 readonly SCRIPT_REPO="claudeeopussonnet/sing-lite"
@@ -10539,13 +10539,13 @@ declare -A ROUTING_PRESETS=(
 
 # 预设规则显示名称
 declare -A ROUTING_PRESET_NAMES=(
-    [singbox-ai]="AI (Sukka)"
-    [stream]="Stream (Sukka)"
-    [stream-jp]="Stream JP (Sukka)"
+    [singbox-ai]="AI"
+    [stream]="Stream"
+    [stream-jp]="Stream JP"
     [youtube]="YouTube"
     [google]="Google"
-    [twitter]="Twitter"
-    [ads]="广告屏蔽 (Sukka)"
+    [twitter]="X"
+    [ads]="广告屏蔽"
     [all]="所有流量"
 )
 
@@ -10914,6 +10914,12 @@ _display_sorted_latencies() {
 _select_outbound() {
     local prompt="${1:-选择出口}"
     local check_mode="${2:-check_latency}"
+    if [[ "$check_mode" == no_check ]]; then
+        local ROUTING_SELECTED_OUTBOUND=''
+        _select_routing_outbound singbox >&2 || return 1
+        printf '%s\n' "$ROUTING_SELECTED_OUTBOUND"
+        return 0
+    fi
     local outbounds=()
     local display_names=()
 
@@ -11075,8 +11081,10 @@ _get_outbound_display_name() {
     local outbound="$1"
     case "$outbound" in
         direct) echo "直连" ;;
+        block) echo "拦截" ;;
         warp) echo "WARP" ;;
         chain:*) echo "${outbound#chain:}" ;;
+        balancer:*) echo "负载均衡 (${outbound#balancer:})" ;;
         *) echo "$outbound" ;;
     esac
 }
@@ -11274,214 +11282,135 @@ gen_singbox_warp_outbound() {
     }'
 }
 
-# 显示当前分流状态 (多规则版本)
-show_routing_status() {
-    local warp_st=$(warp_status)
-
-    echo ""
-    echo -e "  ${C}出口状态${NC}"
-    _line
-
-    # 直连出口 IP 版本（默认 AsIs）
-    local direct_ip_version="as_is"
-    [[ -f "$CFG/direct_ip_version" ]] && direct_ip_version=$(cat "$CFG/direct_ip_version")
-    local direct_display=""
-    case "$direct_ip_version" in
-        ipv4|ipv4_only) direct_display="仅 IPv4" ;;
-        ipv6|ipv6_only) direct_display="仅 IPv6" ;;
-        prefer_ipv4) direct_display="优先 IPv4" ;;
-        prefer_ipv6) direct_display="优先 IPv6" ;;
-        as_is|asis) direct_display="AsIs" ;;
-        # 兜底展示异常值，避免界面空白
-        *) direct_display="${Y}未知 ($direct_ip_version)${NC}" ;;
+# 分流页面共用标题、规则列表和出口名称；内核只在标题标明。
+_routing_core_name() {
+    case "$1" in
+        singbox) printf '%s\n' sing-box ;;
+        xray) printf '%s\n' Xray ;;
+        *) return 1 ;;
     esac
-    echo -e "  Sing-box 直连: ${G}$direct_display${NC}"
+}
 
-    # WARP 状态
-    case "$warp_st" in
-        connected)
-            echo -e "  WARP: ${G}● 已连接${NC} (官方客户端/TCP)"
-            ;;
-        registered)
-            echo -e "  WARP: ${Y}● 已注册${NC} (未连接)"
-            ;;
-        configured)
-            echo -e "  WARP: ${G}● 已配置${NC} (WGCF/UDP)"
-            ;;
-        *)
-            echo -e "  WARP: ${D}○ 未配置${NC}"
-            ;;
-    esac
-
-    # 链式代理节点数量
-    local nodes=$(db_get_chain_nodes 2>/dev/null)
-    local node_count=$(echo "$nodes" | jq 'length' 2>/dev/null || echo 0)
-    if [[ "$node_count" -gt 0 ]]; then
-        echo -e "  代理: ${G}● ${node_count} 个节点${NC}"
-    else
-        echo -e "  代理: ${D}○ 无节点${NC}"
+_routing_header() {
+    local title="$1" core="${2-${ROUTING_ACTIVE_CORE:-}}" name
+    [[ ! -t 1 ]] || clear
+    printf '\n  %s' "$title"
+    if [[ -n "$core" ]]; then
+        name=$(_routing_core_name "$core") || return 1
+        printf ' · %s' "$name"
     fi
-
-    _line
-    echo -e "  ${C}Sing-box 分流规则${NC}"
-    echo -e "  ${D}两个内核分别在“配置分流规则”中管理顺序和出口${NC}"
-    _line
-
-    # 显示分流规则 (优化：一次性提取所有字段，避免多次调用 jq)
-    local rules=$(db_get_routing_rules)
-
-    if [[ -n "$rules" && "$rules" != "[]" ]]; then
-        local rule_count=0
-        # 一次性提取 type, outbound, domains, ip_version，用 | 分隔
-        while IFS='|' read -r rule_type outbound domains ip_version; do
-            [[ -z "$rule_type" ]] && continue
-            local outbound_name=$(_get_outbound_display_name "$outbound")
-
-            local rule_name="${ROUTING_PRESET_NAMES[$rule_type]:-$rule_type}"
-            if [[ "$rule_type" == "custom" ]]; then
-                # 自定义规则显示域名
-                if [[ -n "$domains" && "$domains" != "null" ]]; then
-                    local display_domains="$domains"
-                    if [[ ${#domains} -gt 20 ]]; then
-                        display_domains="${domains:0:17}..."
-                    fi
-                    rule_name="自定义 (${display_domains})"
-                else
-                    rule_name="自定义"
-                fi
-            fi
-            [[ "$rule_type" == "all" ]] && rule_name="所有流量"
-            [[ "$rule_type" == "ads" ]] && rule_name="广告屏蔽"
-
-            # IP 版本标记
-            local ip_mark=""
-            case "$ip_version" in
-                ipv4_only) ip_mark=" ${C}[仅IPv4]${NC}" ;;
-                ipv6_only) ip_mark=" ${C}[仅IPv6]${NC}" ;;
-                prefer_ipv4) ip_mark=" ${C}[优先IPv4]${NC}" ;;
-                prefer_ipv6) ip_mark=" ${C}[优先IPv6]${NC}" ;;
-                as_is|asis) ip_mark=" ${C}[ALL]${NC}" ;;
-            esac
-
-            if [[ "$rule_type" == "all" ]]; then
-                echo -e "  ${Y}●${NC} ${rule_name} → ${C}${outbound_name}${NC}${ip_mark}"
-            elif [[ "$rule_type" == "ads" ]]; then
-                echo -e "  ${R}●${NC} ${rule_name} → ${D}拦截${NC}"
-            else
-                echo -e "  ${G}●${NC} ${rule_name} → ${C}${outbound_name}${NC}${ip_mark}"
-            fi
-
-            ((rule_count++))
-        done < <(echo "$rules" | jq -r '.[] | "\(.type)|\(.outbound)|\(.domains // "")|\(.ip_version // "prefer_ipv4")"')
-
-        [[ $rule_count -eq 0 ]] && echo -e "  ${D}未配置分流规则${NC}"
-    else
-        echo -e "  ${D}未配置分流规则${NC}"
-    fi
-    _line
-    echo "  Xray 独立分流（未匹配直连）"
-    local xray_rules
-    xray_rules=$(db_get_xray_routing_rules) || return 1
-    if [[ "$xray_rules" == '[]' ]]; then
-        echo "  未配置分类，所有流量直连"
-    else
-        jq -r '.[] | "  " + ({ai:"AI",youtube:"YouTube",twitter:"X",google:"Google",cn:"国内流量"}[.type]) + " → " + .outbound' <<<"$xray_rules"
-    fi
+    printf '\n'
     _line
 }
 
-# 测试分流是否生效
-test_routing() {
-    local rules=$(db_get_routing_rules)
+_routing_rules_for_core() {
+    case "$1" in
+        singbox) db_get_routing_rules singbox ;;
+        xray) db_get_xray_routing_rules ;;
+        *) return 1 ;;
+    esac
+}
 
-    # 检查是否有规则
-    if [[ -z "$rules" || "$rules" == "[]" ]]; then
-        _info "未配置分流规则"
-        return 0
-    fi
+_show_routing_rules() {
+    local core="$1" rules="${2:-}"
+    [[ -n "$rules" ]] || rules=$(_routing_rules_for_core "$core") || return 1
+    jq -r --arg core "$core" '
+        def name:
+            if .type == "custom" then
+                "自定义" + (if (.domains // "") != "" then " (" + (.domains[:40]) + ")" else "" end)
+            else {ai:"AI", "singbox-ai":"AI", youtube:"YouTube", twitter:"X", google:"Google", cn:"国内流量",
+                stream:"Stream", "stream-jp":"Stream JP", ads:"广告屏蔽", all:"所有流量",
+                "restrict-cn":"国内流量", "restrict-btpt":"旧版 BT/PT"}[.type] // .type end;
+        def outbound:
+            if . == "direct" then "直连" elif . == "block" then "拦截" elif . == "warp" then "WARP"
+            elif startswith("chain:") then ltrimstr("chain:")
+            elif startswith("balancer:") then "负载均衡 (" + ltrimstr("balancer:") + ")" else . end;
+        if length == 0 then "  暂无规则，默认直连"
+        else to_entries[] | .value as $rule |
+            "  " + ((.key+1)|tostring) + ". " + ($rule | name) + " → " + ($rule.outbound | outbound) +
+            (if $core == "singbox" and $rule.type != "ads" then
+                {ipv4_only:" [仅 IPv4]", ipv6_only:" [仅 IPv6]", prefer_ipv4:" [优先 IPv4]", prefer_ipv6:" [优先 IPv6]"}[
+                    $rule.ip_version // "prefer_ipv4"] // ""
+             else "" end)
+        end
+    ' <<<"$rules"
+}
 
-    echo ""
-    _info "测试分流效果..."
-    _line
-
-    # 获取本机直连 IP
-    local direct_ip=$(curl -s --connect-timeout 5 https://api.ipify.org 2>/dev/null)
-    [[ -z "$direct_ip" ]] && direct_ip=$(curl -s --connect-timeout 5 https://ifconfig.me 2>/dev/null)
-    echo -e "  直连出口 IP: ${C}${direct_ip:-获取失败}${NC}"
-
-    # 测试 WARP 出口
-    local warp_st=$(warp_status)
-    if [[ "$warp_st" == "connected" ]]; then
-        local warp_ip=$(curl -s --connect-timeout 10 --socks5 127.0.0.1:$WARP_OFFICIAL_PORT https://api.ipify.org 2>/dev/null)
-        [[ -n "$warp_ip" ]] && echo -e "  WARP 出口 IP: ${G}${warp_ip}${NC}"
-    elif [[ "$warp_st" == "configured" ]]; then
-        echo -e "  WARP: ${G}已配置${NC} (WGCF/UDP)"
-    fi
-
-    _line
-
-    # 显示规则测试信息
-    echo -e "  ${Y}已配置的分流规则:${NC}"
-    while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        local rule_type=$(echo "$rule" | jq -r '.type')
-        local outbound=$(echo "$rule" | jq -r '.outbound')
-        local domains=$(echo "$rule" | jq -r '.domains // ""')
-
-        local rule_name="${ROUTING_PRESET_NAMES[$rule_type]:-$rule_type}"
-        [[ "$rule_type" == "custom" ]] && rule_name="自定义"
-        [[ "$rule_type" == "all" ]] && rule_name="所有流量"
-        local outbound_name=$(_get_outbound_display_name "$outbound")
-
-        # 获取测试域名
-        if [[ "$rule_type" == "all" ]]; then
-            echo -e "  ${G}●${NC} ${rule_name} → ${outbound_name}"
-        else
-            local test_domain=""
-            [[ -n "$domains" && "$domains" != "null" ]] && test_domain=$(echo "$domains" | cut -d',' -f1)
-            echo -e "  ${G}●${NC} ${rule_name} → ${outbound_name} (${test_domain:-N/A})"
-        fi
-    done < <(echo "$rules" | jq -c '.[]')
-
-    echo ""
-    echo -e "  ${G}✓${NC} 分流规则已配置"
-    _line
-    echo -e "  ${Y}验证方法:${NC}"
-    echo -e "  • 手机访问 ${C}https://ip.sb${NC} 查看出口 IP"
-    echo ""
-    echo -e "  ${Y}调试命令 (Sing-box):${NC}"
-    echo -e "  • 检查配置语法: ${C}sing-box check -c $CFG/singbox.json${NC}"
-    if [[ "$DISTRO" == "alpine" ]]; then
-        # Alpine OpenRC 日志命令
-        echo -e "  • 开启调试日志: ${C}sed -i 's/\"loglevel\":\"warning\"/\"loglevel\":\"debug\"/' /etc/sing-lite/config.json && rc-service sing-singbox restart${NC}"
-        echo -e "  • 查看实时日志: ${C}tail -f $CFG/singbox.log${NC}"
-        echo -e "  • 关闭调试日志: ${C}sed -i 's/\"loglevel\":\"debug\"/\"loglevel\":\"warning\"/' /etc/sing-lite/config.json && rc-service sing-singbox restart${NC}"
+# 在入口选择一次，后续动作均沿用该内核；共享出口仍由原事务更新。
+_select_routing_core() {
+    local singbox_protocols xray_protocols choice
+    ROUTING_SELECTED_CORE=''
+    singbox_protocols=$(get_singbox_protocols) || :
+    xray_protocols=$(get_xray_protocols) || :
+    if [[ -n "$singbox_protocols" && -n "$xray_protocols" ]]; then
+        _routing_header "选择分流内核" ''
+        _item 1 "sing-box"
+        _item 2 "Xray"
+        _item 0 "返回"
+        read -rp "  请选择: " choice || return 1
+        case "$choice" in
+            1) ROUTING_SELECTED_CORE=singbox ;;
+            2) ROUTING_SELECTED_CORE=xray ;;
+            0) return 1 ;;
+            *) _err "无效选择"; return 1 ;;
+        esac
+    elif [[ -n "$xray_protocols" ]]; then
+        ROUTING_SELECTED_CORE=xray
+    elif [[ -n "$singbox_protocols" ]]; then
+        ROUTING_SELECTED_CORE=singbox
     else
-        # systemd 日志命令
-        echo -e "  • 开启调试日志: ${C}sed -i 's/\"loglevel\":\"warning\"/\"loglevel\":\"debug\"/' /etc/sing-lite/config.json && systemctl restart sing-singbox${NC}"
-        echo -e "  • 查看实时日志: ${C}journalctl -u sing-singbox -f${NC}"
-        echo -e "  • 关闭调试日志: ${C}sed -i 's/\"loglevel\":\"debug\"/\"loglevel\":\"warning\"/' /etc/sing-lite/config.json && systemctl restart sing-singbox${NC}"
+        _err "请先安装 sing-box 或 Xray 协议"; return 1
     fi
+}
 
-    # 检查是否有 sing-box 协议
-    if db_exists "singbox" "hy2" || db_exists "singbox" "tuic" || db_exists "singbox" "vless-singbox"; then
-        echo ""
-        echo -e "  ${Y}调试命令 (Sing-box):${NC}"
-        echo -e "  • 检查配置语法: ${C}sing-box check -c /etc/sing-lite/singbox.json${NC}"
-        if [[ "$DISTRO" == "alpine" ]]; then
-            # Alpine OpenRC 日志命令
-            echo -e "  • 开启调试日志: ${C}sed -i 's/\"level\":\"warn\"/\"level\":\"debug\"/' /etc/sing-lite/singbox.json && rc-service sing-singbox restart${NC}"
-            echo -e "  • 查看实时日志: ${C}tail -f /var/log/sing/singbox.log${NC}"
-            echo -e "  • 关闭调试日志: ${C}sed -i 's/\"level\":\"debug\"/\"level\":\"warn\"/' /etc/sing-lite/singbox.json && rc-service sing-singbox restart${NC}"
-        else
-            # systemd 日志命令
-            echo -e "  • 开启调试日志: ${C}sed -i 's/\"level\":\"warn\"/\"level\":\"debug\"/' /etc/sing-lite/singbox.json && systemctl restart sing-singbox${NC}"
-            echo -e "  • 查看实时日志: ${C}journalctl -u sing-singbox -f${NC}"
-            echo -e "  • 关闭调试日志: ${C}sed -i 's/\"level\":\"debug\"/\"level\":\"warn\"/' /etc/sing-lite/singbox.json && systemctl restart sing-singbox${NC}"
-        fi
+show_routing_status() {
+    local core="${1:-${ROUTING_ACTIVE_CORE:-singbox}}" warp_st node_count direct_display="系统默认" direct_ip_version
+    _routing_core_name "$core" >/dev/null || return 1
+    if [[ "$core" == singbox ]]; then
+        direct_ip_version=as_is
+        [[ ! -f "$CFG/direct_ip_version" ]] || direct_ip_version=$(cat "$CFG/direct_ip_version") || return 1
+        case "$direct_ip_version" in
+            ipv4|ipv4_only) direct_display="仅 IPv4" ;;
+            ipv6|ipv6_only) direct_display="仅 IPv6" ;;
+            prefer_ipv4) direct_display="优先 IPv4" ;;
+            prefer_ipv6) direct_display="优先 IPv6" ;;
+            as_is|asis) ;;
+            *) direct_display="未知 ($direct_ip_version)" ;;
+        esac
     fi
+    printf '  直连: %s\n' "$direct_display"
+    warp_st=$(warp_status) || return 1
+    case "$warp_st" in
+        connected) printf '  WARP: 已连接\n' ;;
+        registered) printf '  WARP: 已注册，未连接\n' ;;
+        configured) printf '  WARP: 已配置\n' ;;
+        *) printf '  WARP: 未配置\n' ;;
+    esac
+    node_count=$(db_get_chain_nodes | jq 'length') || return 1
+    printf '  链式节点: %s 个\n' "$node_count"
+    _line
+    _show_routing_rules "$core" || return 1
+    _line
+}
 
-    return 0
+# 仅校验所选内核的现有配置；不会启动服务或改写配置。
+test_routing() {
+    local core="${1:-${ROUTING_ACTIVE_CORE:-singbox}}" binary config
+    case "$core" in
+        singbox)
+            config="$CFG/singbox.json"
+            [[ -s "$config" ]] || { _err "尚未生成配置"; return 1; }
+            validate_singbox_config "$config" || { _err "配置检查失败"; return 1; } ;;
+        xray)
+            config="$CFG/xray.json"
+            [[ -s "$config" ]] || { _err "尚未生成配置"; return 1; }
+            binary=$(_lite_xray_binary) || return 1
+            XRAY_LOCATION_ASSET="$CFG/xray-rules" "$binary" run -test -format json -c "$config" || {
+                _err "配置检查失败"; return 1;
+            } ;;
+        *) return 1 ;;
+    esac
+    _ok "配置检查通过"
 }
 
 # 访问限制预设（Sukka 规则集；保留旧规则标识用于识别和清理）
@@ -11644,9 +11573,7 @@ enable_access_restriction() {
 
 manage_access_restrictions() {
     while true; do
-        _header
-        echo -e "  ${W}访问限制${NC}"
-        _line
+        _routing_header "访问限制" singbox
         local access_action="启用回国限制"
         access_restriction_enabled && access_action="关闭访问限制（含旧版 BT/PT）"
         echo -e "  ${D}BT/PT 暂无专用规则源，不支持新增启用${NC}"
@@ -11670,71 +11597,89 @@ manage_access_restrictions() {
     done
 }
 
-# 配置分流规则：仅装一个核心时不增加选择步骤。
+# 可独立调用；从分流管理进入时沿用当前内核，不重复询问。
 configure_routing_rules() {
-    local singbox_protocols xray_protocols choice
-    singbox_protocols=$(get_singbox_protocols) || :
-    xray_protocols=$(get_xray_protocols) || :
-    if [[ -n "$singbox_protocols" && -n "$xray_protocols" ]]; then
-        _item 1 "Sing-box 分流"
-        _item 2 "Xray 独立分流"
-        _item 0 "返回"
-        read -rp "  选择内核: " choice || return
-        case "$choice" in
-            1) configure_singbox_routing_rules ;;
-            2) configure_xray_routing_rules ;;
-            0) return ;;
-            *) _err "无效选择"; return 1 ;;
-        esac
-    elif [[ -n "$xray_protocols" ]]; then
-        configure_xray_routing_rules
-    elif [[ -n "$singbox_protocols" ]]; then
-        configure_singbox_routing_rules
-    else
-        _err "请先安装 Sing-box 或 Xray 协议"; return 1
+    local core="${1:-${ROUTING_ACTIVE_CORE:-}}" ROUTING_SELECTED_CORE=''
+    if [[ -z "$core" ]]; then
+        _select_routing_core || return 1
+        core="$ROUTING_SELECTED_CORE"
     fi
+    case "$core" in
+        singbox) configure_singbox_routing_rules ;;
+        xray) configure_xray_routing_rules ;;
+        *) return 1 ;;
+    esac
 }
 
-_select_xray_outbound() {
-    local choice name generated nodes count index node label
-    XRAY_SELECTED_OUTBOUND=''
+_select_routing_outbound() {
+    local core="$1" choice name generated entries count index entry label kind=chain
+    ROUTING_SELECTED_OUTBOUND=''
+    _routing_core_name "$core" >/dev/null || return 1
+    _routing_header "选择出口" "$core"
     _item 1 "直连"
     _item 2 "拦截"
     _item 3 "WARP"
     _item 4 "链式节点"
+    [[ "$core" != singbox ]] || _item 5 "负载均衡组"
     _item 0 "返回"
     read -rp "  选择出口: " choice || return 1
     case "$choice" in
-        1) XRAY_SELECTED_OUTBOUND=direct ;;
-        2) XRAY_SELECTED_OUTBOUND=block ;;
+        1) ROUTING_SELECTED_OUTBOUND=direct ;;
+        2) ROUTING_SELECTED_OUTBOUND=block ;;
         3)
-            generated=$(gen_xray_warp_outbound) || return 1
-            XRAY_SELECTED_OUTBOUND=warp ;;
-        4)
-            nodes=$(db_get_chain_nodes) || return 1
-            count=$(jq -e 'if type == "array" then length else error("节点列表无效") end' <<<"$nodes") || return 1
+            if [[ "$core" == xray ]]; then
+                generated=$(gen_xray_warp_outbound) || return 1
+            else
+                case "$(warp_status)" in
+                    configured|connected) ;;
+                    *) _warn "请先在 WARP 管理中完成配置"; return 1 ;;
+                esac
+            fi
+            ROUTING_SELECTED_OUTBOUND=warp ;;
+        4|5)
+            if [[ "$choice" == 5 ]]; then
+                [[ "$core" == singbox ]] || { _err "无效选择"; return 1; }
+                kind=balancer
+                entries=$(db_get_balancer_groups) || return 1
+            else
+                entries=$(db_get_chain_nodes) || return 1
+            fi
+            count=$(jq -e 'if type == "array" then length else error("出口列表无效") end' <<<"$entries") || return 1
             if (( count == 0 )); then
-                _warn "暂无链式节点，请先在链式代理管理中添加节点"
+                if [[ "$kind" == chain ]]; then
+                    _warn "暂无链式节点，请先在链式代理管理中添加节点"
+                else
+                    _warn "暂无负载均衡组，请先在链式代理管理中创建"
+                fi
                 return 1
             fi
+            if [[ "$kind" == chain ]]; then _routing_header "选择节点" "$core"
+            else _routing_header "选择负载均衡组" "$core"; fi
             index=1
-            while IFS= read -r node; do
-                label=$(jq -r '.name + " (" + .type + ")"' <<<"$node") || return 1
+            while IFS= read -r entry; do
+                label=$(jq -r '.name + (if .type then " (" + .type + ")" else "" end)' <<<"$entry") || return 1
                 _item "$index" "$label"
                 index=$((index+1))
-            done < <(jq -c '.[]' <<<"$nodes")
+            done < <(jq -c '.[]' <<<"$entries")
             _item 0 "返回"
-            read -rp "  选择节点编号 (0 返回): " index || return 1
+            read -rp "  请选择（0 返回）: " index || return 1
             [[ "$index" != 0 ]] || return 1
             if [[ ! "$index" =~ ^[1-9][0-9]{0,8}$ ]] || (( index > count )); then
-                _err "无效节点编号"
+                _err "无效出口编号"
                 return 1
             fi
-            name=$(jq -er --argjson index "$((index-1))" '.[$index].name | select(type == "string" and length > 0)' <<<"$nodes") || return 1
-            generated=$(gen_xray_chain_outbound "$name") || return 1
-            XRAY_SELECTED_OUTBOUND="chain:$name" ;;
+            name=$(jq -er --argjson index "$((index-1))" '.[$index].name | select(type == "string" and length > 0)' <<<"$entries") || return 1
+            if [[ "$core" == xray ]]; then generated=$(gen_xray_chain_outbound "$name") || return 1; fi
+            ROUTING_SELECTED_OUTBOUND="$kind:$name" ;;
         *) return 1 ;;
     esac
+}
+
+_select_xray_outbound() {
+    local ROUTING_SELECTED_OUTBOUND=''
+    XRAY_SELECTED_OUTBOUND=''
+    _select_routing_outbound xray || return 1
+    XRAY_SELECTED_OUTBOUND="$ROUTING_SELECTED_OUTBOUND"
 }
 
 _move_xray_routing_rule() {
@@ -11753,18 +11698,8 @@ configure_xray_routing_rules() {
     local rules next choice category index from to count XRAY_SELECTED_OUTBOUND=''
     while true; do
         rules=$(db_get_xray_routing_rules) || return 1
-        [[ ! -t 1 ]] || clear
-        echo ""
-        echo "  Xray 分流"
-        _line
-        if [[ "$rules" == '[]' ]]; then
-            echo "  暂无规则，默认直连"
-        else
-            jq -r 'to_entries[] | "  " + ((.key+1)|tostring) + ". " +
-                ({ai:"AI",youtube:"YouTube",twitter:"X",google:"Google",cn:"国内流量"}[.value.type]) +
-                " → " + (.value.outbound | if . == "direct" then "直连" elif . == "block" then "拦截"
-                    elif . == "warp" then "WARP" else ltrimstr("chain:") end)' <<<"$rules"
-        fi
+        _routing_header "分流规则" xray
+        _show_routing_rules xray "$rules" || return 1
         _line
         _item 1 "设置规则"
         _item 2 "删除规则"
@@ -11774,7 +11709,13 @@ configure_xray_routing_rules() {
         read -rp "  请选择: " choice || return
         case "$choice" in
             1)
-                echo "  1. AI  2. YouTube  3. X  4. Google  5. 国内流量  0. 返回"
+                _routing_header "设置规则" xray
+                _item 1 "AI"
+                _item 2 "YouTube"
+                _item 3 "X"
+                _item 4 "Google"
+                _item 5 "国内流量"
+                _item 0 "返回"
                 read -rp "  选择分类: " category || return
                 case "$category" in
                     1) category=ai ;; 2) category=youtube ;; 3) category=twitter ;;
@@ -11790,6 +11731,9 @@ configure_xray_routing_rules() {
             2)
                 count=$(jq 'length' <<<"$rules") || return 1
                 if (( count == 0 )); then _warn "没有分流规则"; _pause; continue; fi
+                _routing_header "删除规则" xray
+                _show_routing_rules xray "$rules" || return 1
+                _line
                 read -rp "  删除第几条规则（0 返回）: " index || return
                 [[ "$index" != 0 ]] || continue
                 if [[ ! "$index" =~ ^[1-9][0-9]{0,8}$ ]] || (( index > count )); then
@@ -11799,6 +11743,9 @@ configure_xray_routing_rules() {
             3)
                 count=$(jq 'length' <<<"$rules") || return 1
                 if (( count < 2 )); then _info "不足两条规则，无需调整顺序"; _pause; continue; fi
+                _routing_header "调整顺序" xray
+                _show_routing_rules xray "$rules" || return 1
+                _line
                 read -rp "  移动第几条规则（0 返回）: " from || return
                 [[ "$from" != 0 ]] || continue
                 read -rp "  移动到第几位（默认 1，0 返回）: " to || return
@@ -11817,49 +11764,41 @@ configure_xray_routing_rules() {
 configure_singbox_routing_rules() {
     local choice
     while true; do
-        _header
-        show_routing_status
-        _item 1 "添加规则"
+        _routing_header "分流规则" singbox
+        _show_routing_rules singbox || return 1
+        _line
+        _item 1 "设置规则"
         _item 2 "删除规则"
-        _item 3 "调整规则顺序"
-        _item 4 "应用配置"
+        _item 3 "调整顺序"
         _item 0 "返回"
         read -rp "  请选择: " choice || return
         case "$choice" in
             1) _add_routing_rule ;;
             2) _del_routing_rule ;;
             3) _reorder_routing_rules ;;
-            4) _regenerate_singbox_routing_config && _ok "Sing-box 分流配置已应用" ;;
             0) return ;;
-            *) _err "无效选择" ;;
+            *) _err "无效选择"; _pause ;;
         esac
     done
 }
 
 # 添加分流规则
 _add_routing_rule() {
-    _header
-    echo -e "  ${W}添加分流规则${NC}"
-    _line
-    echo -e "  ${D}全局匹配顺序: site（含 domainset）→ non_ip → ip → 所有流量${NC}"
-    echo -e "  ${D}手动优先级仅作用于各阶段内部；所有流量始终最后${NC}"
-    _line
-
-    echo -e "  ${Y}选择规则类型:${NC}"
-    echo ""
-    _item "1" "AI (Sukka)"
-    _item "2" "Stream (Sukka)"
-    _item "3" "Stream JP (Sukka)"
-    _item "4" "YouTube (Yuu)"
-    _item "5" "Google (Yuu)"
-    _item "6" "Twitter (Yuu)"
+    _routing_header "设置规则" singbox
+    _item "1" "AI"
+    _item "2" "Stream"
+    _item "3" "Stream JP"
+    _item "4" "YouTube"
+    _item "5" "Google"
+    _item "6" "X"
     _item "c" "自定义域名"
-    _item "b" "广告屏蔽 (Sukka)"
+    _item "b" "广告屏蔽"
     _item "a" "所有流量"
     _item "0" "返回"
     _line
 
-    read -rp "  请选择: " rule_choice
+    local rule_choice ip_version_choice overwrite
+    read -rp "  请选择: " rule_choice || return
 
     local rule_type="" custom_domains=""
     case "$rule_choice" in
@@ -11878,7 +11817,7 @@ _add_routing_rule() {
             echo -e "  ${D}  2) domainset: rule-set:skk-domainset-cdn${NC}"
             echo -e "  ${D}  3) non_ip: rule-set:skk-non-ip-ai${NC}"
             echo -e "  ${D}  4) ip: rule-set:skk-ip-telegram${NC}"
-            read -rp "  匹配规则: " custom_domains
+            read -rp "  匹配规则: " custom_domains || return
             custom_domains=$(echo "$custom_domains" | tr -d ' \t')
             if [[ -z "$custom_domains" ]]; then
                 _warn "输入不能为空"
@@ -11916,19 +11855,18 @@ _add_routing_rule() {
     fi
 
     # 选择出口
-    echo ""
-    echo -e "  ${Y}选择出口:${NC}"
-    local outbound=$(_select_outbound "选择出口" "no_check")
+    local outbound
+    outbound=$(_select_outbound "选择出口" "no_check") || return
     [[ -z "$outbound" ]] && return
 
     # 选择匹配的 IP 版本（用于 IPv4/IPv6 分流）
     local ip_version="as_is"  # 默认值
     echo ""
     echo -e "  ${Y}匹配的 IP 版本:${NC}"
-    echo -e "  ${G}$(_menu_badge "1")${NC} 仅 IPv4（只匹配 IPv4 流量）"
-    echo -e "  ${G}$(_menu_badge "2")${NC} 仅 IPv6（只匹配 IPv6 流量）"
-    echo -e "  ${G}$(_menu_badge "3")${NC} ALL（不限制，匹配全部）"
-    read -rp "  请选择 [1-3，默认 3]: " ip_version_choice
+    _item 1 "仅 IPv4"
+    _item 2 "仅 IPv6"
+    _item 3 "IPv4 + IPv6（默认）"
+    read -rp "  请选择 [1-3，默认 3]: " ip_version_choice || return
 
     case "$ip_version_choice" in
         1) ip_version="ipv4_only" ;;
@@ -11949,13 +11887,13 @@ _add_routing_rule() {
                     as_is|asis) ip_text="ALL" ;;
                 esac
                 _warn "所有流量 规则(${ip_text})已存在"
-                read -rp "  是否覆盖? [y/N]: " overwrite
+                read -rp "  是否覆盖? [y/N]: " overwrite || return
                 [[ ! "$overwrite" =~ ^[Yy]$ ]] && return
             fi
         else
             if db_has_routing_rule "$rule_type"; then
                 _warn "${ROUTING_PRESET_NAMES[$rule_type]:-$rule_type} 规则已存在"
-                read -rp "  是否覆盖? [y/N]: " overwrite
+                read -rp "  是否覆盖? [y/N]: " overwrite || return
                 [[ ! "$overwrite" =~ ^[Yy]$ ]] && return
             fi
         fi
@@ -11990,7 +11928,7 @@ _add_routing_rule() {
         ipv6_only) ip_version_mark=" ${C}[仅IPv6]${NC}" ;;
         prefer_ipv4) ip_version_mark=" ${C}[优先IPv4]${NC}" ;;
         prefer_ipv6) ip_version_mark=" ${C}[优先IPv6]${NC}" ;;
-        as_is|asis) ip_version_mark=" ${C}[ALL]${NC}" ;;
+        as_is|asis) ;;
     esac
 
     # 专属规则只应用到对应内核。
@@ -12013,62 +11951,27 @@ _add_routing_rule() {
 
 # 删除分流规则
 _del_routing_rule() {
-    _header
-    echo -e "  ${W}删除分流规则${NC}"
-    _line
+    _routing_header "删除规则" singbox
 
-    local rules=$(db_get_routing_rules)
+    local rules rule_id del_choice
+    rules=$(db_get_routing_rules singbox) || return 1
     if [[ -z "$rules" || "$rules" == "[]" ]]; then
         _warn "没有分流规则"
         _pause
         return
     fi
 
-    # 显示规则列表
-    local idx=1
+    # 显示顺序和删除编号使用同一列表。
     local rule_ids=()
-    while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        local rule_id=$(echo "$rule" | jq -r '.id')
-        local rule_type=$(echo "$rule" | jq -r '.type')
-        local outbound=$(echo "$rule" | jq -r '.outbound')
-        local domains=$(echo "$rule" | jq -r '.domains // ""')
-        local ip_version=$(echo "$rule" | jq -r '.ip_version // "prefer_ipv4"')
-        local rule_name="${ROUTING_PRESET_NAMES[$rule_type]:-$rule_type}"
-
-        # 自定义规则显示域名
-        if [[ "$rule_type" == "custom" ]]; then
-            # 截取域名显示，过长则省略
-            local display_domains="$domains"
-            if [[ ${#domains} -gt 30 ]]; then
-                display_domains="${domains:0:27}..."
-            fi
-            rule_name="自定义 (${display_domains})"
-        fi
-        [[ "$rule_type" == "all" ]] && rule_name="所有流量"
-        local outbound_name=$(_get_outbound_display_name "$outbound")
-
-        # IP 版本标记（广告屏蔽规则无需显示）
-        local ip_mark=""
-        if [[ "$rule_type" != "ads" ]]; then
-            case "$ip_version" in
-                ipv4_only) ip_mark=" ${C}[仅IPv4]${NC}" ;;
-                ipv6_only) ip_mark=" ${C}[仅IPv6]${NC}" ;;
-                prefer_ipv4) ip_mark=" ${C}[优先IPv4]${NC}" ;;
-                prefer_ipv6) ip_mark=" ${C}[优先IPv6]${NC}" ;;
-                as_is|asis) ip_mark=" ${C}[ALL]${NC}" ;;
-            esac
-        fi
-
-        echo -e "  ${G}$(_menu_badge "${idx}")${NC} ${rule_name} → ${outbound_name}${ip_mark}"
+    _show_routing_rules singbox "$rules" || return 1
+    while IFS= read -r rule_id; do
         rule_ids+=("$rule_id")
-        ((idx++))
-    done < <(echo "$rules" | jq -c '.[]')
+    done < <(jq -r '.[].id' <<<"$rules")
 
-    echo ""
-    read -rp "  输入序号删除 (0 返回): " del_choice
+    _line
+    read -rp "  删除第几条规则（0 返回）: " del_choice || return
 
-    if [[ "$del_choice" =~ ^[0-9]+$ ]] && [[ "$del_choice" -ge 1 && "$del_choice" -le ${#rule_ids[@]} ]]; then
+    if [[ "$del_choice" =~ ^[1-9][0-9]{0,8}$ ]] && (( del_choice <= ${#rule_ids[@]} )); then
         local del_id="${rule_ids[$((del_choice-1))]}" del_type
         del_type=$(printf '%s\n' "$rules" | jq -r --arg id "$del_id" '.[] | select(.id == $id) | .type')
         local ai_snapshot=""
@@ -12150,42 +12053,15 @@ _apply_routing_rule_order() {
 }
 
 _reorder_routing_rules() {
-    local core_choice core core_name protocols rules count rule idx choice target
-    local rule_type rule_name domains outbound ip_version ip_mark
-    _header
-    echo -e "  ${W}调整规则顺序${NC}"
-    _line
-    core=singbox; core_name=Sing-box; protocols=$(get_singbox_protocols)
+    local core=singbox core_name=sing-box protocols rules count choice target
+    protocols=$(get_singbox_protocols)
     [[ -n "$protocols" ]] || { _warn "请先安装 $core_name 协议"; _pause; return 1; }
 
     while true; do
         rules=$(db_get_routing_rules "$core") || return 1
         count=$(jq 'length' <<<"$rules") || return 1
-        _header
-        echo -e "  ${W}${core_name} 分流规则顺序${NC}"
-        _line
-        _info "全局按 site（含 domainset）→ non_ip → ip 匹配，所有流量始终最后"
-        _info "手动顺序仅调整各阶段内部的优先级，阶段内首条命中生效"
-        idx=1
-        while IFS= read -r rule; do
-            rule_type=$(jq -r '.type' <<<"$rule")
-            rule_name="${ROUTING_PRESET_NAMES[$rule_type]:-$rule_type}"
-            domains=$(jq -r '.domains // ""' <<<"$rule")
-            [[ "$rule_type" != custom ]] || rule_name="自定义 (${domains:0:60})"
-            [[ "$rule_type" != all ]] || rule_name="所有流量"
-            outbound=$(jq -r '.outbound' <<<"$rule")
-            outbound=$(_get_outbound_display_name "$outbound")
-            ip_version=$(jq -r '.ip_version // "prefer_ipv4"' <<<"$rule")
-            case "$ip_version" in
-                ipv4_only) ip_mark=仅IPv4 ;;
-                ipv6_only) ip_mark=仅IPv6 ;;
-                prefer_ipv4) ip_mark=优先IPv4 ;;
-                prefer_ipv6) ip_mark=优先IPv6 ;;
-                *) ip_mark=ALL ;;
-            esac
-            printf '  %s %s → %s [%s]\n' "$(_menu_badge "$idx")" "$rule_name" "$outbound" "$ip_mark"
-            idx=$((idx+1))
-        done < <(jq -c '.[]' <<<"$rules")
+        _routing_header "调整顺序" "$core"
+        _show_routing_rules "$core" "$rules" || return 1
         if (( count < 2 )); then
             _info "当前内核不足两条分流规则，无需调整顺序"
             _pause
@@ -12228,8 +12104,7 @@ _regenerate_proxy_configs() {
 
 # WARP 管理菜单 (二选一模式)
 manage_warp() {
-    _header
-    echo -e "  ${W}WARP 管理${NC}"
+    _routing_header "WARP 管理（共享出口）" ''
 
     local status=$(warp_status)
     local current_mode=$(db_get_warp_mode)
@@ -12376,9 +12251,7 @@ manage_warp() {
 
 # 配置直连出口 IP 版本
 configure_direct_outbound() {
-    _header
-    echo -e "  ${W}直连出口设置${NC}"
-    _line
+    _routing_header "直连出口设置" singbox
     echo -e "  ${D}设置直连流量使用的 IP 版本${NC}"
     echo -e "  ${D}适用于双栈服务器选择出口 IP${NC}"
     echo ""
@@ -12423,55 +12296,64 @@ setup_warp_ipv6_chain() {
     return 1
 }
 
-# 分流管理主菜单
-manage_routing() {
+# 仅当前内核提供的额外设置，避免在另一个内核的菜单中出现无效入口。
+_manage_routing_options() {
+    [[ "$1" == singbox ]] || return 1
+    local choice
     while true; do
-        _header
-        echo -e "  ${W}分流管理${NC}"
-        show_routing_status
+        _routing_header "更多设置" singbox
+        _item 1 "直连出口"
+        _item 2 "访问限制"
+        _item 0 "返回"
+        read -rp "  请选择: " choice || return
+        case "$choice" in
+            1) configure_direct_outbound ;;
+            2) manage_access_restrictions ;;
+            0) return ;;
+            *) _err "无效选择"; _pause ;;
+        esac
+    done
+}
 
-        _item "1" "WARP 管理"
-        _item "2" "链式代理"
-        _item "3" "配置分流规则"
-        _item "4" "直连出口设置 (Sing-box)"
-        _item "5" "多IP入出站配置 (Sing-box)"
-        _item "6" "访问限制 (Sing-box)"
-        _item "7" "测试分流效果"
-        _item "8" "查看当前配置"
-        _item "0" "返回"
+# 分流管理只展示当前内核；WARP 和节点池作为共享出口管理。
+manage_routing() {
+    local choice ROUTING_SELECTED_CORE='' ROUTING_ACTIVE_CORE='' can_switch=false
+    _select_routing_core || return 1
+    ROUTING_ACTIVE_CORE="$ROUTING_SELECTED_CORE"
+    if [[ -n "$(get_singbox_protocols)" && -n "$(get_xray_protocols)" ]]; then can_switch=true; fi
+    while true; do
+        _routing_header "分流管理" "$ROUTING_ACTIVE_CORE"
+        show_routing_status "$ROUTING_ACTIVE_CORE" || return 1
+        _item 1 "WARP 管理"
+        _item 2 "链式代理"
+        _item 3 "配置分流规则"
+        _item 4 "检查配置"
+        _item 5 "查看配置"
+        if [[ "$ROUTING_ACTIVE_CORE" == singbox ]]; then _item 6 "更多设置"; fi
+        if [[ "$can_switch" == true ]]; then _item 9 "切换内核"; fi
+        _item 0 "返回"
         _line
-
-        read -rp "  请选择: " choice
-
+        read -rp "  请选择: " choice || return
         case "$choice" in
             1) manage_warp ;;
             2) manage_chain_proxy ;;
-            3) configure_routing_rules ;;
-            4) configure_direct_outbound ;;
-            5) manage_ip_routing ;;
-            6) manage_access_restrictions ;;
-            7)
-                _header
-                echo -e "  ${W}测试分流效果${NC}"
-                test_routing
-                _pause
-                ;;
-            8)
-                _header
-                echo -e "  ${W}当前分流配置${NC}"
-                _line
-                echo "  Xray 独立分流（未匹配直连）:"
-                db_get_xray_routing_rules
-                echo "  Sing-box 分流:"
-                local rules=$(db_get_routing_rules)
-                if [[ -n "$rules" && "$rules" != "[]" ]]; then
-                    echo "$rules" | jq .
-                else
-                    echo -e "  ${D}未配置分流规则${NC}"
-                fi
-                _line
-                read -rp "  按回车返回..." _
-                ;;
+            3) configure_routing_rules "$ROUTING_ACTIVE_CORE" ;;
+            4)
+                _routing_header "检查配置" "$ROUTING_ACTIVE_CORE"
+                test_routing "$ROUTING_ACTIVE_CORE"
+                _pause ;;
+            5)
+                _routing_header "查看配置" "$ROUTING_ACTIVE_CORE"
+                show_runtime_config "$ROUTING_ACTIVE_CORE"
+                _pause ;;
+            6)
+                if [[ "$ROUTING_ACTIVE_CORE" == singbox ]]; then
+                    _manage_routing_options "$ROUTING_ACTIVE_CORE"
+                else _err "无效选择"; _pause; fi ;;
+            9)
+                if [[ "$can_switch" == true ]]; then
+                    if _select_routing_core; then ROUTING_ACTIVE_CORE="$ROUTING_SELECTED_CORE"; fi
+                else _err "无效选择"; _pause; fi ;;
             0) return ;;
             *) _err "无效选择"; _pause ;;
         esac
@@ -13353,9 +13235,7 @@ gen_singbox_chain_outbound() {
 
 # 添加节点交互 (带解析预览和自定义名称)
 _add_chain_node_interactive() {
-    _header
-    echo -e "  ${W}添加代理节点${NC}"
-    _line
+    _routing_header "添加节点（共享出口）" ''
     echo -e "  ${D}支持: ss/vmess/vless/trojan/hysteria2/socks5/naive${NC}"
     echo ""
 
@@ -13436,9 +13316,7 @@ _add_chain_node_interactive() {
 
 # 导入订阅交互 (带预览确认)
 _import_subscription_interactive() {
-    _header
-    echo -e "  ${W}导入订阅${NC}"
-    _line
+    _routing_header "导入订阅（共享出口）" ''
 
     echo -e "  ${Y}输入订阅链接:${NC}"
     read -rp "  URL: " sub_url
@@ -13574,9 +13452,7 @@ _import_subscription_interactive() {
 # 链式代理管理菜单
 # 一键导入 Alice SOCKS5 节点 (8个出口)
 _import_alice_nodes() {
-    _header
-    echo -e "  ${W}导入 Alice SOCKS5 节点${NC}"
-    _line
+    _routing_header "导入 Alice SOCKS5 节点（共享出口）" ''
     echo -e "  ${D}Alice 提供 8 个 SOCKS5 出口 (端口 10001-10008)${NC}"
     echo -e "  ${D}统一命名为 Alice-TW-SOCKS5-01 ~ 08${NC}"
     echo ""
@@ -13753,9 +13629,7 @@ _create_alice_balancer_inline() {
 
 # 一键导入 Akile SOCKS5 节点 (12个出口)
 _import_akile_nodes() {
-    _header
-    echo -e "  ${W}导入 Akile SOCKS5 节点${NC}"
-    _line
+    _routing_header "导入 Akile SOCKS5 节点（共享出口）" ''
     echo -e "  ${D}Akile 提供 12 个 SOCKS5 出口 (多地区)${NC}"
     echo -e "  ${D}包括: HK/JP/KR/TW/SG/US/UK/DE 等地区${NC}"
     echo ""
@@ -13944,9 +13818,7 @@ _create_akile_balancer_inline() {
 # 创建负载均衡组
 
 create_load_balance_group() {
-    _header
-    echo -e "  ${W}创建负载均衡组${NC}"
-    _line
+    _routing_header "创建负载均衡组" singbox
 
     # 获取所有节点
     local nodes=$(db_get_chain_nodes)
@@ -14103,28 +13975,28 @@ create_load_balance_group() {
 
 manage_chain_proxy() {
     while true; do
-        _header
-        echo -e "  ${W}链式代理管理${NC}"
-        _line
+        _routing_header "链式代理（共享出口）" ''
 
         # 显示当前状态
         local nodes=$(db_get_chain_nodes)
         local node_count=$(echo "$nodes" | jq 'length' 2>/dev/null || echo 0)
 
         # 获取分流规则使用的节点
-        local routing_rules=$(jq '(.routing_rules // []) + [(.xray_routing_rules // [])[] | .type = ("Xray/" + .type)]' "$DB_FILE")
+        local routing_rules=$(jq '[(.routing_rules // [])[] | . + {_core:"sing-box"}] +
+            [(.xray_routing_rules // [])[] | . + {_core:"Xray"}]' "$DB_FILE")
         local routing_count=0
         local routing_nodes=""
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
-            while IFS= read -r line; do
-                local r_type=$(echo "$line" | cut -d'|' -f1)
-                local r_outbound=$(echo "$line" | cut -d'|' -f2)
+            local r_type r_outbound r_core r_name
+            while IFS='|' read -r r_type r_outbound r_core; do
                 if [[ "$r_outbound" == chain:* ]]; then
                     local node_name="${r_outbound#chain:}"
-                    routing_nodes+="    ${C}•${NC} ${node_name} ${D}← ${r_type}${NC}\n"
-                    ((routing_count++))
+                    r_name="${ROUTING_PRESET_NAMES[$r_type]:-$r_type}"
+                    case "$r_type" in ai) r_name=AI ;; cn) r_name=国内流量 ;; custom) r_name=自定义 ;; esac
+                    routing_nodes+="    ${C}•${NC} ${node_name} ${D}← ${r_name} (${r_core})${NC}\n"
+                    routing_count=$((routing_count+1))
                 fi
-            done < <(echo "$routing_rules" | jq -r '.[] | "\(.type)|\(.outbound)"')
+            done < <(echo "$routing_rules" | jq -r '.[] | "\(.type)|\(.outbound)|\(._core)"')
         fi
 
         if [[ $routing_count -gt 0 ]]; then
@@ -14141,19 +14013,20 @@ manage_chain_proxy() {
         _item "2" "导入订阅"
         _item "3" "一键导入 Alice SOCKS5 (8节点)"
         _item "4" "一键导入 Akile SOCKS5 (12节点)"
-        echo -e "  ${D}───────────────────────────────────────────${NC}"
-        _item "5" "多IP入出站配置"
-        _item "6" "WARP 双层链式"
-        _item "7" "创建负载均衡组"
-        _item "8" "查看负载均衡组"
-        echo -e "  ${D}───────────────────────────────────────────${NC}"
+        _line
+        if [[ "${ROUTING_ACTIVE_CORE:-singbox}" == singbox ]]; then
+            _item "7" "创建负载均衡组"
+            _item "8" "查看负载均衡组"
+            _line
+        fi
         _item "9" "测试所有节点延迟"
         _item "10" "删除节点"
-        _item "11" "删除负载均衡组"
+        if [[ "${ROUTING_ACTIVE_CORE:-singbox}" == singbox ]]; then _item "11" "删除负载均衡组"; fi
         _item "0" "返回"
         _line
 
-        read -rp "  请选择: " choice
+        local choice
+        read -rp "  请选择: " choice || return
 
         case "$choice" in
             1)
@@ -14168,20 +14041,14 @@ manage_chain_proxy() {
             4)
                 _import_akile_nodes
                 ;;
-            5)
-                manage_ip_routing
-                ;;
-            6)
-                setup_warp_ipv6_chain
-                ;;
             7)
+                [[ "${ROUTING_ACTIVE_CORE:-singbox}" == singbox ]] || { _err "无效选择"; _pause; continue; }
                 create_load_balance_group
                 ;;
             8)
+                [[ "${ROUTING_ACTIVE_CORE:-singbox}" == singbox ]] || { _err "无效选择"; _pause; continue; }
                 # 查看负载均衡组
-                _header
-                echo -e "  ${W}查看负载均衡组${NC}"
-                _line
+                _routing_header "查看负载均衡组" singbox
 
                 local balancer_groups=$(db_get_balancer_groups)
                 local group_count=$(echo "$balancer_groups" | jq 'length' 2>/dev/null || echo 0)
@@ -14219,9 +14086,7 @@ manage_chain_proxy() {
                 ;;
             9)
                 # 测试所有节点延迟
-                _header
-                echo -e "  ${W}测试节点延迟 ${D}(仅供参考)${NC}"
-                _line
+                _routing_header "测试节点延迟（共享出口）" ''
 
                 local nodes=$(db_get_chain_nodes)
                 local count=$(echo "$nodes" | jq 'length' 2>/dev/null || echo 0)
@@ -14265,9 +14130,7 @@ manage_chain_proxy() {
                 _pause
                 ;;
             10)
-                _header
-                echo -e "  ${W}删除节点${NC}"
-                _line
+                _routing_header "删除节点（共享出口）" ''
 
                 local nodes=$(db_get_chain_nodes)
                 local count=$(echo "$nodes" | jq 'length' 2>/dev/null || echo 0)
@@ -14309,10 +14172,9 @@ manage_chain_proxy() {
                 _pause
                 ;;
             11)
+                [[ "${ROUTING_ACTIVE_CORE:-singbox}" == singbox ]] || { _err "无效选择"; _pause; continue; }
                 # 删除负载均衡组
-                _header
-                echo -e "  ${W}删除负载均衡组${NC}"
-                _line
+                _routing_header "删除负载均衡组" singbox
 
                 local balancer_groups=$(db_get_balancer_groups)
                 local group_count=$(echo "$balancer_groups" | jq 'length' 2>/dev/null || echo 0)
