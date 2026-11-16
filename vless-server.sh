@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.1.3 [服务端]
+#  sing-lite v1.1.4 [服务端]
 #  官方 sing-box、Xray 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 vless。
 #  适配: Alpine/Debian/Ubuntu/CentOS
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.1.3"
+readonly VERSION="1.1.4"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/claudeeopussonnet/sing-lite"
 readonly SCRIPT_REPO="claudeeopussonnet/sing-lite"
@@ -11696,11 +11696,12 @@ configure_routing_rules() {
 }
 
 _select_xray_outbound() {
-    local choice name generated
+    local choice name generated nodes count index node label
+    XRAY_SELECTED_OUTBOUND=''
     _item 1 "直连"
     _item 2 "拦截"
-    _item 3 "WARP（复用现有账户）"
-    _item 4 "链式节点（Xray 原生出口）"
+    _item 3 "WARP"
+    _item 4 "链式节点"
     _item 0 "返回"
     read -rp "  选择出口: " choice || return 1
     case "$choice" in
@@ -11710,8 +11711,26 @@ _select_xray_outbound() {
             generated=$(gen_xray_warp_outbound) || return 1
             XRAY_SELECTED_OUTBOUND=warp ;;
         4)
-            jq -r '.chain_proxy.nodes[]? | "  " + .name + " (" + .type + ")"' "$DB_FILE"
-            read -rp "  输入节点名称: " name || return 1
+            nodes=$(db_get_chain_nodes) || return 1
+            count=$(jq -e 'if type == "array" then length else error("节点列表无效") end' <<<"$nodes") || return 1
+            if (( count == 0 )); then
+                _warn "暂无链式节点，请先在链式代理管理中添加节点"
+                return 1
+            fi
+            index=1
+            while IFS= read -r node; do
+                label=$(jq -r '.name + " (" + .type + ")"' <<<"$node") || return 1
+                _item "$index" "$label"
+                index=$((index+1))
+            done < <(jq -c '.[]' <<<"$nodes")
+            _item 0 "返回"
+            read -rp "  选择节点编号 (0 返回): " index || return 1
+            [[ "$index" != 0 ]] || return 1
+            if [[ ! "$index" =~ ^[1-9][0-9]{0,8}$ ]] || (( index > count )); then
+                _err "无效节点编号"
+                return 1
+            fi
+            name=$(jq -er --argjson index "$((index-1))" '.[$index].name | select(type == "string" and length > 0)' <<<"$nodes") || return 1
             generated=$(gen_xray_chain_outbound "$name") || return 1
             XRAY_SELECTED_OUTBOUND="chain:$name" ;;
         *) return 1 ;;
@@ -11731,23 +11750,27 @@ _move_xray_routing_rule() {
 }
 
 configure_xray_routing_rules() {
-    local rules next choice category index from to XRAY_SELECTED_OUTBOUND=''
-    rules=$(db_get_xray_routing_rules) || return 1
+    local rules next choice category index from to count XRAY_SELECTED_OUTBOUND=''
     while true; do
-        _header
-        echo "  Xray 独立分流（IPv4 + IPv6）"
-        echo "  来源: Loyalsoldier/v2ray-rules-dat 成品 DAT"
-        echo "  site → non_ip（空）→ ip → 未匹配直连"
-        echo "  AI、YouTube 必须在 Google 前面；修改后选择应用配置"
-        jq -r 'to_entries[] | "  " + ((.key+1)|tostring) + ". " +
-            ({ai:"AI",youtube:"YouTube",twitter:"X",google:"Google",cn:"国内流量"}[.value.type]) +
-            " → " + .value.outbound' <<<"$rules"
-        _item 1 "新增／修改分类出口"
-        _item 2 "删除分类"
+        rules=$(db_get_xray_routing_rules) || return 1
+        [[ ! -t 1 ]] || clear
+        echo ""
+        echo "  Xray 分流"
+        _line
+        if [[ "$rules" == '[]' ]]; then
+            echo "  暂无规则，默认直连"
+        else
+            jq -r 'to_entries[] | "  " + ((.key+1)|tostring) + ". " +
+                ({ai:"AI",youtube:"YouTube",twitter:"X",google:"Google",cn:"国内流量"}[.value.type]) +
+                " → " + (.value.outbound | if . == "direct" then "直连" elif . == "block" then "拦截"
+                    elif . == "warp" then "WARP" else ltrimstr("chain:") end)' <<<"$rules"
+        fi
+        _line
+        _item 1 "设置规则"
+        _item 2 "删除规则"
         _item 3 "调整顺序"
-        _item 4 "应用配置"
-        _item 5 "更新已应用的规则集"
-        _item 0 "返回（放弃未应用修改）"
+        _item 4 "更新规则集"
+        _item 0 "返回"
         read -rp "  请选择: " choice || return
         case "$choice" in
             1)
@@ -11763,20 +11786,31 @@ configure_xray_routing_rules() {
                     else . + [{type:$type,outbound:$outbound}] |
                         sort_by(.type as $t | ["ai","youtube","twitter","google","cn"] | index($t)) end |
                     to_entries | map(.value + {order:.key})' <<<"$rules") || return 1
-                rules="$next" ;;
+                ;;
             2)
+                count=$(jq 'length' <<<"$rules") || return 1
+                if (( count == 0 )); then _warn "没有分流规则"; _pause; continue; fi
                 read -rp "  删除第几条规则（0 返回）: " index || return
-                [[ "$index" =~ ^[1-9][0-9]{0,8}$ ]] || continue
-                rules=$(jq --argjson index "$((index-1))" 'del(.[$index]) | to_entries | map(.value + {order:.key})' <<<"$rules") || return 1 ;;
+                [[ "$index" != 0 ]] || continue
+                if [[ ! "$index" =~ ^[1-9][0-9]{0,8}$ ]] || (( index > count )); then
+                    _err "无效规则序号"; _pause; continue
+                fi
+                next=$(jq --argjson index "$((index-1))" 'del(.[$index]) | to_entries | map(.value + {order:.key})' <<<"$rules") || return 1 ;;
             3)
-                read -rp "  移动第几条规则: " from || return
-                read -rp "  移动到第几位: " to || return
-                if next=$(_move_xray_routing_rule "$rules" "$from" "$to"); then rules="$next"; fi ;;
-            4) _apply_xray_routing_rules "$rules" && _ok "Xray 分流已应用，未匹配流量直连"; _pause ;;
-            5) update_xray_rules && _ok "Xray 规则集已更新"; _pause ;;
+                count=$(jq 'length' <<<"$rules") || return 1
+                if (( count < 2 )); then _info "不足两条规则，无需调整顺序"; _pause; continue; fi
+                read -rp "  移动第几条规则（0 返回）: " from || return
+                [[ "$from" != 0 ]] || continue
+                read -rp "  移动到第几位（默认 1，0 返回）: " to || return
+                to=${to:-1}
+                [[ "$to" != 0 ]] || continue
+                if ! next=$(_move_xray_routing_rule "$rules" "$from" "$to"); then _pause; continue; fi ;;
+            4) update_xray_rules && _ok "规则集已更新"; _pause; continue ;;
             0) return ;;
-            *) _err "无效选择" ;;
+            *) _err "无效选择"; _pause; continue ;;
         esac
+        _apply_xray_routing_rules "$next" && _ok "已保存"
+        _pause
     done
 }
 

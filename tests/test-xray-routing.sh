@@ -297,6 +297,74 @@ db_set_warp_mode official
 [[ "$SINGBOX_RUNNING" == false && "$XRAY_RUNNING" == false ]] || fail 'shared change activated stopped service'
 printf 'ok - shared WARP changes roll back both cores and preserve both stopped states\n'
 
+# Menu edits use the real transaction immediately, including rollback and redraw.
+(
+    _item() { printf '  [%s] %s\n' "$1" "$2"; }
+    _line() { :; }
+    _ok() { printf '%s\n' "$*" >>"$TEST_TMP/menu-success"; }
+    _apply_xray_routing_rules '[]'
+    cp "$CFG/singbox.json" "$TEST_TMP/menu-singbox"
+    : >"$TEST_TMP/services"
+    # Select AI, then chain node 1; returning must retain the completed change.
+    configure_xray_routing_rules <<< $'1\n1\n4\n1\n0' >"$TEST_TMP/menu-set"
+    assert_json '.xray_routing_rules == [{type:"ai",outbound:"chain:socks",order:0}]' "$DB_FILE"
+    assert_json '.routing.rules[0].outboundTag == "chain-socks"' "$CFG/xray.json"
+    grep -q 'AI → socks' "$TEST_TMP/menu-set" || fail 'menu did not redraw saved rule'
+    if grep -qE '应用配置|未应用|放弃' "$TEST_TMP/menu-set"; then fail 'menu still requires a separate apply'; fi
+    [[ "$XRAY_RUNNING" == false && ! -s "$TEST_TMP/services" ]] || fail 'menu started stopped Xray'
+    configure_xray_routing_rules <<< $'1\n1\n2\n0' >"$TEST_TMP/menu-replace"
+    assert_json '.xray_routing_rules[0].outbound == "block"' "$DB_FILE"
+    assert_json '.routing.rules[0].outboundTag == "block"' "$CFG/xray.json"
+    configure_xray_routing_rules <<< $'1\n2\n1\n1\n3\n1\n0' >"$TEST_TMP/menu-add"
+    assert_json '[.xray_routing_rules[].type] == ["ai","youtube","twitter"]' "$DB_FILE"
+    configure_xray_routing_rules <<< $'3\n3\n1\n0' >"$TEST_TMP/menu-order"
+    assert_json '[.xray_routing_rules[].type] == ["twitter","ai","youtube"]' "$DB_FILE"
+    assert_json '[.routing.rules[:3][].domain[0]] == ["geosite:twitter","geosite:category-ai-!cn","geosite:youtube"]' "$CFG/xray.json"
+
+    XRAY_RUNNING=true
+    save_state
+    # A failed set/delete/reorder must redraw persisted rules, without success.
+    for failure in check restart; do
+        for input in $'1\n3\n2\n0' $'2\n1\n0' $'3\n1\n3\n0'; do
+            : >"$TEST_TMP/menu-success"
+            case "$failure" in check) FAIL_CHECK=true ;; restart) FAIL_RESTART=restart:sing-xray ;; esac
+            configure_xray_routing_rules <<<"$input" >"$TEST_TMP/menu-failure"
+            FAIL_CHECK=false
+            assert_state
+            [[ "$XRAY_RUNNING" == true && ! -s "$TEST_TMP/menu-success" ]] || fail 'failed menu edit reported success or lost runtime'
+            tail -n 9 "$TEST_TMP/menu-failure" >"$TEST_TMP/menu-redraw"
+            grep -q 'X → 直连' "$TEST_TMP/menu-redraw" || fail 'failed menu edit displayed uncommitted rules'
+        done
+    done
+    XRAY_RUNNING=false
+    : >"$TEST_TMP/services"
+    # Cancellation, invalid input and EOF never reach the transaction.
+    for input in $'1\n0\n0' $'1\n1\n0\n0' $'1\n1\n4\n0\n0' $'2\n0\n0' \
+        $'2\n99\n0' $'3\n0\n0' $'3\n1\n0\n0'; do
+        configure_xray_routing_rules <<<"$input" >"$TEST_TMP/menu-cancel"
+        assert_state
+    done
+    if configure_xray_routing_rules <<< $'1\n1' >"$TEST_TMP/menu-eof"; then :; fi
+    assert_state
+    [[ ! -s "$TEST_TMP/services" ]] || fail 'cancelled menu edit touched service'
+    configure_xray_routing_rules <<< $'1\n4\n1\n0' >"$TEST_TMP/menu-google"
+    save_state
+    configure_xray_routing_rules <<< $'3\n4\n1\n0' >"$TEST_TMP/menu-invalid-order"
+    assert_state
+
+    previous_link=$(readlink "$CFG/xray-rules")
+    configure_xray_routing_rules <<< $'4\n0' >"$TEST_TMP/menu-update"
+    [[ "$(readlink "$CFG/xray-rules")" != "$previous_link" ]] || fail 'menu rule update did not publish resources'
+    # Removing the final rule immediately restores the default direct config.
+    XRAY_RUNNING=true
+    configure_xray_routing_rules <<< $'2\n1\n2\n1\n2\n1\n2\n1\n0' >"$TEST_TMP/menu-delete"
+    assert_json '.xray_routing_rules == []' "$DB_FILE"
+    assert_json '.outbounds == [{protocol:"freedom",tag:"direct"}] and (has("routing") | not)' "$CFG/xray.json"
+    cmp "$CFG/singbox.json" "$TEST_TMP/menu-singbox" || fail 'Xray menu changed Sing-box config'
+    [[ "$XRAY_RUNNING" == true ]] || fail 'successful menu edits stopped Xray'
+)
+printf 'ok - menu sets, replaces, deletes and reorders immediately; failures/cancellation preserve persisted rules and runtime\n'
+
 # Each UI dispatches directly on a single-core installation.
 (
     configure_xray_routing_rules() { printf 'xray\n' >>"$TEST_TMP/menu"; }
