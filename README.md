@@ -39,6 +39,8 @@ Surge 自 iOS 6.0.0 / Mac 6.12.0 起支持 VLESS。脚本提供普通 REALITY、
 
 WARP 和链式节点池由两个内核共享，管理页会标明「共享出口」；分流规则和优先级仍分别保存。Xray 界面不提供 sing-box 的负载均衡组或其他专属设置。
 
+通过分享链接添加链式节点后，可选择「立即将此节点用于分流」。同时安装 sing-box 和 Xray 时，先选择目标内核。只安装一个内核时直接进入设置。选择分流分类后，刚添加的节点会作为该规则的出口。取消设置或规则应用失败时，节点仍保存在共享节点池中。
+
 Xray 五类预设统一使用 [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat/releases) 发布的成品 `geosite.dat` 和 `geoip.dat`：
 
 | 分类（默认优先级） | 域名规则 | IP 规则 |
@@ -47,7 +49,9 @@ Xray 五类预设统一使用 [Loyalsoldier/v2ray-rules-dat](https://github.com/
 | YouTube | `geosite:youtube` | 无 |
 | X | `geosite:twitter` | `geoip:twitter` |
 | Google | `geosite:google` | 默认不使用 |
-| 国内流量 | `geosite:cn` | `geoip:cn` |
+| 国内流量 | `geosite:cn`（直连、WARP 或链式节点） | `geoip:cn` |
+
+Xray 的「国内流量 → 拦截」仅匹配 `geoip:cn` 中的中国大陆 IPv4 和 IPv6 网段。这样可避免因域名同时收录在 Google 和 `geosite:cn` 而触发拦截。已有拦截规则在重新保存或重建 Xray 配置后采用此行为。 [233boy/Xray 服务端配置](https://github.com/233boy/Xray/blob/main/src/core.sh#L426-L432)
 
 Xray 全局先输出域名规则（site 块），包括自定义域名和预设域名，再输出 X 和国内的独立 IP 规则（ip 块），non_ip 块为空；各块内部遵循所选优先级。新增自定义域名默认放在首位，可通过「调整顺序」移动。AI、YouTube 必须排在 Google 之前，无效排序会给出中文说明。五类预设同时覆盖 IPv4、IPv6。启用 HTTP、TLS、QUIC 域名嗅探，`routeOnly` 保留原始连接目标；`IPOnDemand` 在域名未命中且进入 IP 匹配阶段时解析域名，内置 DNS 使用系统解析器。
 

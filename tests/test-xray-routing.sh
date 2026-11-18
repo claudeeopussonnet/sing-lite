@@ -95,7 +95,10 @@ xray() {
     [[ "$1 $2 $3 $4 $5" == 'run -test -format json -c' && $# == 6 ]] || forbidden xray "$@"
     jq empty "$6" || return 1
     if jq -e 'any(.routing.rules[]?.domain[]?; startswith("geosite:"))' "$6" >/dev/null; then
-        [[ -d "$XRAY_LOCATION_ASSET" ]] || fail 'missing Xray asset environment'
+        [[ -s "$XRAY_LOCATION_ASSET/geosite.dat" ]] || fail 'missing Xray geosite asset'
+    fi
+    if jq -e 'any(.routing.rules[]?.ip[]?; startswith("geoip:"))' "$6" >/dev/null; then
+        [[ -s "$XRAY_LOCATION_ASSET/geoip.dat" ]] || fail 'missing Xray geoip asset'
     fi
     if [[ "$6" == */.xray-dat-check.*/config.json && -z "${SING_TEST_XRAY_BIN:-}" ]]; then
         cmp -s "$XRAY_LOCATION_ASSET/geosite.dat" "$TEST_TMP/releases/good/geosite.dat" || return 1
@@ -135,6 +138,33 @@ assert_json '.outbounds == [{protocol:"freedom",tag:"direct"}] and (has("routing
     _apply_xray_routing_rules '[]'
 )
 printf 'ok - custom Xray domains save independently without DAT, with suffix matching and input validation\n'
+
+cp "$DB_FILE" "$TEST_TMP/before-cn-block-db"
+cp "$CFG/xray.json" "$TEST_TMP/before-cn-block-config"
+cn_block='[{"type":"cn","outbound":"block","order":0}]'
+DOWNLOAD_FAILURE=true
+if _apply_xray_routing_rules "$cn_block"; then fail 'GeoIP-only block accepted with no assets'; fi
+cmp "$DB_FILE" "$TEST_TMP/before-cn-block-db"
+cmp "$CFG/xray.json" "$TEST_TMP/before-cn-block-config"
+[[ ! -e "$CFG/xray-rules" ]] || fail 'failed GeoIP-only block published resources'
+DOWNLOAD_FAILURE=false
+_apply_xray_routing_rules "$cn_block"
+assert_json '.routing.domainStrategy == "IPOnDemand" and
+    .routing.rules == [{type:"field",ip:["geoip:cn"],outboundTag:"block"}]' "$CFG/xray.json"
+[[ -L "$CFG/xray-rules" && -s "$CFG/xray-rules/geoip.dat" ]] || fail 'GeoIP-only block did not publish assets'
+_apply_xray_routing_rules '[
+    {"type":"cn","outbound":"block","order":0},
+    {"type":"youtube","outbound":"direct","order":1},
+    {"type":"google","outbound":"direct","order":2},
+    {"type":"twitter","outbound":"direct","order":3}]'
+assert_json '.routing.rules == [
+    {type:"field",domain:["geosite:youtube"],outboundTag:"direct"},
+    {type:"field",domain:["geosite:google"],outboundTag:"direct"},
+    {type:"field",domain:["geosite:twitter"],outboundTag:"direct"},
+    {type:"field",ip:["geoip:cn"],outboundTag:"block"},
+    {type:"field",ip:["geoip:twitter"],outboundTag:"direct"}]' "$CFG/xray.json"
+printf 'ok - CN block uses GeoIP only, with first-use assets, rollback and global rule order\n'
+
 rules='[{"type":"cn","outbound":"direct"},{"type":"google","outbound":"block"},{"type":"twitter","outbound":"direct"},{"type":"youtube","outbound":"direct"},{"type":"ai","outbound":"direct"}]'
 rewrite_db ".xray_routing_rules=$rules"
 generate_xray_config
@@ -397,6 +427,45 @@ printf 'ok - shared WARP changes roll back both cores and preserve both stopped 
     [[ "$XRAY_RUNNING" == true ]] || fail 'successful menu edits stopped Xray'
 )
 printf 'ok - menu sets, replaces, deletes and reorders immediately; failures/cancellation preserve persisted rules and runtime\n'
+
+# The shortcut uses the selected core and the newly imported node.
+(
+    _line() { :; }
+    cp "$CFG/singbox.json" "$TEST_TMP/chain-singbox-before"
+    manage_routing <<< $'1\n2\n1\nsocks5://192.0.2.11:1080#Imported\nXray Relay\ny\n2\nc\nxray.example\n0\n0' >"$TEST_TMP/chain-xray"
+    grep -Fq '设置规则 · Xray' "$TEST_TMP/chain-xray" || fail 'chain shortcut did not open Xray settings'
+    grep -Fq '出口: Xray Relay' "$TEST_TMP/chain-xray" || fail 'chain shortcut did not show the renamed node'
+    assert_json '.xray_routing_rules == [{type:"custom",domains:"xray.example",outbound:"chain:Xray Relay",order:0}]' "$DB_FILE"
+    assert_json '.routing.rules[0].outboundTag == "chain-Xray Relay" and
+        any(.outbounds[]; .tag == "chain-Xray Relay" and .protocol == "socks")' "$CFG/xray.json"
+    cmp "$CFG/singbox.json" "$TEST_TMP/chain-singbox-before"
+
+    cp "$CFG/xray.json" "$TEST_TMP/chain-xray-before"
+    manage_routing <<< $'2\n2\n1\nsocks5://192.0.2.12:1080#Sing-box%20Relay\n\ny\n1\nc\nsingbox.example\n2\n0\n0' >"$TEST_TMP/chain-singbox"
+    grep -Fq '设置规则 · sing-box' "$TEST_TMP/chain-singbox" || fail 'chain shortcut did not open sing-box settings'
+    assert_json '.routing_rules | length == 1 and
+        .[0].outbound == "chain:Sing-box Relay" and .[0].ip_version == "ipv6_only"' "$DB_FILE"
+    assert_json 'any(.route.rules[]; .outbound == "chain-Sing-box Relay-ipv6" and .domain_suffix == ["singbox.example"])' "$CFG/singbox.json"
+    cmp "$CFG/xray.json" "$TEST_TMP/chain-xray-before"
+
+    cp "$CFG/singbox.json" "$TEST_TMP/chain-singbox-before"
+    _add_chain_node_interactive <<< $'socks5://192.0.2.13:1080#PoolOnly\n\ny\n0' >"$TEST_TMP/chain-cancel"
+    _add_chain_node_interactive <<< $'hy2://test@192.0.2.14:443#Unsupported\n\ny\n2' >"$TEST_TMP/chain-unsupported" 2>&1
+    grep -Fq 'Xray 不支持该节点协议' "$TEST_TMP/chain-unsupported" || fail 'missing Xray chain compatibility error'
+    FAIL_CHECK=true
+    _add_chain_node_interactive <<< $'socks5://192.0.2.15:1080#FailedRule\n\ny\n2\nc\nfailed.example' >"$TEST_TMP/chain-failed"
+    FAIL_CHECK=false
+    assert_json '[.chain_proxy.nodes[-3:][].name] == ["PoolOnly","Unsupported","FailedRule"] and
+        (.routing_rules | length == 1) and (.xray_routing_rules | length == 1)' "$DB_FILE"
+    cmp "$CFG/singbox.json" "$TEST_TMP/chain-singbox-before"
+    cmp "$CFG/xray.json" "$TEST_TMP/chain-xray-before"
+
+    rewrite_db '.singbox={}'
+    manage_routing <<< $'2\n1\nsocks5://192.0.2.16:1080#XrayOnly\n\ny\nc\nonly.example\n0\n0' >"$TEST_TMP/chain-single"
+    if grep -Fq '选择分流内核' "$TEST_TMP/chain-single"; then fail 'single-core chain shortcut asked for a core'; fi
+    assert_json '.xray_routing_rules[0] == {type:"custom",domains:"only.example",outbound:"chain:XrayOnly",order:0}' "$DB_FILE"
+)
+printf 'ok - imported chains route immediately on either core, with single-core selection, validation and rollback\n'
 
 # Each UI dispatches directly on a single-core installation.
 (

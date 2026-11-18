@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.1.6 [服务端]
+#  sing-lite v1.1.7 [服务端]
 #  官方 sing-box、Xray 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 vless。
 #  适配: Alpine/Debian/Ubuntu/CentOS
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.1.6"
+readonly VERSION="1.1.7"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/claudeeopussonnet/sing-lite"
 readonly SCRIPT_REPO="claudeeopussonnet/sing-lite"
@@ -8280,7 +8280,7 @@ _add_xray_routing_config() {
         .inbounds |= map(. + {sniffing:{enabled:true,destOverride:["http","tls","quic"],routeOnly:true}}) |
         .dns = {servers:["localhost"]} |
         .routing = {domainStrategy:"IPOnDemand",rules:
-            ([$rules[] | {type:"field",
+            ([$rules[] | select(.type != "cn" or .outbound != "block") | {type:"field",
                 domain:(if .type == "custom" then (.domains | split(",") | map("domain:" + .))
                     else ["geosite:" + ({ai:"category-ai-!cn",youtube:"youtube",twitter:"twitter",google:"google",cn:"cn"}[.type])]
                     end),
@@ -8376,7 +8376,8 @@ generate_xray_config() {
     fi
     local rules_directory="$CFG/xray-rules" XRAY_RULES_PREPARED_LOCAL=''
     if ! _add_xray_routing_config "$candidate" "$db_file"; then rm -rf "$candidate_dir"; return 1; fi
-    if jq -e 'any(.routing.rules[]?.domain[]?; startswith("geosite:"))' "$candidate" >/dev/null; then
+    if jq -e 'any(.routing.rules[]?;
+        any(.domain[]?; startswith("geosite:")) or any(.ip[]?; startswith("geoip:")))' "$candidate" >/dev/null; then
         if ! _prepare_xray_rules "$binary"; then rm -rf "$candidate_dir"; return 1; fi
         rules_directory="$XRAY_RULES_PREPARED"
         XRAY_RULES_PREPARED_LOCAL="$XRAY_RULES_PREPARED"
@@ -11375,7 +11376,7 @@ _show_routing_rules() {
     ' <<<"$rules"
 }
 
-# 在入口选择一次，后续动作均沿用该内核；共享出口仍由原事务更新。
+# 单内核直接选定，双内核提示选择。
 _select_routing_core() {
     local singbox_protocols xray_protocols choice
     ROUTING_SELECTED_CORE=''
@@ -11733,8 +11734,60 @@ _move_xray_routing_rule() {
     printf '%s\n' "$next"
 }
 
+_set_xray_routing_rule() {
+    local rules="$1" chain_node="${2:-}" category custom_domains='' next XRAY_SELECTED_OUTBOUND=''
+    _routing_header "设置规则" xray
+    if [[ -n "$chain_node" ]]; then
+        gen_xray_chain_outbound "$chain_node" >/dev/null || { _pause; return; }
+        XRAY_SELECTED_OUTBOUND="chain:$chain_node"
+        printf '  出口: %s\n' "$chain_node"
+    fi
+    _item 1 "AI"
+    _item 2 "YouTube"
+    _item 3 "X"
+    _item 4 "Google"
+    _item 5 "国内流量"
+    _item c "自定义域名"
+    _item 0 "返回"
+    read -rp "  选择分类: " category || return
+    case "$category" in
+        1) category=ai ;; 2) category=youtube ;; 3) category=twitter ;;
+        4) category=google ;; 5) category=cn ;;
+        c|C)
+            category=custom
+            printf '\n  输入域名，多个用逗号分隔，例如 example.com,example.org\n'
+            printf '  每项匹配该域名及其子域名，输入 0 返回。\n'
+            read -rp "  域名: " custom_domains || return
+            [[ "$custom_domains" != 0 ]] || return 0
+            if ! custom_domains=$(_normalize_xray_routing_domains "$custom_domains"); then
+                _warn "请输入有效的自定义域名"
+                _pause
+                return
+            fi
+            ;;
+        *) return 0 ;;
+    esac
+    if [[ -z "$chain_node" ]]; then
+        _select_xray_outbound || { _pause; return; }
+    fi
+    next=$(jq --arg type "$category" --arg domains "$custom_domains" --arg outbound "$XRAY_SELECTED_OUTBOUND" '
+        def rank($t): ["ai","youtube","twitter","google","cn"] | index($t);
+        {type:$type,outbound:$outbound} as $rule |
+        if $type == "custom" then [$rule + {domains:$domains}] + .
+        elif any(.[]; .type == $type) then map(if .type == $type then .outbound=$outbound else . end)
+        else
+            to_entries as $entries |
+            (([$entries[] | select(.value.type != "custom" and rank(.value.type) < rank($type)) | .key + 1] | last) //
+             ([$entries[] | select(.value.type != "custom") | .key] | first) // length) as $position |
+            .[:$position] + [$rule] + .[$position:]
+        end |
+        to_entries | map(.value + {order:.key})' <<<"$rules") || return 1
+    _apply_xray_routing_rules "$next" "$rules" && _ok "已保存"
+    _pause
+}
+
 configure_xray_routing_rules() {
-    local rules next choice category custom_domains index from to count XRAY_SELECTED_OUTBOUND=''
+    local rules next choice index from to count
     while true; do
         rules=$(db_get_xray_routing_rules) || return 1
         _routing_header "分流规则" xray
@@ -11748,46 +11801,8 @@ configure_xray_routing_rules() {
         read -rp "  请选择: " choice || return
         case "$choice" in
             1)
-                _routing_header "设置规则" xray
-                _item 1 "AI"
-                _item 2 "YouTube"
-                _item 3 "X"
-                _item 4 "Google"
-                _item 5 "国内流量"
-                _item c "自定义域名"
-                _item 0 "返回"
-                read -rp "  选择分类: " category || return
-                custom_domains=''
-                case "$category" in
-                    1) category=ai ;; 2) category=youtube ;; 3) category=twitter ;;
-                    4) category=google ;; 5) category=cn ;;
-                    c|C)
-                        category=custom
-                        printf '\n  输入域名，多个用逗号分隔，例如 example.com,example.org\n'
-                        printf '  每项匹配该域名及其子域名，输入 0 返回。\n'
-                        read -rp "  域名: " custom_domains || return
-                        [[ "$custom_domains" != 0 ]] || continue
-                        if ! custom_domains=$(_normalize_xray_routing_domains "$custom_domains"); then
-                            _warn "请输入有效的自定义域名"
-                            _pause
-                            continue
-                        fi
-                        ;;
-                    *) continue ;;
-                esac
-                _select_xray_outbound || { _pause; continue; }
-                next=$(jq --arg type "$category" --arg domains "$custom_domains" --arg outbound "$XRAY_SELECTED_OUTBOUND" '
-                    def rank($t): ["ai","youtube","twitter","google","cn"] | index($t);
-                    {type:$type,outbound:$outbound} as $rule |
-                    if $type == "custom" then [$rule + {domains:$domains}] + .
-                    elif any(.[]; .type == $type) then map(if .type == $type then .outbound=$outbound else . end)
-                    else
-                        to_entries as $entries |
-                        (([$entries[] | select(.value.type != "custom" and rank(.value.type) < rank($type)) | .key + 1] | last) //
-                         ([$entries[] | select(.value.type != "custom") | .key] | first) // length) as $position |
-                        .[:$position] + [$rule] + .[$position:]
-                    end |
-                    to_entries | map(.value + {order:.key})' <<<"$rules") || return 1
+                _set_xray_routing_rule "$rules" || return 1
+                continue
                 ;;
             2)
                 count=$(jq 'length' <<<"$rules") || return 1
@@ -11845,7 +11860,9 @@ configure_singbox_routing_rules() {
 
 # 添加分流规则
 _add_routing_rule() {
+    local chain_node="${1:-}" outbound
     _routing_header "设置规则" singbox
+    if [[ -n "$chain_node" ]]; then printf '  出口: %s\n' "$chain_node"; fi
     _item "1" "AI"
     _item "2" "Stream"
     _item "3" "Stream JP"
@@ -11853,7 +11870,7 @@ _add_routing_rule() {
     _item "5" "Google"
     _item "6" "X"
     _item "c" "自定义域名"
-    _item "b" "广告屏蔽"
+    if [[ -z "$chain_node" ]]; then _item "b" "广告屏蔽"; fi
     _item "a" "所有流量"
     _item "0" "返回"
     _line
@@ -11892,7 +11909,10 @@ _add_routing_rule() {
                 return
             fi
             ;;
-        b|B) rule_type="ads" ;;
+        b|B)
+            [[ -z "$chain_node" ]] || { _warn "无效选项"; _pause; return; }
+            rule_type="ads"
+            ;;
         a|A) rule_type="all" ;;
         0|"") return ;;
         *) _warn "无效选项"; _pause; return ;;
@@ -11916,8 +11936,11 @@ _add_routing_rule() {
     fi
 
     # 选择出口
-    local outbound
-    outbound=$(_select_outbound "选择出口" "no_check") || return
+    if [[ -n "$chain_node" ]]; then
+        outbound="chain:$chain_node"
+    else
+        outbound=$(_select_outbound "选择出口" "no_check") || return
+    fi
     [[ -z "$outbound" ]] && return
 
     # 选择匹配的 IP 版本（用于 IPv4/IPv6 分流）
@@ -13296,6 +13319,7 @@ gen_singbox_chain_outbound() {
 
 # 添加节点交互 (带解析预览和自定义名称)
 _add_chain_node_interactive() {
+    local link custom_name overwrite use_now ROUTING_SELECTED_CORE='' rules
     _routing_header "添加节点（共享出口）" ''
     echo -e "  ${D}支持: ss/vmess/vless/trojan/hysteria2/socks5/naive${NC}"
     echo ""
@@ -13365,7 +13389,14 @@ _add_chain_node_interactive() {
         echo ""
         read -rp "  是否立即将此节点用于分流? [y/N]: " use_now
         if [[ "$use_now" =~ ^[Yy]$ ]]; then
-            _add_routing_rule
+            _select_routing_core || return 0
+            case "$ROUTING_SELECTED_CORE" in
+                singbox) _add_routing_rule "$final_name" ;;
+                xray)
+                    rules=$(db_get_xray_routing_rules) || return 1
+                    _set_xray_routing_rule "$rules" "$final_name"
+                    ;;
+            esac
             return
         fi
     else
