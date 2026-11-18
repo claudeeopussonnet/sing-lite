@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  sing-lite v1.1.5 [服务端]
+#  sing-lite v1.1.6 [服务端]
 #  官方 sing-box、Xray 与 Surge 原厂 Snell v5/v6。
 #  配置目录 /etc/sing-lite，快捷命令 vless。
 #  适配: Alpine/Debian/Ubuntu/CentOS
@@ -33,7 +33,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="1.1.5"
+readonly VERSION="1.1.6"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/claudeeopussonnet/sing-lite"
 readonly SCRIPT_REPO="claudeeopussonnet/sing-lite"
@@ -5042,7 +5042,10 @@ _fetch_script_tmp() {
     commit=$(curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout "$connect_timeout" \
         --max-time "$max_time" "https://api.github.com/repos/${SCRIPT_SOURCE_REPO}/commits/${ref}" |
         jq -er '.sha | select(test("^[0-9a-f]{40}$"))') || return 1
-    tmp_file=$(mktemp) || return 1
+    tmp_file=$(mktemp 2>/dev/null || mktemp /tmp/sing-lite-script.XXXXXX 2>/dev/null) || {
+        _err "无法创建脚本下载临时文件，请检查临时目录权限和磁盘空间"
+        return 1
+    }
     if ! curl -fsSL --connect-timeout "$connect_timeout" --max-time "$max_time" \
         -o "$tmp_file" "https://raw.githubusercontent.com/${SCRIPT_SOURCE_REPO}/${commit}/${SCRIPT_SOURCE_PATH}" ||
        ! _verify_script_blob "$tmp_file" "$commit"; then
@@ -19062,7 +19065,9 @@ select_script_update_channel() {
 }
 
 _current_script_path() {
-    readlink -f "$0" 2>/dev/null
+    local path
+    path=$(readlink -f -- "$0" 2>/dev/null) && [[ -f "$path" ]] || return 1
+    printf '%s\n' "$path"
 }
 
 _system_script_path() {
@@ -19070,9 +19075,13 @@ _system_script_path() {
 }
 
 _script_update_is_available() {
-    local channel="$1" current_file="$2" remote_file="$3" remote_ver="$4"
+    local channel="$1" current_file="$2" remote_file="$3" remote_ver="$4" current_ver
     case "$channel" in
-        stable) _version_gt "$remote_ver" "$VERSION" ;;
+        stable)
+            current_ver=$(_extract_script_version "$current_file") || current_ver=""
+            [[ "$current_ver" =~ ^[0-9]+(\.[0-9]+)*$ ]] || current_ver="$VERSION"
+            _version_gt "$remote_ver" "$current_ver"
+            ;;
         dev) ! cmp -s "$current_file" "$remote_file" ;;
         *) return 1 ;;
     esac
@@ -19101,20 +19110,27 @@ _stage_script_update() {
 _update_script_from_channel() {
     local channel="$1" ref channel_label prompt
     local tmp_file="" remote_ver="" downloaded_ver="" script_path system_script system_target
-    local script_stage="" system_stage="" rollback_stage="" resolved_system="" sync_system=false
+    local script_stage="" system_stage="" rollback_stage=""
     ref=$(_script_update_ref "$channel") || { _err "未知脚本更新渠道: $channel"; return 1; }
     [[ "$channel" == dev ]] && channel_label="测试版 (dev)" || channel_label="稳定版 (main)"
 
     _header
     echo -e "  ${W}脚本更新 - ${channel_label}${NC}"
     _line
-    echo -e "  当前版本: ${G}v${VERSION}${NC}"
+    echo -e "  当前运行版本: ${G}v${VERSION}${NC}"
     _info "检查${channel_label}..."
 
-    script_path=$(_current_script_path)
-    if [[ -z "$script_path" || ! -f "$script_path" ]]; then
-        _err "无法确定当前脚本路径"
-        return 1
+    script_path=$(_current_script_path) || script_path=""
+    system_script=$(_system_script_path)
+    system_target=$(readlink -f -- "$system_script" 2>/dev/null) || system_target=""
+    [[ -f "$system_target" ]] || system_target=""
+    if [[ ! -f "$script_path" ]]; then
+        if [[ -z "$system_target" ]]; then
+            _err "找不到可更新的脚本（系统脚本：$system_script），请将管理脚本下载到本地文件后运行"
+            return 1
+        fi
+        script_path="$system_target"
+        _info "将更新已安装的管理脚本 $script_path"
     fi
 
     if [[ "$channel" == stable ]]; then
@@ -19178,7 +19194,8 @@ _update_script_from_channel() {
         _err "下载脚本缺少有效版本标识，已拒绝更新"
         return 1
     fi
-    if [[ "$channel" == stable ]] && ! _version_gt "$downloaded_ver" "$VERSION"; then
+    if [[ "$channel" == stable ]] &&
+       ! _script_update_is_available "$channel" "$script_path" "$tmp_file" "$downloaded_ver"; then
         rm -f "$tmp_file"
         _ok "下载内容不是更高版本，已取消替换"
         return 2
@@ -19186,25 +19203,27 @@ _update_script_from_channel() {
     remote_ver="$downloaded_ver"
     SCRIPT_REMOTE_VERSION="$remote_ver"
 
-    system_script=$(_system_script_path)
-    system_target="$system_script"
-    if [[ -e "$system_script" || -L "$system_script" ]]; then
-        resolved_system=$(readlink -f "$system_script" 2>/dev/null || true)
-        [[ -n "$resolved_system" ]] && system_target="$resolved_system"
-        if [[ "$system_target" != "$script_path" && -f "$system_target" ]]; then
-            sync_system=true
+    if ! script_stage=$(_stage_script_update "$tmp_file" "$script_path"); then
+        if [[ -n "$system_target" && "$system_target" != "$script_path" ]]; then
+            _warn "无法为 $script_path 创建更新暂存文件，改用已安装的管理脚本 $system_target"
+            script_path="$system_target"
+            if ! _script_update_is_available "$channel" "$script_path" "$tmp_file" "$remote_ver"; then
+                rm -f "$tmp_file"
+                _ok "已安装的管理脚本无需更新"
+                return 2
+            fi
+            script_stage=$(_stage_script_update "$tmp_file" "$script_path") || script_stage=""
+        fi
+        if [[ -z "$script_stage" ]]; then
+            rm -f "$tmp_file"
+            _err "无法为 $script_path 创建更新暂存文件，请检查所在目录的写入权限和磁盘空间"
+            return 1
         fi
     fi
-
-    script_stage=$(_stage_script_update "$tmp_file" "$script_path") || {
-        rm -f "$tmp_file"
-        _err "无法在当前脚本目录暂存更新"
-        return 1
-    }
-    if [[ "$sync_system" == true ]]; then
+    if [[ -n "$system_target" && "$system_target" != "$script_path" ]]; then
         system_stage=$(_stage_script_update "$tmp_file" "$system_target") || {
             rm -f "$tmp_file" "$script_stage"
-            _err "无法在系统脚本目录暂存更新"
+            _err "无法为系统脚本 $system_target 创建更新暂存文件，请检查所在目录的写入权限和磁盘空间"
             return 1
         }
     fi
@@ -19220,7 +19239,7 @@ _update_script_from_channel() {
         _err "当前脚本替换失败"
         return 1
     fi
-    if [[ "$sync_system" == true ]] && ! mv -f "$system_stage" "$system_target"; then
+    if [[ -n "$system_stage" ]] && ! mv -f "$system_stage" "$system_target"; then
         rm -f "$system_stage"
         rollback_stage=$(_stage_script_update "${script_path}.bak" "$script_path" preserve 2>/dev/null || true)
         if [[ -n "$rollback_stage" ]] && mv -f "$rollback_stage" "$script_path"; then
@@ -19231,11 +19250,11 @@ _update_script_from_channel() {
         fi
         return 1
     fi
-    [[ "$sync_system" == true ]] && _info "已同步更新系统目录脚本"
+    [[ -n "$system_stage" ]] && _info "已同步更新系统目录脚本"
 
-    _ok "更新成功! v${VERSION} -> v${remote_ver} (${channel_label})"
+    _ok "已更新至 v${remote_ver} (${channel_label})"
     echo ""
-    echo -e "  ${C}请重新运行脚本以使用新版本${NC}"
+    echo -e "  ${C}请重新运行已更新的脚本：${script_path}${NC}"
     echo -e "  ${D}备份文件: ${script_path}.bak${NC}"
     _line
     return 0

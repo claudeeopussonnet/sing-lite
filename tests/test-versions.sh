@@ -100,3 +100,73 @@ for channel in stable dev; do
     [[ "$(stat -c %a "$TEST_TMP/current.sh")" == 755 && "$(stat -c %a "$TEST_TMP/system.sh")" == 755 ]] || fail "$channel update permissions"
 done
 printf 'ok - stable/dev menu updates cancel cleanly or replace and sync verified scripts without missing helpers\n'
+
+# A streamed or removed launcher can leave only the installed script available.
+rm -f "$CFG/.version-cache" "$TEST_TMP/current.sh" "$TEST_TMP/current.sh.bak" "$TEST_TMP/system.sh"
+rmdir "$CFG"
+mkdir "$TEST_TMP/installed scripts"
+installed="$TEST_TMP/installed scripts/sing-lite.sh"
+ln -s "$installed" "$TEST_TMP/system.sh"
+ln -s "$TEST_TMP/system.sh" "$TEST_TMP/vless"
+cp "$TEST_TMP/original.sh" "$installed"
+[[ "$(bash -c 'source "$1"; _current_script_path' "$TEST_TMP/vless" "$TEST_ROOT/vless-server.sh")" == "$installed" ]] ||
+    fail 'could not resolve the vless symlink to its script'
+if bash <(printf 'source "$1"\n_current_script_path\n') "$TEST_ROOT/vless-server.sh"; then
+    fail 'streamed script was treated as a replaceable file'
+fi
+for channel in stable dev; do
+    cp "$TEST_TMP/original.sh" "$installed"
+    if ! _update_script_from_channel "$channel" <<<'y' >"$TEST_TMP/menu.log" 2>&1; then
+        cat "$TEST_TMP/menu.log" >&2
+        fail "$channel update could not use the installed script when the launcher was missing"
+    fi
+    [[ -L "$TEST_TMP/system.sh" && ! -e "$CFG" ]] || fail 'update changed the shortcut or created a config directory'
+    cmp "$TEST_TMP/remote-script" "$installed"
+    cmp "$TEST_TMP/original.sh" "$installed.bak"
+done
+printf 'ok - missing launchers fall back to the installed script without requiring a config directory\n'
+
+# Simulate a launch directory where an atomic replacement cannot be staged.
+cp "$TEST_TMP/original.sh" "$TEST_TMP/current.sh"
+cp "$TEST_TMP/original.sh" "$installed"
+mktemp() {
+    [[ "${1:-}" != "$TEST_TMP/current.sh.update.XXXXXX" ]] || return 1
+    command mktemp "$@"
+}
+_update_script_from_channel stable <<<'y' >"$TEST_TMP/menu.log" 2>&1 ||
+    fail 'update did not fall back when the launch directory could not stage a file'
+cmp "$TEST_TMP/original.sh" "$TEST_TMP/current.sh"
+cmp "$TEST_TMP/remote-script" "$installed"
+cmp "$TEST_TMP/original.sh" "$installed.bak"
+[[ ! -e "$TEST_TMP/current.sh.bak" ]] || fail 'fallback created a backup in the launch directory'
+
+printf '#!/bin/bash\nreadonly VERSION="99.3.0"\n' >"$installed"
+rc=0
+_update_script_from_channel stable <<<'y' >"$TEST_TMP/menu.log" 2>&1 || rc=$?
+[[ "$rc" == 2 && "$(_extract_script_version "$installed")" == 99.3.0 ]] ||
+    fail 'fallback downgraded a newer installed script'
+unset -f mktemp
+printf 'ok - launch directory staging failures update only the installed script without downgrading it\n'
+
+# A failure at the final system rename must roll back the already replaced launcher.
+cp "$TEST_TMP/original.sh" "$installed"
+mv() {
+    [[ "${@: -1}" != "$installed" ]] || return 1
+    command mv "$@"
+}
+rc=0
+_update_script_from_channel stable <<<'y' >"$TEST_TMP/menu.log" 2>&1 || rc=$?
+[[ "$rc" == 1 ]] || fail 'failed system replacement reported success'
+cmp "$TEST_TMP/original.sh" "$TEST_TMP/current.sh"
+cmp "$TEST_TMP/original.sh" "$installed"
+cmp "$TEST_TMP/original.sh" "$TEST_TMP/current.sh.bak"
+[[ -z "$(find "$TEST_TMP" -name '*.update.*' -print -quit)" ]] || fail 'update left staging files'
+unset -f mv
+printf 'ok - a failed system replacement rolls back the launcher and cleans up staging files\n'
+
+# An inherited TMPDIR can refer to a directory removed before the menu opened.
+download_path=$(TMPDIR="$TEST_TMP/missing downloads" _fetch_script_tmp 5 10 main) ||
+    fail 'script download did not recover from a missing temporary directory'
+cmp "$TEST_TMP/remote-script" "$download_path"
+rm -f "$download_path"
+printf 'ok - script downloads recover when TMPDIR is missing\n'
