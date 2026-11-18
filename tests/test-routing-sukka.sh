@@ -161,6 +161,11 @@ test_menu_and_access() {
         assert_json ".routing_rules | length==1 and .[0].type==\"$preset\"" "$DB_FILE"
     done
     reset_db
+    _add_routing_rule <<< $'c\nexample.com, sub.example.org\n3' >"$TEST_TMP/menu.log"
+    gen_singbox_routing_rules >"$TEST_TMP/rules.json"
+    assert_json 'map(.domain_suffix[]) == ["example.com","sub.example.org"] and
+        all(.[]; .outbound == "direct-asis")' "$TEST_TMP/rules.json"
+    reset_db
     enable_access_restriction <<<'' >"$TEST_TMP/access.log"
     access_restriction_enabled || fail 'CN access rule not detected'
     assert_json '.routing_rules | length==1 and .[0].id=="restrict-cn" and .[0].outbound=="block" and (. [0].domains | contains("skk-ip-china_ip_ipv6"))' "$DB_FILE"

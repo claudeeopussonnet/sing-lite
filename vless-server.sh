@@ -8109,23 +8109,51 @@ db_get_xray_routing_rules() {
     jq -e '
         (if has("xray_routing_rules") then .xray_routing_rules else [] end) |
         if type != "array" then error("Xray 规则必须为数组") else . end |
-        sort_by(.order // (.type as $t | ["ai","youtube","twitter","google","cn"] | index($t)))
+        sort_by(.order // (.type as $t | if $t == "custom" then -1 else ["ai","youtube","twitter","google","cn"] | index($t) end))
     ' "${1:-$DB_FILE}"
 }
 
+_normalize_xray_routing_domains() {
+    local input="$1" domain domains=''
+    local -a entries
+    [[ -n "$input" && "$input" != *, && "$input" != *$'\n'* ]] || return 1
+    IFS=',' read -r -a entries <<<"$input"
+    for domain in "${entries[@]}"; do
+        domain="${domain#"${domain%%[![:blank:]]*}"}"
+        domain="${domain%"${domain##*[![:blank:]]}"}"
+        domain="${domain%.}"
+        [[ "${#domain}" -le 253 && ! "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+            _is_valid_dns_name "$domain" || return 1
+        domains+="${domains:+,}${domain,,}"
+    done
+    printf '%s\n' "$domains"
+}
+
 _validate_xray_routing_rules() {
-    jq -e '
-        . as $rules | type == "array" and
+    local rules domains
+    rules=$(cat) || return 1
+    if ! jq -e '
+        type == "array" and
         all(.[]; type == "object" and
-            (.type as $t | ["ai","youtube","twitter","google","cn"] | index($t) != null) and
+            (.type as $t | ($t == "custom" or (["ai","youtube","twitter","google","cn"] | index($t) != null))) and
             (.outbound | type == "string" and test("^(direct|block|warp|chain:[^\\x00-\\x1f\\x7f]+)$")) and
-            ((has("order") | not) or (.order | type == "number" and . >= 0 and floor == .))) and
-        ([.[].type] | length == (unique | length)) and
+            ((has("order") | not) or (.order | type == "number" and . >= 0 and floor == .)) and
+            (.type != "custom" or (.domains | type == "string" and (test("[\\x00-\\x1f\\x7f]") | not)))) and
+        ([.[].type | select(. != "custom")] | length == (unique | length)) and
         ([.[].type] as $types |
             all(["ai","youtube"][]; . as $t |
                 ($types | index("google")) == null or ($types | index($t)) == null or
                 ($types | index($t)) < ($types | index("google"))))
-    ' >/dev/null || { _err "Xray 分流规则无效：分类不可重复，AI、YouTube 必须排在 Google 前面"; return 1; }
+    ' <<<"$rules" >/dev/null; then
+        _err "Xray 分流规则无效：预设不可重复，AI、YouTube 必须排在 Google 前面"
+        return 1
+    fi
+    while IFS= read -r domains; do
+        if [[ -z "$domains" || "$domains" != "$(_normalize_xray_routing_domains "$domains")" ]]; then
+            _err "Xray 自定义域名无效"
+            return 1
+        fi
+    done < <(jq -r '.[] | select(.type == "custom") | .domains' <<<"$rules")
 }
 
 gen_xray_warp_outbound() {
@@ -8252,8 +8280,10 @@ _add_xray_routing_config() {
         .inbounds |= map(. + {sniffing:{enabled:true,destOverride:["http","tls","quic"],routeOnly:true}}) |
         .dns = {servers:["localhost"]} |
         .routing = {domainStrategy:"IPOnDemand",rules:
-            ([$rules[] | {type:"field",domain:["geosite:" +
-                ({ai:"category-ai-!cn",youtube:"youtube",twitter:"twitter",google:"google",cn:"cn"}[.type])],
+            ([$rules[] | {type:"field",
+                domain:(if .type == "custom" then (.domains | split(",") | map("domain:" + .))
+                    else ["geosite:" + ({ai:"category-ai-!cn",youtube:"youtube",twitter:"twitter",google:"google",cn:"cn"}[.type])]
+                    end),
                 outboundTag:(.outbound | tag)}] +
              [$rules[] | select(.type == "twitter" or .type == "cn") |
                 {type:"field",ip:["geoip:" + (if .type == "twitter" then "twitter" else "cn" end)],outboundTag:(.outbound | tag)}])}
@@ -8346,7 +8376,7 @@ generate_xray_config() {
     fi
     local rules_directory="$CFG/xray-rules" XRAY_RULES_PREPARED_LOCAL=''
     if ! _add_xray_routing_config "$candidate" "$db_file"; then rm -rf "$candidate_dir"; return 1; fi
-    if jq -e 'has("routing")' "$candidate" >/dev/null; then
+    if jq -e 'any(.routing.rules[]?.domain[]?; startswith("geosite:"))' "$candidate" >/dev/null; then
         if ! _prepare_xray_rules "$binary"; then rm -rf "$candidate_dir"; return 1; fi
         rules_directory="$XRAY_RULES_PREPARED"
         XRAY_RULES_PREPARED_LOCAL="$XRAY_RULES_PREPARED"
@@ -8658,10 +8688,15 @@ rebuild_and_reload_xray() {
 }
 
 _apply_xray_routing_rules() {
-    local rules="$1" result=0
+    local rules="$1" expected="${2:-}" current result=0
     _validate_xray_routing_rules <<<"$rules" || return 1
     _db_lock_acquire || return 1
-    _apply_xray_config_locked "$rules" routing '' '' || result=1
+    if [[ -n "$expected" ]] && { ! current=$(db_get_xray_routing_rules) || [[ "$current" != "$expected" ]]; }; then
+        _err "Xray 分流规则已变更，请重试"
+        result=1
+    else
+        _apply_xray_config_locked "$rules" routing '' '' || result=1
+    fi
     _db_lock_release
     return "$result"
 }
@@ -8669,8 +8704,9 @@ _apply_xray_routing_rules() {
 update_xray_rules() {
     local XRAY_RULES_FORCE_UPDATE=true rules
     rules=$(db_get_xray_routing_rules) || return 1
-    [[ "$rules" != '[]' ]] || { _err "请先配置 Xray 分流规则"; return 1; }
-    _apply_xray_routing_rules "$rules"
+    jq -e 'any(.[]; .type != "custom")' <<<"$rules" >/dev/null ||
+        { _err "请先配置使用规则集的 Xray 预设"; return 1; }
+    _apply_xray_routing_rules "$rules" "$rules"
 }
 
 # 共享节点和 WARP 变更：两个核心均检查成功后提交；任一重启失败一起恢复。
@@ -11698,7 +11734,7 @@ _move_xray_routing_rule() {
 }
 
 configure_xray_routing_rules() {
-    local rules next choice category index from to count XRAY_SELECTED_OUTBOUND=''
+    local rules next choice category custom_domains index from to count XRAY_SELECTED_OUTBOUND=''
     while true; do
         rules=$(db_get_xray_routing_rules) || return 1
         _routing_header "分流规则" xray
@@ -11718,17 +11754,39 @@ configure_xray_routing_rules() {
                 _item 3 "X"
                 _item 4 "Google"
                 _item 5 "国内流量"
+                _item c "自定义域名"
                 _item 0 "返回"
                 read -rp "  选择分类: " category || return
+                custom_domains=''
                 case "$category" in
                     1) category=ai ;; 2) category=youtube ;; 3) category=twitter ;;
-                    4) category=google ;; 5) category=cn ;; *) continue ;;
+                    4) category=google ;; 5) category=cn ;;
+                    c|C)
+                        category=custom
+                        printf '\n  输入域名，多个用逗号分隔，例如 example.com,example.org\n'
+                        printf '  每项匹配该域名及其子域名，输入 0 返回。\n'
+                        read -rp "  域名: " custom_domains || return
+                        [[ "$custom_domains" != 0 ]] || continue
+                        if ! custom_domains=$(_normalize_xray_routing_domains "$custom_domains"); then
+                            _warn "请输入有效的自定义域名"
+                            _pause
+                            continue
+                        fi
+                        ;;
+                    *) continue ;;
                 esac
                 _select_xray_outbound || { _pause; continue; }
-                next=$(jq --arg type "$category" --arg outbound "$XRAY_SELECTED_OUTBOUND" '
-                    if any(.[]; .type == $type) then map(if .type == $type then .outbound=$outbound else . end)
-                    else . + [{type:$type,outbound:$outbound}] |
-                        sort_by(.type as $t | ["ai","youtube","twitter","google","cn"] | index($t)) end |
+                next=$(jq --arg type "$category" --arg domains "$custom_domains" --arg outbound "$XRAY_SELECTED_OUTBOUND" '
+                    def rank($t): ["ai","youtube","twitter","google","cn"] | index($t);
+                    {type:$type,outbound:$outbound} as $rule |
+                    if $type == "custom" then [$rule + {domains:$domains}] + .
+                    elif any(.[]; .type == $type) then map(if .type == $type then .outbound=$outbound else . end)
+                    else
+                        to_entries as $entries |
+                        (([$entries[] | select(.value.type != "custom" and rank(.value.type) < rank($type)) | .key + 1] | last) //
+                         ([$entries[] | select(.value.type != "custom") | .key] | first) // length) as $position |
+                        .[:$position] + [$rule] + .[$position:]
+                    end |
                     to_entries | map(.value + {order:.key})' <<<"$rules") || return 1
                 ;;
             2)
@@ -11759,7 +11817,7 @@ configure_xray_routing_rules() {
             0) return ;;
             *) _err "无效选择"; _pause; continue ;;
         esac
-        _apply_xray_routing_rules "$next" && _ok "已保存"
+        _apply_xray_routing_rules "$next" "$rules" && _ok "已保存"
         _pause
     done
 }
@@ -11815,7 +11873,7 @@ _add_routing_rule() {
             rule_type="custom"
             echo ""
             echo -e "  ${Y}输入要分流的匹配规则 (逗号分隔):${NC}"
-            echo -e "  ${D}支持普通域名/IP 与 Sukka 规则集，可混合输入:${NC}"
+            echo -e "  ${D}普通域名匹配该域名及其子域名，也可混合输入 IP 和 Sukka 规则集。${NC}"
             echo -e "  ${D}  1) 普通域名/IP: google.com,youtube.com 或 1.2.3.4,192.168.0.0/16${NC}"
             echo -e "  ${D}  2) domainset: rule-set:skk-domainset-cdn${NC}"
             echo -e "  ${D}  3) non_ip: rule-set:skk-non-ip-ai${NC}"

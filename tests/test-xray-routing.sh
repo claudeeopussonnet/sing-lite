@@ -94,13 +94,13 @@ curl() {
 xray() {
     [[ "$1 $2 $3 $4 $5" == 'run -test -format json -c' && $# == 6 ]] || forbidden xray "$@"
     jq empty "$6" || return 1
-    if jq -e 'has("routing")' "$6" >/dev/null; then
+    if jq -e 'any(.routing.rules[]?.domain[]?; startswith("geosite:"))' "$6" >/dev/null; then
         [[ -d "$XRAY_LOCATION_ASSET" ]] || fail 'missing Xray asset environment'
-        if [[ "$6" == */.xray-dat-check.*/config.json && -z "${SING_TEST_XRAY_BIN:-}" ]]; then
-            cmp -s "$XRAY_LOCATION_ASSET/geosite.dat" "$TEST_TMP/releases/good/geosite.dat" || return 1
-            cmp -s "$XRAY_LOCATION_ASSET/geoip.dat" "$TEST_TMP/releases/good/geoip.dat" || return 1
-        elif [[ "$FAIL_CHECK" == true ]]; then return 1; fi
     fi
+    if [[ "$6" == */.xray-dat-check.*/config.json && -z "${SING_TEST_XRAY_BIN:-}" ]]; then
+        cmp -s "$XRAY_LOCATION_ASSET/geosite.dat" "$TEST_TMP/releases/good/geosite.dat" || return 1
+        cmp -s "$XRAY_LOCATION_ASSET/geoip.dat" "$TEST_TMP/releases/good/geoip.dat" || return 1
+    elif [[ "$FAIL_CHECK" == true ]] && jq -e 'has("routing")' "$6" >/dev/null; then return 1; fi
     if [[ -n "${SING_TEST_XRAY_BIN:-}" ]]; then "$SING_TEST_XRAY_BIN" "$@" || return 1; fi
 }
 raw='{"port":49101,"uuid":"00000000-0000-4000-8000-000000000001","security_mode":"reality","transport":"raw","sni":"test.example","private_key":"eCtXsJZ27-4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU","public_key":"Cr8hWlKvtDt7nrvf-f0brNQQzabAqrjfBvas9pmowjo","short_id":"00123456","encryption":"none","decryption":"none"}'
@@ -109,6 +109,32 @@ jq -n --argjson raw "$raw" '{xray:{vless:$raw},singbox:{},snell:{},routing:{warp
 generate_xray_config
 assert_json '.outbounds == [{protocol:"freedom",tag:"direct"}] and (has("routing") | not)' "$CFG/xray.json"
 [[ ! -e "$TEST_TMP/downloads" && ! -e "$CFG/xray-rules" ]] || fail 'direct-only Xray fetched rules'
+(
+    _item() { printf '  [%s] %s\n' "$1" "$2"; }
+    _line() { :; }
+    DOWNLOAD_FAILURE=true
+    configure_xray_routing_rules <<< $'1\nc\nExample.COM.,  sub.example.org\n2\n1\nc\nother.example\n1\n0' >"$TEST_TMP/custom-menu"
+    grep -Fq '[c] 自定义域名' "$TEST_TMP/custom-menu" || fail 'custom domain option missing'
+    grep -Fq '自定义 (example.com,sub.example.org) → 拦截' "$TEST_TMP/custom-menu" || fail 'custom domain rule missing from list'
+    assert_json '.xray_routing_rules == [
+        {type:"custom",domains:"other.example",outbound:"direct",order:0},
+        {type:"custom",domains:"example.com,sub.example.org",outbound:"block",order:1}]' "$DB_FILE"
+    assert_json '.routing.rules == [
+        {type:"field",domain:["domain:other.example"],outboundTag:"direct"},
+        {type:"field",domain:["domain:example.com","domain:sub.example.org"],outboundTag:"block"}]' "$CFG/xray.json"
+    if update_xray_rules; then fail 'custom-only configuration reported a DAT update'; fi
+    [[ ! -e "$TEST_TMP/downloads" && ! -e "$CFG/xray-rules" ]] || fail 'custom-only Xray fetched DAT rules'
+    cp "$DB_FILE" "$TEST_TMP/custom-before"
+    for input in 'https://bad.example' 'example.com,,example.org' 'example.com,' '192.0.2.1' '0'; do
+        configure_xray_routing_rules <<<"1"$'\nc\n'"$input"$'\n0' >"$TEST_TMP/custom-invalid"
+        cmp "$DB_FILE" "$TEST_TMP/custom-before"
+    done
+    [[ ! -e "$TEST_TMP/services" ]] || fail 'custom rule started stopped service'
+    if _apply_xray_routing_rules '[]' '[]'; then fail 'stale edit removed custom rules'; fi
+    cmp "$DB_FILE" "$TEST_TMP/custom-before"
+    _apply_xray_routing_rules '[]'
+)
+printf 'ok - custom Xray domains save independently without DAT, with suffix matching and input validation\n'
 rules='[{"type":"cn","outbound":"direct"},{"type":"google","outbound":"block"},{"type":"twitter","outbound":"direct"},{"type":"youtube","outbound":"direct"},{"type":"ai","outbound":"direct"}]'
 rewrite_db ".xray_routing_rules=$rules"
 generate_xray_config
@@ -321,11 +347,17 @@ printf 'ok - shared WARP changes roll back both cores and preserve both stopped 
     assert_json '[.xray_routing_rules[].type] == ["twitter","ai","youtube"]' "$DB_FILE"
     assert_json '[.routing.rules[:3][].domain[0]] == ["geosite:twitter","geosite:category-ai-!cn","geosite:youtube"]' "$CFG/xray.json"
 
+    configure_xray_routing_rules <<< $'1\nc\nyoutube.com\n4\n1\n3\n1\n3\n0' >"$TEST_TMP/custom-order"
+    assert_json '[.routing.rules[].domain[]?] == ["geosite:twitter","geosite:category-ai-!cn","domain:youtube.com","geosite:youtube"] and
+        .routing.rules[2].outboundTag == "chain-socks" and .routing.rules[-1].ip == ["geoip:twitter"]' "$CFG/xray.json"
+    configure_xray_routing_rules <<< $'2\n3\n0' >"$TEST_TMP/custom-delete"
+    assert_json 'all(.xray_routing_rules[]; .type != "custom")' "$DB_FILE"
+
     XRAY_RUNNING=true
     save_state
     # A failed set/delete/reorder must redraw persisted rules, without success.
     for failure in check restart; do
-        for input in $'1\n3\n2\n0' $'2\n1\n0' $'3\n1\n3\n0'; do
+        for input in $'1\n3\n2\n0' $'1\nc\ncustom.example\n2\n0' $'2\n1\n0' $'3\n1\n3\n0'; do
             : >"$TEST_TMP/menu-success"
             case "$failure" in check) FAIL_CHECK=true ;; restart) FAIL_RESTART=restart:sing-xray ;; esac
             configure_xray_routing_rules <<<"$input" >"$TEST_TMP/menu-failure"
@@ -348,6 +380,7 @@ printf 'ok - shared WARP changes roll back both cores and preserve both stopped 
     assert_state
     [[ ! -s "$TEST_TMP/services" ]] || fail 'cancelled menu edit touched service'
     configure_xray_routing_rules <<< $'1\n4\n1\n0' >"$TEST_TMP/menu-google"
+    assert_json '[.xray_routing_rules[].type] == ["twitter","ai","youtube","google"]' "$DB_FILE"
     save_state
     configure_xray_routing_rules <<< $'3\n4\n1\n0' >"$TEST_TMP/menu-invalid-order"
     assert_state
